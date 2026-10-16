@@ -240,6 +240,18 @@ def _fake_code_tree(c, comfy_version):
     (c / "main.py").write_text(""); (c / "requirements.txt").write_text(""); (c / "comfyui_version.py").write_text('__version__ = "%s"\n' % comfy_version)
 
 
+def zip_extra(pkg_dir):
+    """The paths a package's script lists in ZIP_EXTRA=( ... ), read as _build/package.py reads them (shlex, so a quoted
+    name with spaces is one path). The kit ships without _build/, so the zip rehearsal cannot import the packager."""
+    import shlex
+    out = []
+    for sc in sorted(pathlib.Path(pkg_dir).glob("*-script.sh")):
+        m = re.search(r"^ZIP_EXTRA=\((.*?)\)", sc.read_text(encoding="utf-8", errors="replace"), re.M | re.S)
+        if m:
+            out += [p for p in shlex.split(m.group(1), comments=False) if p not in out]
+    return out
+
+
 def _pkg_comfy_min(pkg_dir, floor="0.34.7"):
     """The fake machine's ComfyUI: the package's own COMFY_MIN (3.0.0), never below the fixture's historic 0.34.7. A package
     needing a newer ComfyUI (Qwen Image 2.1: 0.37.0) otherwise stopped at the version gate before a pack or row was placed."""
@@ -325,6 +337,14 @@ def fake_pod(tmp_path, pkg_dir, strays=False, duplicates=False, foreign=False, l
             # 3.0.0: a package's vendored node packs ship in its zip, so the fake machine carries them too (they were
             # missing, and every suite test that reads a pack file failed inside the rehearsal while green elsewhere)
             shutil.copytree(f, pkg / f.name, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", ".git"))
+    for rel in zip_extra(pkg_dir):
+        # 3.9.2: and every file its ZIP_EXTRA ships, at its path, so a shipped directory that is not a node pack (the
+        # Video Replacer's app/) reaches the fake machine too; a listed file that is not there fails here, as package.py does
+        src = pathlib.Path(pkg_dir) / rel
+        if not src.is_file():
+            raise FileNotFoundError("%s: ZIP_EXTRA lists %r, which is not a file there" % (pkg_dir, rel))
+        (pkg / rel).parent.mkdir(parents=True, exist_ok=True)
+        (pkg / rel).write_bytes(src.read_bytes()); (pkg / rel).chmod(src.stat().st_mode)
     (root / "home").mkdir(exist_ok=True)
     return c
 

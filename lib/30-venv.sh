@@ -68,23 +68,48 @@ _base_newest_python_minor(){ # → the newest stable CPython minor uv can provid
 _base_python_minors(){ # → every stable CPython minor uv can provide, newest first
   uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV || true
 }
+_base_family_minors(){ # [backend] → the minors uv can provide, newest first, from the newest one the torch family has wheels for
+  # 3.9.2: a minor uv lists before torchaudio ships its wheel (cp315 on 2026-10-16) used to cost a fresh pod minutes: the
+  # backend pick stepped down through every CUDA build for it, then the full derived-set resolve ran for it, before both
+  # fell back to the next minor. One small compile of the family alone (torch, torchvision, torchaudio: seconds) now
+  # drops every minor newer than the first that has them, before anything else resolves. The rest stay, older ones
+  # included, for _base_python_pick to try against the whole set. The caller runs _base_tmp first.
+  local mm b="${1:-auto}" found="" tmp="$BASE_TMPD/family.txt" errf="$BASE_TMPD/family.err"
+  for mm in $(_base_python_minors); do
+    if [ -z "$found" ]; then
+      if printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" --python-platform "$(_base_uv_platform)" \
+           --torch-backend "$b" - -o "$tmp" >/dev/null 2>"$errf"; then
+        found=1
+      else
+        echo "    Python $mm: skipped, the torch family has no wheels for it on $b" >&2
+        { { grep -E '^\s*hint:' "$errf" || grep -v '^\s*$' "$errf" | tail -2; } | head -2 | cut -c1-220 | sed 's/^ */        /' || true; } >&2   # uv's own words
+        continue
+      fi
+    fi
+    echo "$mm"
+  done
+  rm -f "$tmp"
+}
 
 # ---------------------------------------------------------------- picks: genuine latest, no fallback
 _base_python_pick(){ # → newest CPython minor whose uv pip compile resolves the derived set (every upstream pin lifted) + torch
   # The resolve output must go to a real file: `uv pip compile -o /dev/null` fails because uv writes its
   # temp file beside the output path. `|| true` on the greps: an empty grep exits 1 and pipefail would
   # fire the ERR trap inside the substitution.
-  local mm tmp list cands f reqargs=() errf backend="${BASE_TORCH_BACKEND:-auto}"
+  local mm tmp cands f reqargs=() errf backend="${BASE_TORCH_BACKEND:-auto}"
   _base_tmp; tmp="$BASE_TMPD/resolve.txt"; errf="$BASE_TMPD/resolve.err"
   # 3.0.0: the DERIVED set, so no upstream == pin caps the Python either. Requirement files are POSITIONAL for
   # `uv pip compile` (uv 0.12 rejects `-r`: "unexpected argument", 2026-09-05).
   if _base_reqlift >/dev/null 2>"$errf" && [ -s "$BASE_LIFT_DIR/derived.txt" ]; then reqargs=("$BASE_LIFT_DIR/derived.txt")
   else while IFS= read -r f; do if [ -n "$f" ]; then reqargs+=("$f"); fi; done < <(_base_all_reqfiles); fi
-  list="$(uv python list 2>/dev/null || true)"
-  cands="$(printf '%s\n' "$list" | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV || true)"   # -rV, not tac: no tac on macOS
-  if [ -z "$cands" ]; then
+  if [ -z "$(_base_python_minors)" ]; then
     err "uv listed no CPython versions — cannot pick a Python (uv $(uv --version 2>/dev/null || echo missing))"
     BASE_FAILED+=("venv: uv python list returned nothing"); return 1
+  fi
+  cands="$(_base_family_minors "$backend")"                    # 3.9.2: never a full resolve for a minor torch has no wheels for
+  if [ -z "$cands" ]; then
+    err "the torch family (torch, torchvision, torchaudio) has wheels for no CPython minor uv lists ($(_base_python_minors | tr '\n' ' ')) on $backend"
+    return 1
   fi
   # 3.6.1: no shortcut when there is nothing else to resolve against. The torch family alone decides then, and it is
   # what ruled out the newest minor on 2026-10-15: uv listed CPython 3.15 before torch shipped a cp315 wheel, and
@@ -359,7 +384,7 @@ base_venv(){ # the stage: reuse when the probe passes, otherwise rebuild with ro
   BASE_TORCH_BACKEND="$have_backend"
   if [ -z "$BASE_TORCH_BACKEND" ]; then
     # 3.6.1: the newest minor torch has a build for, not the newest uv lists (3.15 arrived before its torch wheels)
-    local mm1; for mm1 in $(_base_python_minors); do
+    local mm1; _base_tmp; for mm1 in $(_base_family_minors); do                # 3.9.2: not for a minor the family has no wheels for
       if pick="$(_base_torch_pick "$mm1" "" 2>/dev/null)"; then BASE_TORCH_BACKEND="${pick#* }"; break; fi
     done
   fi

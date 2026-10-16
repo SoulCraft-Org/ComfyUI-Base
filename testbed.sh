@@ -270,8 +270,10 @@ provision_server() {
   fi
   "$VENV/bin/python" -c 'import importlib.metadata as m; print("  frontend " + m.version("comfyui-frontend-package"))' 2>/dev/null || true
   stop_server
+  refuse_foreign_port
   note "starting ComfyUI --cpu on port $PORT …"
-  ( cd "$COMFY" && nohup "$VENV/bin/python" main.py --cpu --port "$PORT" --disable-auto-launch \
+  # nohup alone in the background, so $! is the pid python runs as (nohup execs it): the pid file names the server
+  ( cd "$COMFY" || exit 1; nohup "$VENV/bin/python" main.py --cpu --port "$PORT" --disable-auto-launch \
       >"$LOG" 2>&1 & echo $! >"$PIDF" )
   echo "$PORT" >"$PORTF"     # the base's runner (lib/95-summary.sh) and _build/verify.sh read this to find the server
   local i
@@ -285,34 +287,67 @@ provision_server() {
   warn "server did not answer within 240 s — see $LOG"; tail -30 "$LOG" || true; return 1
 }
 
-stop_server() {
-  # $! inside the subshell is the SUBSHELL, not python — nohup's child ends up one pid along.
-  # Kill whatever is actually listening on the port, then fall back to the recorded pid.
-  # NB: lsof exits 1 when nothing matches, and `set -o pipefail` propagates that, so every
-  # lookup here needs `|| true` or `set -e` kills the caller before the server ever starts.
-  local pids=""
-  if command -v lsof >/dev/null 2>&1; then
-    pids="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u || true)"
-  fi
-  if [ -z "$pids" ] && [ -f "$PIDF" ]; then pids="$(cat "$PIDF" 2>/dev/null || true)"; fi
-  local p
-  for p in $pids; do
-    kill -0 "$p" 2>/dev/null || continue
-    kill "$p" 2>/dev/null || true
-    ok "stopped pid $p"
+# 3.9.2: the testbed stops only the server it started. It used to kill whatever listened on $PORT, and on a Mac shared
+# by several sessions that was another checkout's ComfyUI on 8199. Ours is the pid --server recorded in $PIDF, or a
+# child of it (a pid file written before 3.9.2 holds the subshell nohup's python ran under), and only while its command
+# line is still a ComfyUI main.py: a pid the system has since handed to something else is never ours.
+own_pids() {
+  [ -f "$PIDF" ] || return 0
+  local rec p
+  rec="$(tr -dc '0-9' < "$PIDF" 2>/dev/null || true)"
+  [ -n "$rec" ] && kill -0 "$rec" 2>/dev/null || return 0
+  for p in "$rec" $(pgrep -P "$rec" 2>/dev/null || true); do
+    case "$(ps -o command= -p "$p" 2>/dev/null || true)" in *main.py*--cpu*) echo "$p";; esac
   done
+}
+
+# Who listens on $PORT (pids), or "?" when something accepts a connection there and lsof is not on this host to say who.
+# NB: lsof exits 1 when nothing matches, and `set -o pipefail` propagates that, so every lookup needs `|| true`.
+port_holders() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u || true
+  elif (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+    echo "?"
+  fi
+}
+
+stop_server() {
+  local pids p i alive
+  pids="$(own_pids)"
+  for p in $pids; do kill "$p" 2>/dev/null && ok "stopped pid $p" || true; done
   if [ -n "$pids" ]; then
-    sleep 2
+    for i in 1 2 3 4 5 6 7 8 9 10; do          # up to 10 s for a clean exit, then the hard way
+      alive=0; for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+      [ "$alive" = 0 ] && break; sleep 1
+    done
     for p in $pids; do kill -9 "$p" 2>/dev/null || true; done
   fi
   rm -f "$PIDF" "$PORTF"
+  local held; held="$(port_holders | tr '\n' ' ')"
+  [ -n "${held// /}" ] && note "port $PORT is held by pid ${held% } (not this testbed's server): left running"
+  return 0
+}
+
+# Before --server starts: a port someone else holds is a stop, never a kill. Name the holder and the way out.
+refuse_foreign_port() {
+  local held p cmd=""
+  held="$(port_holders | tr '\n' ' ')"; held="${held% }"
+  [ -n "$held" ] || return 0
+  p="${held%% *}"; [ "$p" = "?" ] || cmd="$(ps -o command= -p "$p" 2>/dev/null | cut -c1-120 || true)"
+  warn "port $PORT is already in use by pid $held${cmd:+ ($cmd)}, which this testbed did not start; it is left running"
+  local free; free="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])' 2>/dev/null || echo 8237)"
+  note "another checkout's server, most likely. Pick a free port for this one: TESTBED_PORT=$free bash \"$HERE/testbed.sh\" --server"
+  exit 1
 }
 
 status() {
   hdr "STATUS"
   [ -d "$COMFY/.git" ] && ok "ComfyUI $(git -C "$COMFY" describe --tags 2>/dev/null || echo '?') · $(ls -1 "$CN" 2>/dev/null | wc -l | tr -d ' ') packs" || note "no source tree yet"
   [ -x "$VENV/bin/python" ] && ok "venv $($VENV/bin/python -V 2>&1)" || note "no venv"
-  if curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then ok "server answering on $PORT"; else note "server not running"; fi
+  local mine; mine="$(own_pids | head -1)"
+  if curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
+    if [ -n "$mine" ]; then ok "server answering on $PORT (this testbed's, pid $mine)"; else note "a server answers on $PORT, but not this testbed's (TESTBED_PORT picks another)"; fi
+  else note "server not running"; fi
   [ -f "$PORTF" ] && note "port file: $PORTF ($(tr -d '[:space:]' < "$PORTF"))"
   # what a provision WOULD install, and where the packages were found. Silent derivation is how 2.6.0 shipped
   # a testbed that quietly provisioned the base's packs and none of a consumer repository's.
