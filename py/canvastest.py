@@ -485,10 +485,16 @@ def test_snapshot_console_errors_are_all_explained(canvas, snap):
 
 def test_snapshot_sizes_cache_is_current(canvas, snap):
     """_build/sizes.json is what the layout tool sizes against. A fresh run must compute the same sizes for every
-    key, or the cache is from another frontend or another graph."""
+    key, or the cache is from another frontend or another graph. 3.8.2: only on the OS that photographed it. The
+    frontend measures text with the system's fonts, so a Linux runner computes other widths than the Mac that made
+    the cache (CI, 2026-10-16: 22 of a package's nodes off on Linux, 1 on the Mac, same frontend). A cache without
+    the field predates 3.8.2 and was made on the Mac, where the layout tool runs."""
     sizes = canvas.files["sizes"]
     if not os.path.exists(sizes): pytest.skip("no _build/sizes.json beside the workflow")
     fresh = snap["sizes"]["nodes"]; kept = json.loads(Path(sizes).read_text(encoding="utf-8"))
+    made_on = kept.get("platform", "darwin")
+    if made_on != sys.platform:
+        pytest.skip(f"sizes.json was photographed on {made_on}; this is {sys.platform}, whose fonts measure text differently")
     assert kept["workflow_structure_sha"] == snap["view"]["workflow_structure_sha"], "sizes.json was made from a different graph: rerun the photograph tool"
     off = [k for k, r in fresh.items() if k not in kept["nodes"] or any(abs(a - b) > 0.5 for a, b in zip(r["computed"], kept["nodes"][k]["computed"]))]
     assert off == [], f"{len(off)} nodes compute a different size than sizes.json holds (frontend {snap['view']['frontend']} vs {kept.get('frontend')}): {off[:8]}"

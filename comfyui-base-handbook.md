@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.8.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.8.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -625,6 +625,12 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.8.2: the canvas size cache is compared only on the OS that photographed it. The frontend measures text with the
+  system's fonts, so the package gate's Linux runner computed other sizes than the Mac that made `_build/sizes.json`
+  (2026-10-16: 22 of the Character Creator's nodes off on Linux, 1 on the Mac, both on frontend 1.55.17), and
+  `test_snapshot_sizes_cache_is_current` was red in CI for every package with a cache. `snapshot.py` now writes
+  `platform` into the cache; the test skips, naming both, where it differs. A cache without the field predates 3.8.2
+  and counts as the Mac's, where the layout tool runs. Exercised on this Mac; the Linux skip is CI's to show.
 - 3.8.1: a new pod is PRIVATE unless `--public` (Paul, 2026-10-16: everything a person touches is as simple, then as
   secure, then as private as possible). `podctl create` on RunPod with no flag makes 3.7.4's private pod (an encrypted pod
   volume, `22/tcp` only, ComfyUI on loopback through `podctl tunnel`) on Secure Cloud, B200 first; `--public` is the one way

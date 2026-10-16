@@ -304,6 +304,7 @@ def main():
                  and (r["stored"][0] < r["computed"][0] - 0.5 or r["stored"][1] < r["computed"][1] - 0.5)]
         Path(a.sizes_out).write_text(json.dumps(
                   {"frontend": view["frontend"], "comfyui": view["comfyui"], "generated": view["generated"],
+                   "platform": sys.platform,       # 3.8.2: the text metrics differ by OS; the cache is compared only where it was made
                    "workflow_structure_sha": view["workflow_structure_sha"],
                    "constants": {"NODE_TITLE_HEIGHT": 30, "NODE_SLOT_HEIGHT": 20, "NODE_WIDGET_HEIGHT": 20},
                    "nodes": sizes}, indent=1, ensure_ascii=False))
