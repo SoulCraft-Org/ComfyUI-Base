@@ -12,10 +12,10 @@ from basetest import fake_pod, run_script, tree_hash
 
 def test_install_preflight_changes_nothing_and_runs_no_pipeline(tmp_path):
     fake_pod(tmp_path, STUB, strays=True)
-    before = tree_hash(tmp_path, ignore=("logs",))
+    before = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
     r = run_script(SCRIPT, "preflight", fake_root=tmp_path)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
-    assert tree_hash(tmp_path, ignore=("logs",)) == before
+    assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == before
     assert "PREFLIGHT" in r.stdout and "nothing stops the install" in r.stdout
     for stage in ("══ VENV", "══ NODE PACKS", "══ MODEL LIBRARY", "══ TEST SUITE", "══ CONSOLIDATE"):
         assert stage not in r.stdout, stage
@@ -75,10 +75,10 @@ def test_install_own_packs_are_mirrored_recorded_and_left_alone_when_unchanged(t
     assert "own\tComfyUI-Stub-Own\t1.0.0\t" in manifest
     assert "time " in r.stdout and "slowest first" in r.stdout
     # the same zip again: nothing on the store moves
-    h = tree_hash(tmp_path, ignore=("logs",))
+    h = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
     r = run_script(src / "stub-script.sh", fake_root=tmp_path)
     assert r.returncode == 0 and "ComfyUI-Stub-Own 1.0.0 unchanged" in r.stdout, r.stdout[-3000:]
-    assert tree_hash(tmp_path, ignore=("logs",)) == h
+    assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == h
     # a new release of the pack: mirrored, and the file it no longer ships is gone
     src = _own_package(tmp_path, nodes="A = 2\n", version="1.0.1"); _refresh_pkg(tmp_path, src)
     r = run_script(src / "stub-script.sh", fake_root=tmp_path)

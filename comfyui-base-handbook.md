@@ -586,7 +586,9 @@ for any invocation that somehow arrives without the environment. The suite asser
   other walker. The workspace folder is `<name>/`, not `<brand>-<name>/` as 3.6.0's prose said: the rule needs the
   folder's name to be the script's stem, and the first consumer (SoulCraft, one repository per workflow under
   SoulCraft-Org) clones each package as `<workspace>/<name>/`. New: `test_unit_podctl_reads_the_workspace_shape_for_pkg_and_provider`.
-  Exercised on temp trees only.
+  Exercised on temp trees only. Also: the install tier's "a second run is a no-op" checks were red on `main` since
+  3.5.0, because 3.5.0's size cache (`state/sizes.tsv`, a directory's size by path and ctime) may gain a row on the
+  second run; like `logs/` it is a runtime record, not the store, so every no-op check now skips it (`basetest.tree_hash`).
 - 3.6.0: packages are found in the workspace shape too. Every cross-package walker assumed a consumer with the base as
   a submodule at `base/comfyui-base` and its packages under `<brand>/packages/<name>/`; the consumers are moving to one
   repository per package, cloned side by side as `<brand>-<name>/` under a workspace, with the base read from
