@@ -19,7 +19,9 @@ ships and moving it needs no package version.
   - a literal value converts for INT / FLOAT, lies within min / max, and is one of a combo's options.
 What it cannot see is a node's VALIDATE_INPUTS, which ComfyUI runs INSTEAD of the list check for the inputs it names
 (LoadImage's file name is checked against the disk, not the list). So upload combos (image_upload, video_upload, ...)
-and empty option lists (a model folder on a testbed without the weights) are not list-checked: they are counted as
+input file names (.mp4, .png, ...: the customer's file, renamed at run time), the inputs a package lists in
+_build/objinfo-self-validated.txt (its nodes' own VALIDATE_INPUTS), and empty option lists (a model folder on a testbed
+without the weights) are not list-checked: they are counted as
 "unjudged", never passed silently. A cache taken on the pod lists the pod's own files, so there a model name the pod
 lacks fails here, before a render dies on it.
 """
@@ -39,7 +41,17 @@ sys.path.insert(0, str(BASE / "py"))
 from canvas import FRONTEND_ONLY_TYPES                               # noqa: E402  the one list (canvas.py)
 
 CACHE = pathlib.Path("_build") / "object_info.json"
-UNJUDGED_KINDS = ("upload combo", "empty option list", "dynamic input")
+SELF_VALIDATED = pathlib.Path("_build") / "objinfo-self-validated.txt"   # Class.input per line: the node's own VALIDATE_INPUTS judges it
+MEDIA_EXT = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".gif", ".png", ".jpg", ".jpeg", ".webp", ".wav", ".mp3", ".flac", ".ogg", ".m4a")
+
+
+def self_validated(pkg):
+    """The inputs a package's nodes validate themselves (VALIDATE_INPUTS, invisible in /object_info): ComfyUI skips its list
+    check for them, so this check does too. One `Class.input` per line in _build/objinfo-self-validated.txt, # comments."""
+    f = pathlib.Path(pkg) / SELF_VALIDATED
+    if not f.is_file():
+        return set()
+    return {l.split("#", 1)[0].strip() for l in f.read_text(encoding="utf-8").splitlines() if l.split("#", 1)[0].strip()}
 
 
 def cache_path(pkg):
@@ -136,7 +148,7 @@ def reachable(prompt, types):
     return seen
 
 
-def check_prompt(prompt, types, venv_gated=()):
+def check_prompt(prompt, types, venv_gated=(), own=()):
     """(problems, unjudged) for one API prompt: problems are what ComfyUI would refuse; unjudged names what the schema
     alone cannot decide."""
     problems, unjudged = [], []
@@ -189,6 +201,10 @@ def check_prompt(prompt, types, venv_gated=()):
                 continue
             if any(key.endswith("upload") and extra.get(key) for key in extra):
                 unjudged.append("%s.%s: upload combo" % (k, name)); continue
+            if "%s.%s" % (c, name) in own:
+                unjudged.append("%s.%s: validated by the node itself" % (k, name)); continue
+            if isinstance(val, str) and val.lower().endswith(MEDIA_EXT):    # a file the customer supplies, renamed at run time
+                unjudged.append("%s.%s: input file" % (k, name)); continue
             if not opts:
                 unjudged.append("%s.%s: empty option list" % (k, name)); continue
             if val not in opts:
@@ -251,14 +267,14 @@ def check(pkg):
     for p in prompts:
         prompt = json.loads(p.read_text(encoding="utf-8"))
         nodes += len(prompt)
-        problems, unjudged = check_prompt(prompt, types, cache.get("venv_gated") or {})
+        problems, unjudged = check_prompt(prompt, types, cache.get("venv_gated") or {}, self_validated(pkg))
         skipped += len(unjudged)
         for line in problems:
             print("  %s %s" % (p.relative_to(pkg), line))
         bad += len(problems)
     print("objinfo %s: %d prompts, %d nodes against ComfyUI %s (cached from %s, %s): %s%s" % (
         pkg.name, len(prompts), nodes, cache.get("comfyui"), cache.get("server"), cache.get("generated"),
-        "%d problem(s)" % bad if bad else "OK", ", %d inputs unjudged (upload combos, empty lists, dynamic inputs)" % skipped if skipped else ""))
+        "%d problem(s)" % bad if bad else "OK", ", %d inputs unjudged (upload combos, input files, empty lists, dynamic or self-validated inputs)" % skipped if skipped else ""))
     return 1 if bad else 0
 
 
