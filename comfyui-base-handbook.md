@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.15.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.15.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -778,6 +778,10 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.15.3: a failing suite's report keeps each failing test whole (2026-10-16). `_build/verify.sh` printed only 12 to 24
+  lines of a failure, so a long assertion lost its cause in CI (it hid a Video Replacer failure's reason). It now prints
+  pytest's ERRORS and FAILURES sections (each test's header, its `>` lines and its whole E block), capped at 200 lines,
+  then the short summary naming every failing test. A test holds it.
 - 3.15.2: the first install's packs pip skip works, and 3.11.0 is measured on RunPod (2026-10-16). 3.11.0 meant the
   packs' requirements step to skip the set the venv build had just installed; it resolved it again (138 s on the pod)
   because the build took its fingerprint before reading the torch constraints from the venv again, and the install had
