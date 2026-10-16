@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.7.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.7.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -200,6 +200,8 @@ it rides a bearer header and is never printed.
 ```bash
 uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>     # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
 uv run "base/comfyui-base/_build/pod/podctl.py" deploy --like <pod> --wait   # a NEW pod cloned onto the same volume (rule 11's redeploy rung)
+uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500   # a first pod: stock check, network volume, Secure Cloud pod
+uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg <dir> --no-suite --env KEY=VALUE   # BASE_NO_SUITE=1 and KEY on every run on the machine
 uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>     # 22/tcp · PUBLIC_KEY = the Mac key · the start command · Host runpod · state/host.env
 uv run "base/comfyui-base/_build/pod/podctl.py" upload <zip>...  # to /workspace/packages, size + sha256 checked both sides
 uv run "base/comfyui-base/_build/pod/podctl.py" stop|start|restart <pod> --wait
@@ -588,6 +590,19 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.7.3: `podctl create` on RunPod, the volume a pod really has, and `install --no-suite` / `--env`. A first pod on a
+  fresh account needed the console or runpodctl, because RunPod had only `deploy --like <pod>`; `create` now checks
+  stock first (GraphQL `dataCenters`, the only stock view RunPod has) and names every data centre where the GPU is free,
+  stops before anything is created when the chosen one (or the `--volume`'s) has none, makes a network volume of
+  `--data-gb` there or reuses `--volume`, and puts a Secure Cloud pod on it (the image, `8188/http 8888/http 22/tcp`,
+  `PUBLIC_KEY`, container disk, `allowedCudaVersions` from `--min-cuda` or the image tag); a refused pod takes the
+  volume it made with it. `status` printed "volume NONE" for a pod whose `/workspace` is a pod volume
+  (`volumeInGb`), and every pod read now asks `includeNetworkVolume=true`, because the live openapi names only the
+  `networkVolume` object and not the `networkVolumeId` older answers carried: either shape is read, a pod volume is
+  named as one (and recorded for the disk gate), and `deploy` says why a pod volume cannot be cloned. `install
+  --no-suite` sets `BASE_NO_SUITE=1` for the base step and every package run (it had to be done by hand over ssh), and
+  `--env KEY=VALUE` passes any variable to every run on the machine, names printed, values never. Exercised on this
+  Mac against the suite's fake RunPod; the stock query and both volume shapes were read from the live API (read-only).
 - 3.7.2: no shell function is defined twice. `base.sh` sources `lib/[0-9][0-9]-*.sh` in order into one shell, so a name
   defined in two files is silently the later one: 00-env's §4 hook helper `base_run` was shadowed by 95-summary's
   install pipeline of the same name, and a hook that called it (`base_run cp …`, as §4 says) re-entered the whole

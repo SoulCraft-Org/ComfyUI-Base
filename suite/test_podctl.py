@@ -40,13 +40,17 @@ class FakeRunPod:
     """An in-memory RunPod REST v1: GET/PATCH /pods/{id}, POST /pods/{id}/start|stop, GET /pods. Records PATCH
     bodies in order. `on_patch` lets a test react (e.g. open the fake sshd once the start command lands)."""
 
-    def __init__(self, pod, volumes=None):
+    def __init__(self, pod, volumes=None, gql=None):
         self.pod = pod
         self.volumes = volumes or {}
         self.patches = []
         self.posts = []
+        self.bodies = []                                  # 3.7.3: (path, body) of every POST, for create
+        self.gets = []
         self.deletes = []
         self.on_patch = None
+        self.gql = gql or {}                              # 3.7.3: what POST /graphql answers under "data"
+        self.refuse_pods = False                          # 3.7.3: POST /pods answers 400 (sold out between check and create)
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -66,12 +70,14 @@ class FakeRunPod:
 
             def do_GET(self):
                 srv.last_auth = self._auth(); srv.last_ua = self.headers.get("User-Agent", "")
-                if self.path == "/pods":
+                srv.gets.append(self.path)
+                path = self.path.split("?")[0]            # 3.7.3: every pod read carries includeMachine/includeNetworkVolume
+                if path == "/pods":
                     return self._send(200, [srv.pod])
-                if self.path == "/pods/" + srv.pod["id"]:
+                if path == "/pods/" + srv.pod["id"]:
                     return self._send(200, srv.pod)
-                if self.path.startswith("/networkvolumes/") and self.path.split("/")[2] in srv.volumes:
-                    return self._send(200, srv.volumes[self.path.split("/")[2]])
+                if path.startswith("/networkvolumes/") and path.split("/")[2] in srv.volumes:
+                    return self._send(200, srv.volumes[path.split("/")[2]])
                 self._send(404, {"error": "no such pod"})
 
             def do_PATCH(self):
@@ -87,6 +93,21 @@ class FakeRunPod:
 
             def do_POST(self):
                 srv.posts.append(self.path)
+                n = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(n) or b"null")
+                srv.bodies.append((self.path, body))
+                if self.path == "/graphql":
+                    srv.last_auth = self._auth()
+                    return self._send(200, {"data": srv.gql})
+                if self.path == "/networkvolumes":
+                    vol = dict(body, id="newvol%d" % (len(srv.volumes) + 1))
+                    srv.volumes[vol["id"]] = vol
+                    return self._send(200, vol)
+                if self.path == "/pods":
+                    if srv.refuse_pods:
+                        return self._send(400, {"error": "There are no longer any instances available with the requested specifications."})
+                    srv.pod = dict(body, id="newpod0000001", desiredStatus="RUNNING", publicIp="127.0.0.1", portMappings={"22": 15270})
+                    return self._send(201, srv.pod)
                 if self.path.endswith("/stop"):
                     srv.pod["desiredStatus"] = "EXITED"
                     srv.pod["portMappings"] = {}
@@ -1561,3 +1582,202 @@ def test_unit_podctl_gate_is_not_rerun_for_a_zip_that_already_passed(tmp_path):
         io.gate(pkg, io.say)
     io.env.pop("FAKE_RC")
     io.gate(pkg, io.say); assert log.read_text().count("run") == 3   # the red run was not cached
+
+
+
+# ---------------------------------------------------------------- 3.7.3: the volume a pod really has, both REST shapes
+
+def test_unit_runpod_reads_either_volume_shape_and_names_a_pod_volume(tmp_path):
+    """2026-10-15: `status` said "volume NONE at /workspace" for a B200 pod whose /workspace held 500 GB: the account had
+    no network volume at all, the pod had a POD volume (volumeInGb). And the live openapi names only the networkVolume
+    object (with includeNetworkVolume=true), not the top-level networkVolumeId older answers carried: both are read."""
+    podctl = _load()
+    old = _pod(networkVolumeId="v1")                                                     # the 2026-09-05 shape
+    new = _pod(networkVolume={"id": "v2", "size": 400, "dataCenterId": "EU-RO-1"}); new.pop("networkVolumeId")
+    podvol = _pod(networkVolumeId=None, volumeInGb=500); podvol.pop("networkVolumeId")    # what the live pod answered
+    bare = _pod(volumeInGb=0); bare.pop("networkVolumeId")
+    assert podctl.pod_volume(old)["kind"] == "network" and podctl.pod_volume_id(old) == "v1"
+    assert podctl.pod_volume(new) == {"kind": "network", "id": "v2", "size": 400, "dc": "EU-RO-1"}
+    assert podctl.pod_volume(podvol)["kind"] == "pod" and podctl.pod_volume_id(podvol) == ""
+    assert podctl.pod_volume(bare)["kind"] == "none"
+    assert "network volume v2 (400 GB, EU-RO-1) at /workspace" in podctl.pod_facts(new)
+    line = [l for l in podctl.pod_facts(podvol).splitlines() if l.startswith("volume")][0]
+    assert "pod volume 500 GB at /workspace" in line and "NONE" not in line and "deleted with the pod" in line, line
+    assert "NONE at /workspace" in podctl.pod_facts(bare)
+    # the size: embedded or volumeInGb, without asking the API; the disk gate gets a pod volume too
+    assert podctl.volume_size_gb(None, new) == 400 and podctl.volume_size_gb(None, podvol) == 500 and podctl.volume_size_gb(None, bare) is None
+    bin_ = tmp_path / "bin"; bin_.mkdir(); log = tmp_path / "calls.log"
+    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\nexit 0\n' % log); (bin_ / "ssh").chmod(0o755)
+    out = podctl.record_volume(None, podvol, env={**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])})
+    assert " 500 " in log.read_text() and "pod-volume:fakepod0000001" in log.read_text() and "500 GB" in out
+    # deploy: the new shape clones (the data centre from the object); a pod volume says why it cannot
+    src = dict(new, machine={"gpuTypeId": "NVIDIA B200", "secureCloud": True}, gpuCount=1, containerDiskInGb=50)
+    body = podctl.deploy_body(src)
+    assert body["networkVolumeId"] == "v2" and body["dataCenterIds"] == ["EU-RO-1"]
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.deploy_body(dict(podvol, machine={"gpuTypeId": "NVIDIA B200"}))
+    assert "500 GB pod volume" in str(e.value) and "podctl create" in str(e.value)
+    # every pod read asks for both include flags, so the networkVolume object comes back whatever made the pod
+    srv = FakeRunPod(new)
+    try:
+        prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url))
+        prov.pod(new["id"]); prov.pods()
+    finally:
+        srv.close()
+    assert len(srv.gets) == 2 and all("includeNetworkVolume=true" in g and "includeMachine=true" in g for g in srv.gets), srv.gets
+
+
+# ---------------------------------------------------------------- 3.7.3: podctl create on RunPod
+
+B200_STOCK = {"dataCenters": [
+    {"id": "EU-RO-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B200", "stockStatus": "Low", "available": True}]},
+    {"id": "US-NE-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B200", "stockStatus": None, "available": False},
+                                          {"gpuTypeId": "NVIDIA H200", "stockStatus": "High", "available": True}]},
+    {"id": "US-CA-2", "gpuAvailability": [{"gpuTypeId": "NVIDIA B200", "stockStatus": "Medium", "available": True}]},
+    {"id": "AP-IN-3", "gpuAvailability": []}]}
+
+
+def _create(podctl, srv, pub, *argv):
+    prov = podctl.RunPodProvider(api=podctl.Api("rp_key_create", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "b2", "--gpu", "NVIDIA B200",
+                                             "--image", "runpod/comfyui:1.4.7-cuda13.0", "--no-wait", *argv])
+    return podctl.cmd_create(prov, args)
+
+
+def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod(tmp_path, capsys):
+    """2026-10-15: a first pod on a fresh account needed the web console (RunPod had only `deploy --like`). `create`:
+    the stock check names every data centre with the GPU free NOW and stops before anything bills when the chosen one
+    has none; then a network volume there, then a Secure Cloud pod on it with the three ports, PUBLIC_KEY, the CUDA floor."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    try:
+        assert podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql")).availability("NVIDIA B200") == ["EU-RO-1", "US-CA-2"]
+        assert srv.last_auth == "Bearer k"
+        # a data centre without stock: STOP, naming the ones that have it; nothing is created
+        assert _create(podctl, srv, pub, "--data-gb", "500", "--location", "US-NE-1") == 1
+        out = capsys.readouterr().out
+        assert "free now in: EU-RO-1, US-CA-2" in out and "STOP: US-NE-1 has no NVIDIA B200 free" in out, out
+        assert [p for p in srv.posts if p != "/graphql"] == []
+        # neither a new size nor an existing volume: refused before any call bills
+        with pytest.raises(podctl.PodctlError):
+            _create(podctl, srv, pub)
+        # the first data centre with stock, a new volume there, the pod on it
+        srv.posts.clear(); srv.bodies.clear()
+        assert _create(podctl, srv, pub, "--data-gb", "500") in (None, 0)
+        out = capsys.readouterr().out
+    finally:
+        srv.close()
+    assert srv.posts == ["/graphql", "/networkvolumes", "/pods"], srv.posts
+    vol, body = srv.bodies[1][1], srv.bodies[2][1]
+    assert vol == {"name": "b2-data", "size": 500, "dataCenterId": "EU-RO-1"}
+    assert body["cloudType"] == "SECURE" and body["dataCenterIds"] == ["EU-RO-1"] and body["networkVolumeId"] == "newvol1"
+    assert body["volumeMountPath"] == "/workspace" and body["ports"] == ["8188/http", "8888/http", "22/tcp"]
+    assert body["env"] == {"PUBLIC_KEY": "ssh-ed25519 AAAAMAC mac@key"} and body["gpuTypeIds"] == ["NVIDIA B200"] and body["gpuCount"] == 1
+    assert body["allowedCudaVersions"] == ["13.0"] and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
+    assert "templateId" not in body and "dockerStartCmd" not in body and body["interruptible"] is False
+    assert "created newpod0000001" in out and "next: podctl ensure newpod0000001" in out and "rp_key_create" not in out, out
+
+
+def test_unit_runpod_create_reuses_a_volume_and_a_refusal_takes_only_its_own_volume(tmp_path, capsys):
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    vols = {"oldvol": {"id": "oldvol", "size": 300, "dataCenterId": "US-CA-2"}, "rovol": {"id": "rovol", "size": 100, "dataCenterId": "US-NE-1"}}
+    srv = FakeRunPod(_pod(), volumes=dict(vols), gql=B200_STOCK)
+    try:
+        # an existing volume pins the data centre: a different --location is refused, and the pod goes where the volume is
+        with pytest.raises(podctl.PodctlError) as e:
+            _create(podctl, srv, pub, "--volume", "oldvol", "--location", "EU-RO-1")
+        assert "is in US-CA-2" in str(e.value)
+        _create(podctl, srv, pub, "--volume", "oldvol", "--min-cuda", "12.8")
+        assert "/networkvolumes" not in srv.posts
+        body = srv.bodies[-1][1]
+        assert body["networkVolumeId"] == "oldvol" and body["dataCenterIds"] == ["US-CA-2"] and body["allowedCudaVersions"] == ["13.0", "12.9", "12.8"]
+        # a volume whose data centre has no stock: STOP, and say the volume is why
+        assert _create(podctl, srv, pub, "--volume", "rovol") == 1
+        assert "the volume pins the data centre" in capsys.readouterr().out
+        # sold out between the check and the create: the volume THIS call made is deleted; an existing one never is
+        srv.refuse_pods = True
+        with pytest.raises(podctl.PodctlError):
+            _create(podctl, srv, pub, "--data-gb", "200")
+        made = [b for p, b in srv.bodies if p == "/networkvolumes"]
+        assert len(made) == 1 and srv.deletes == ["/networkvolumes/newvol3"], (made, srv.deletes)
+        with pytest.raises(podctl.PodctlError):
+            _create(podctl, srv, pub, "--volume", "oldvol")
+        assert srv.deletes == ["/networkvolumes/newvol3"], srv.deletes
+    finally:
+        srv.close()
+
+
+def test_unit_runpod_create_waits_for_sshd_and_points_the_host_block_at_the_new_pod(tmp_path):
+    podctl = _load()
+    api_srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    try:
+        api = podctl.Api("k", base_url=api_srv.url, graphql_url=api_srv.url + "/graphql")
+        cfg = tmp_path / "config"; said = []
+        pod_id = podctl.create(api, "b2", "NVIDIA B200", "EU-RO-1", data_gb=50, image="x/comfy:cu130", pubkey="ssh-ed25519 K k",
+                               wait=True, sleep=lambda s: None, banner=lambda h, p: True, ssh_config=cfg, say=said.append)
+    finally:
+        api_srv.close()
+    assert pod_id == "newpod0000001" and "15270" in cfg.read_text() and "127.0.0.1" in cfg.read_text()
+    assert any("ssh answers on 127.0.0.1:15270" in s for s in said), said
+    with pytest.raises(podctl.PodctlError):                         # no image: refused before any call
+        podctl.create(None, "b2", "NVIDIA B200", "EU-RO-1", data_gb=50, pubkey="k", wait=False, say=lambda *a: None)
+
+
+def test_unit_runpod_cuda_floor_comes_from_the_flag_or_the_image_tag():
+    podctl = _load()
+    assert podctl.cuda_floor("runpod/comfyui:1.4.7-cuda13.0") == "13.0"
+    assert podctl.cuda_floor("someone/comfy:cu130-py312") == "13.0" and podctl.cuda_floor("someone/comfy:cu128") == "12.8"
+    assert podctl.cuda_floor("someone/comfy:latest") is None and podctl.cuda_floor("someone/comfy:latest", "12.9") == "12.9"
+    assert podctl.allowed_cuda(None) is None and podctl.allowed_cuda("13.0") == ["13.0"]
+    with pytest.raises(podctl.PodctlError):
+        podctl.allowed_cuda("14.0")
+
+
+def test_unit_create_flags_a_host_does_not_take_are_refused_by_name(tmp_path):
+    """Verda's create_machine takes no --volume or --min-cuda: a clear refusal, never a TypeError traceback."""
+    podctl = _load()
+
+    class Verda:
+        name = "verda"; made = []
+        def availability(self, gpu, spot=False): return ["FIN-01"]
+        def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True, ssh_config=None, say=print):
+            self.made.append(name); return "i-1"
+    args = podctl.build_parser().parse_args(["create", "--name", "n", "--gpu", "1B200.30V", "--data-gb", "100", "--min-cuda", "13.0"])
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.cmd_create(Verda(), args)
+    assert "--min-cuda: not offered by host verda" in str(e.value) and Verda.made == []
+    args = podctl.build_parser().parse_args(["create", "--name", "n", "--gpu", "1B200.30V", "--volume", "v"])
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.cmd_create(Verda(), args)
+    assert "volume_location: not offered by host verda" in str(e.value)
+
+
+# ---------------------------------------------------------------- 3.7.3: install --no-suite and --env
+
+def test_unit_podctl_install_no_suite_and_env_reach_every_run_on_the_machine(tmp_path, capsys):
+    """2026-10-15: a "no suite on the pod" install had to be done by hand over ssh, because only the buyer path could set
+    an environment for the machine's runs. --no-suite is BASE_NO_SUITE=1 for the base step and every package run;
+    --env KEY=VALUE (repeatable) rides every run too."""
+    podctl = _load()
+    a = podctl.build_parser().parse_args(["install", "pod1", "--base", "--pkg", "x", "--no-suite",
+                                          "--env", "FOO=bar baz", "--env", "EMPTY=", "--env", "URL=a=b", "--env", "FOO=last"])
+    assert podctl.install_run_env(a) == {"FOO": "last", "EMPTY": "", "URL": "a=b", "BASE_NO_SUITE": "1"}
+    assert podctl.install_run_env(podctl.build_parser().parse_args(["install", "pod1", "--pkg", "x"])) == {}
+    for bad in ("1BAD=x", "NOEQUALS", "=x", "A-B=x"):
+        with pytest.raises(SystemExit):
+            podctl.build_parser().parse_args(["install", "pod1", "--env", bad])
+    capsys.readouterr()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [base, pkg], io, every=1, timeout=60, today="2026-10-15", save_pins=False,
+                        run_env={"FOO": "bar baz", "BASE_NO_SUITE": "1"})
+    out = capsys.readouterr().out
+    assert rc == 0 and "base suite: not run (BASE_NO_SUITE=1)" in out, out
+    calls = [c.rstrip() for c in (io.root / "calls.log").read_text().splitlines()]
+    assert calls == ["base.sh install-self", "My Pkg-script.sh preflight", "My Pkg-script.sh"], calls   # no base suite step
+    selfs = [c for c in io.cmds if "install-self" in c]; pre = [c for c in io.cmds if " preflight" in c]
+    runs = [c for c in io.cmds if "STEP RC=" in c and "nohup" in c]
+    assert len(selfs) == 1 and len(pre) == 1 and len(runs) == 1, io.cmds
+    for c in selfs + pre + runs:
+        assert "BASE_NO_SUITE=" in c and "FOO=" in c and "bar baz" in c, c

@@ -19,6 +19,11 @@ folder's `provider.py` is the RunPod half of the driver, moved here verbatim in 
 - **A network volume at `/workspace`** (`volumeMountPath`). The base installs itself to `/workspace/comfy-base` and the
   packages to `/workspace/packages`, so a stop, start or redeploy keeps everything. `podctl install` records the volume's
   size in `state/volume.env` because `df` on the pooled volume reports the pool, not the quota.
+  A **pod volume** (`volumeInGb`, the console's "Volume Disk" with no network volume chosen) also mounts at `/workspace`
+  and survives stop/start, but it belongs to that machine: terminating the pod deletes it, and `deploy --like` cannot
+  share it. `status` says which kind a pod has (3.7.3); before that a pod volume printed as "volume NONE".
+- **Network volumes exist only in Secure Cloud and pin a data centre**: the pod lands where its volume is, so the GPU must
+  be in stock THERE. `podctl create` checks that first.
 - **22/tcp exposed.** `ensure` adds it when missing (the pod resets).
 
 ## How the boot is handed over
@@ -49,14 +54,39 @@ mechanism; `BASE_HOST` is detected on the pod itself from PID 1's `RUNPOD_POD_ID
 ## The commands
 
     uv run "_build/pod/podctl.py" pods                          # every pod: id, name, image, status, public ip, port 22
+    uv run "_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 [--location <dc> | --volume <id>]
+                                                                # stock check (names the data centres with the GPU free now), network volume, Secure Cloud pod
     uv run "_build/pod/podctl.py" status <pod>                  # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
     uv run "_build/pod/podctl.py" ensure <pod>                  # 22/tcp, PUBLIC_KEY, the boot guard, Host runpod
     uv run "_build/pod/podctl.py" install <pod> --base --pkg <dir>...   # upload, extract, --check, run (everything newest), poll, logs, pack records
+                                                                # --no-suite (BASE_NO_SUITE=1 on the machine), --env KEY=VALUE (repeatable)
     uv run "_build/pod/podctl.py" stop|start|restart <pod> --wait
     uv run "_build/pod/podctl.py" deploy --like <pod> --wait    # a NEW pod cloned onto the same volume (a machine whose GPU is not ours)
     uv run "_build/pod/podctl.py" lease <pod> [--take|--release] [--minutes N] [--purpose ...]   # who holds the GPU; advisory, expires
     uv run "_build/pod/podctl.py" tunnel <pod>                  # 8188 and 8888 to localhost, until killed
     uv run "_build/pod/podctl.py" prune <pod> [--yes]           # the old-layout folders under /workspace/packages
+
+## Creating a pod from nothing (3.7.3)
+
+`podctl create` is the first-pod path on a fresh account (before it, only `deploy --like <pod>` existed, so a first pod
+needed the console or runpodctl). In order: the stock check (`stock` in `provider.py`: RunPod's GraphQL `dataCenters {
+gpuAvailability { gpuTypeId stockStatus available } }`, the same view `runpodctl datacenter list` prints; REST v1 has no
+stock call), which prints every data centre where the GPU is free now and stops when the chosen one (`--location`, or
+the `--volume`'s) has none; `POST /networkvolumes` (`--data-gb` in that data centre) unless `--volume` names an existing
+one; `POST /pods` with `cloudType SECURE`, `dataCenterIds` [that one], the network volume at `/workspace`, ports
+`8188/http 8888/http 22/tcp`, `env.PUBLIC_KEY` (the Mac key), `containerDiskInGb` (`--os-gb`, default 100),
+`supportPublicIp`, and `allowedCudaVersions`: REST v1's field (GraphQL's is `minCudaVersion`), every version from
+`--min-cuda`, else from the image tag (`…-cuda13.0`, `…-cu130`), upward. No templateId and no start command: `ensure`
+installs the boot guard as for every pod. A refused pod (sold out between the check and the create) deletes the volume
+the same call made, so nothing is left billing. `create` is a billable verb: a consumer's guard hook prompts for it.
+
+## The two shapes of a pod's volume
+
+REST v1 has answered with a top-level `networkVolumeId` (pods read on 2026-09-05) and, in its current openapi, names
+only the `networkVolume` object, which comes back when the read asks `includeNetworkVolume=true` (pods made by runpodctl
+v3 or the console, read on 2026-10-15). Every pod read asks for it (and for `includeMachine`), and `pod_volume_id`
+accepts either shape; `deploy` takes the data centre from `networkVolume.dataCenterId`. A pod with neither but
+`volumeInGb` > 0 has a pod volume, and its size goes to `state/volume.env` as `pod-volume:<pod id>`.
 
 `--provider runpod` is the default when the repository's `brand.toml` names no other host. The handbook's section 1
 ("Step zero") and section 7 ("State on the pod") carry the details this page leaves out.

@@ -47,6 +47,7 @@ def _sq(s):
 
 
 DEFAULT_API_URL = "https://rest.runpod.io/v1"
+DEFAULT_GRAPHQL_URL = "https://api.runpod.io/graphql"   # 3.7.3: stock per data centre lives only here (REST v1 has no stock call)
 
 
 PLACEHOLDERS = {"token_here", "replace_with_ids", "changeme", ""}
@@ -88,15 +89,16 @@ BASE_VERSION_FOR_UA = _base_version()
 class Api:
     """The few REST v1 calls podctl needs. JSON in, JSON out; errors carry the status and the body, never the key."""
 
-    def __init__(self, key, base_url=None):
+    def __init__(self, key, base_url=None, graphql_url=None):
         self.key = key
         self.base = (base_url or os.environ.get("RUNPOD_API_URL") or DEFAULT_API_URL).rstrip("/")
+        self.graphql_url = graphql_url or os.environ.get("RUNPOD_GRAPHQL_URL") or DEFAULT_GRAPHQL_URL
 
     USER_AGENT = "podctl/%s (ComfyUI Base; RunPod REST v1 client)" % BASE_VERSION_FOR_UA
 
-    def _call(self, method, path, body=None, _retry=True):
+    def _call(self, method, path, body=None, _retry=True, url=None):
         data = None if body is None else json.dumps(body).encode()
-        req = urllib.request.Request(self.base + path, data=data, method=method)
+        req = urllib.request.Request(url or (self.base + path), data=data, method=method)
         req.add_header("Authorization", "Bearer " + self.key)
         req.add_header("Accept", "application/json")
         req.add_header("User-Agent", self.USER_AGENT)   # 2.0.31: Cloudflare blocks urllib's default signature (error 1010)
@@ -113,7 +115,7 @@ class Api:
             if e.code == 403 and "error-1010" in text and _retry:
                 import time
                 time.sleep(5)                               # one retry: the edge rule is per request signature, not per key
-                return self._call(method, path, body, _retry=False)
+                return self._call(method, path, body, _retry=False, url=url)
             raise PodctlError("%s %s -> HTTP %s: %s" % (method, path, e.code, text[:300]))
         except urllib.error.URLError as e:
             raise PodctlError("%s %s -> %s" % (method, path, e.reason))
@@ -131,6 +133,13 @@ class Api:
     def delete(self, path):
         return self._call("DELETE", path)
 
+    def graphql(self, query, variables=None):
+        """RunPod's GraphQL API, for what REST v1 does not answer (stock per data centre). Same bearer header."""
+        out = self._call("POST", "graphql", {"query": query, "variables": variables or {}}, url=self.graphql_url)
+        if out.get("errors"):
+            raise PodctlError("GraphQL: %s" % "; ".join(str(e.get("message", e)) for e in out["errors"])[:300])
+        return out.get("data") or {}
+
 
 def pod_image(pod):
     """RunPod's REST v1 returns `imageName` (its openapi says `image`); accept both."""
@@ -138,7 +147,40 @@ def pod_image(pod):
 
 
 def pod_volume_id(pod):
+    """The NETWORK volume's id, in either shape REST v1 has answered with: a top-level `networkVolumeId` (pods read on
+    2026-09-05) or only the `networkVolume` object, which the live openapi names and which comes back with
+    `includeNetworkVolume=true` (pods created by runpodctl v3 or the console, read on 2026-10-15). "" for none."""
     return pod.get("networkVolumeId") or (pod.get("networkVolume") or {}).get("id") or ""
+
+
+POD_READ = "?includeMachine=true&includeNetworkVolume=true"   # 3.7.3: every pod read asks for both, so either shape is complete
+
+
+def pod_volume(pod):
+    """What persists at volumeMountPath: {'kind': 'network' | 'pod' | 'none', 'id', 'size' (GB or None), 'dc'}.
+    3.7.3: a pod volume (`volumeInGb` > 0, the pod's own disk on that machine) used to print as "volume NONE", which
+    reads as "nothing persists". It persists across stop/start, but it is the machine's: terminate deletes it and a
+    clone cannot share it, so the status line says which kind it is."""
+    vid = pod_volume_id(pod)
+    if vid:
+        nv = pod.get("networkVolume") or {}
+        size = nv.get("size")
+        return {"kind": "network", "id": vid, "size": int(size) if size is not None else None, "dc": nv.get("dataCenterId") or ""}
+    gb = int(pod.get("volumeInGb") or 0)
+    if gb > 0:
+        return {"kind": "pod", "id": "", "size": gb, "dc": (pod.get("machine") or {}).get("dataCenterId") or ""}
+    return {"kind": "none", "id": "", "size": None, "dc": ""}
+
+
+def volume_line(pod):
+    v, at = pod_volume(pod), pod.get("volumeMountPath") or "?"
+    if v["kind"] == "network":
+        extra = ", ".join(x for x in (("%d GB" % v["size"]) if v["size"] is not None else "", v["dc"]) if x)
+        return "network volume %s%s at %s" % (v["id"], (" (%s)" % extra) if extra else "", at)
+    if v["kind"] == "pod":
+        return ("pod volume %d GB at %s (this machine's disk: kept across stop/start, deleted with the pod, "
+                "not shareable by deploy --like)" % (v["size"], at))
+    return "NONE at %s" % at
 
 
 def env_verdicts(env):
@@ -165,7 +207,7 @@ def pod_facts(pod):
         "public ip  %s" % (pod.get("publicIp") or "(none yet)"),
         "ports      %s" % " ".join(pod.get("ports") or []) ,
         "ssh        %s" % ("%s:%s" % (pod.get("publicIp"), mapping["22"]) if mapping.get("22") else "port 22 not mapped"),
-        "volume     %s at %s" % (pod_volume_id(pod) or "NONE", pod.get("volumeMountPath") or "?"),
+        "volume     %s" % volume_line(pod),
         "start cmd  %s" % (" ".join(pod.get("dockerStartCmd") or []) or "(image default)"),
     ]
     for name, verdict in env_verdicts(env).items():
@@ -376,15 +418,21 @@ def deploy_body(src, name=None, gpu=None):
     start command over the clone's. The one reason to exist: a machine whose GPU is not ours (2.0.26's verdict): a stop/start
     lands on the same machine; a new pod lands wherever the datacenter has the GPU free."""
     vol = src.get("networkVolume") or {}
-    if not src.get("networkVolumeId") or not vol.get("dataCenterId"):
-        raise PodctlError("%s has no network volume: nothing for a clone to share (a redeploy is for a pod on a volume)" % src.get("id"))
+    vid = pod_volume_id(src)
+    if not vid:
+        why = (" (its %s is a %d GB pod volume, the machine's own disk)" % (src.get("volumeMountPath") or "/workspace", src["volumeInGb"])
+               if int(src.get("volumeInGb") or 0) > 0 else "")
+        raise PodctlError("%s has no network volume%s: nothing for a clone to share (a redeploy is for a pod on a network "
+                          "volume; podctl create makes one)" % (src.get("id"), why))
+    if not vol.get("dataCenterId"):
+        raise PodctlError("%s: the API did not say which data centre volume %s is in (networkVolume missing)" % (src.get("id"), vid))
     machine = src.get("machine") or {}
     gpu = gpu or machine.get("gpuTypeId")
     if not gpu:
         raise PodctlError("%s: the API did not name the GPU type (machine facts missing): pass --gpu" % src.get("id"))
     body = {"name": name or "%s-2" % (src.get("name") or "pod"), "imageName": src["imageName"], "gpuTypeIds": [gpu],
             "gpuCount": int(src.get("gpuCount") or 1), "containerDiskInGb": int(src.get("containerDiskInGb") or 50),
-            "networkVolumeId": src["networkVolumeId"], "volumeMountPath": src.get("volumeMountPath") or "/workspace",
+            "networkVolumeId": vid, "volumeMountPath": src.get("volumeMountPath") or "/workspace",
             "ports": list(src.get("ports") or []), "env": dict(src.get("env") or {}),
             "cloudType": "SECURE" if machine.get("secureCloud", True) else "COMMUNITY", "dataCenterIds": [vol["dataCenterId"]],
             "supportPublicIp": True, "computeType": "GPU", "interruptible": bool(src.get("interruptible"))}
@@ -399,7 +447,7 @@ def deploy(api, like, name=None, gpu=None, wait=True, sleep=None, banner=ssh_ban
     Returns the new pod id. Prints counts and names, never an env value."""
     import time
     sleep = sleep or time.sleep
-    src = api.get("/pods/%s?includeMachine=true&includeNetworkVolume=true" % like)
+    src = api.get("/pods/%s%s" % (like, POD_READ))
     body = deploy_body(src, name=name, gpu=gpu)
     new = api.post("/pods", body)
     pod_id = new["id"]
@@ -431,12 +479,15 @@ def deploy(api, like, name=None, gpu=None, wait=True, sleep=None, banner=ssh_ban
 
 
 def volume_size_gb(api, pod):
-    """The network volume's size in GB from RunPod's REST, or None for a pod without one."""
-    vid = pod_volume_id(pod)
-    if not vid:
+    """The persistent volume's size in GB: a network volume's from RunPod's REST (or the embedded networkVolume), a pod
+    volume's from `volumeInGb`; None for a pod without either."""
+    v = pod_volume(pod)
+    if v["kind"] == "pod" or (v["kind"] == "network" and v["size"] is not None):
+        return v["size"]
+    if v["kind"] != "network":
         return None
-    v = api.get("/networkvolumes/%s" % vid)
-    size = v.get("size") if isinstance(v, dict) else None
+    nv = api.get("/networkvolumes/%s" % v["id"])
+    size = nv.get("size") if isinstance(nv, dict) else None
     return int(size) if size is not None else None
 
 
@@ -447,7 +498,7 @@ def record_volume(api, pod, env=None):
     size = volume_size_gb(api, pod)
     if size is None:
         return None
-    vid = pod_volume_id(pod)
+    vid = pod_volume_id(pod) or "pod-volume:%s" % pod.get("id")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     cmd = "mkdir -p /workspace/comfy-base/state && printf 'VOLUME_GB=%%s\\nVOLUME_ID=%%s\\nRECORDED=%%s\\n' %s %s %s > /workspace/comfy-base/state/volume.env" % (
         _sq(str(size)), _sq(vid), _sq(ts))
@@ -455,6 +506,107 @@ def record_volume(api, pod, env=None):
     if r.returncode != 0:
         raise PodctlError("could not record the volume size on the pod: %s" % r.stderr.strip()[-300:])
     return "volume  %d GB (%s) recorded in state/volume.env" % (size, vid)
+
+
+# ---------------------------------------------------------------- 3.7.3: create, from nothing
+
+STOCK_QUERY = "query { dataCenters { id name location gpuAvailability { gpuTypeId stockStatus available } } }"
+CREATE_PORTS = ["8188/http", "8888/http", "22/tcp"]      # ComfyUI and JupyterLab through the proxy, sshd on a public port
+CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
+
+
+def stock(api, gpu):
+    """[(data centre id, stock status)] where `gpu` can be rented NOW, in RunPod's order (GraphQL dataCenters; REST v1 has
+    no stock call). `available` is the verdict; stockStatus (Low, Medium, High) is said beside it."""
+    rows = []
+    for dc in (api.graphql(STOCK_QUERY).get("dataCenters") or []):
+        for g in dc.get("gpuAvailability") or []:
+            if g.get("gpuTypeId") == gpu and g.get("available"):
+                rows.append((dc.get("id"), g.get("stockStatus") or "?"))
+    return rows
+
+
+def cuda_floor(image, min_cuda=None):
+    """The lowest host CUDA the pod accepts: --min-cuda, else what the image's tag says it was built for (cuda13.0,
+    cu130), else None (any). A cu130 image on a 12.x driver starts and then fails at the first kernel."""
+    if min_cuda:
+        return str(min_cuda)
+    tag = (image or "").rpartition(":")[2]
+    m = re.search(r"cuda[-_]?(\d+)\.(\d+)", tag) or re.search(r"(?<![a-z])cu(\d{2})(\d)(?!\d)", tag)
+    return "%s.%s" % (int(m.group(1)), m.group(2)) if m else None
+
+
+def allowed_cuda(floor):
+    if not floor:
+        return None
+    key = lambda v: tuple(int(x) for x in v.split("."))
+    if floor not in CUDA_VERSIONS and not any(key(v) >= key(floor) for v in CUDA_VERSIONS):
+        raise PodctlError("--min-cuda %s: RunPod offers %s" % (floor, ", ".join(CUDA_VERSIONS)))
+    return [v for v in CUDA_VERSIONS if key(v) >= key(floor)]
+
+
+def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False):
+    """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
+    data centre, the three ports, PUBLIC_KEY, the CUDA floor. No templateId and no start command: `ensure` installs the
+    base's boot guard from the image's own entry, as for every other pod."""
+    body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
+            "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
+            "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
+    if cuda:
+        body["allowedCudaVersions"] = list(cuda)
+    return body
+
+
+def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_gb=100, pubkey=None, min_cuda=None, spot=False,
+           wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print):
+    """A pod from nothing: a network volume of `data_gb` in `dc` (or the existing `volume`), then the pod on it. A refused
+    pod (sold out between the stock check and the create) takes a volume THIS call made with it, so nothing is left
+    billing; an existing volume is never deleted. With wait: until sshd answers, then `Host runpod` -> the new pod.
+    Returns the pod id. Prints names and counts, never the key."""
+    import time
+    sleep = sleep or time.sleep
+    if not image:
+        raise PodctlError("--image is required on RunPod (the pod's container image, e.g. a ComfyUI image built for CUDA 13)")
+    if not pubkey:
+        raise PodctlError("no public key for PUBLIC_KEY: pass --pubkey <file.pub>")
+    cuda = allowed_cuda(cuda_floor(image, min_cuda))
+    made = None
+    if volume:
+        vid = volume
+    else:
+        if not data_gb:
+            raise PodctlError("--data-gb N (a new network volume) or --volume <id> (an existing one)")
+        made = vid = api.post("/networkvolumes", {"name": "%s-data" % name, "size": int(data_gb), "dataCenterId": dc})["id"]
+        say("created network volume %s (%s-data): %d GB in %s" % (vid, name, int(data_gb), dc))
+    body = create_body(name, gpu, dc, vid, image, container_gb, pubkey, cuda=cuda, spot=spot)
+    try:
+        pod_id = api.post("/pods", body)["id"]
+    except Exception:
+        if made:
+            try:
+                api.delete("/networkvolumes/%s" % made)
+                say("  the pod was refused: network volume %s deleted again (nothing left billing)" % made)
+            except Exception as e:  # the refusal is the news; a leftover volume is named so it can be removed
+                say("  !! could not delete the new network volume %s after the refusal: %s" % (made, e))
+        raise
+    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · network volume %s at %s · ports %s · CUDA %s%s" % (
+        pod_id, name, image, gpu, dc, int(container_gb), vid, VOLUME_ROOT, " ".join(CREATE_PORTS),
+        (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
+    if not wait:
+        return pod_id
+    pod = wait_for(api, pod_id, lambda p: p.get("desiredStatus") == "RUNNING" and p.get("publicIp") and (p.get("portMappings") or {}).get("22"),
+                   "RUNNING with port 22 mapped", sleep, tries=120)
+    host, port = pod["publicIp"], int(pod["portMappings"]["22"])
+    for _ in range(120):
+        if banner(host, port):
+            break
+        sleep(5)
+    else:
+        raise PodctlError("created %s, but sshd never answered on %s:%d: does the image run sshd from PUBLIC_KEY? "
+                          "podctl ensure %s wraps its start command" % (pod_id, host, port, pod_id))
+    write_ssh_config(ssh_config or pathlib.Path.home() / ".ssh" / "config", host, port)
+    say("  ssh answers on %s:%d (Host %s -> %s)" % (host, port, _c().SSH_ALIAS, pod_id))
+    return pod_id
 
 
 # ---------------------------------------------------------------- the provider the driver loads
@@ -473,10 +625,10 @@ class RunPodProvider(Provider):
         self.api = api or Api(load_api_key())
 
     def pods(self):
-        return self.api.get("/pods") or []
+        return self.api.get("/pods" + POD_READ) or []
 
     def pod(self, ident):
-        return self.api.get("/pods/" + ident)
+        return self.api.get("/pods/" + ident + POD_READ)
 
     def facts(self, pod):
         mapping = pod.get("portMappings") or {}
@@ -522,3 +674,25 @@ class RunPodProvider(Provider):
 
     def record_volume(self, pod, env=None):
         return record_volume(self.api, pod, env=env)
+
+    # 3.7.3: `podctl create` (the verb Verda already had) and the stock check behind it
+    def availability(self, gpu, spot=False):
+        """The data centres where `gpu` can be rented now, in RunPod's order (spot shares the on-demand stock view)."""
+        return [dc for dc, _ in stock(self.api, gpu)]
+
+    def stock_text(self, gpu):
+        rows = stock(self.api, gpu)
+        return ", ".join("%s (%s)" % r for r in rows) if rows else "nowhere"
+
+    def volume_location(self, volume_id):
+        v = self.api.get("/networkvolumes/%s" % volume_id)
+        if not isinstance(v, dict) or not v.get("dataCenterId"):
+            raise PodctlError("network volume %s: the API named no data centre (%r)" % (volume_id, v))
+        return v["dataCenterId"]
+
+    def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True,
+                       ssh_config=None, say=print, volume=None, min_cuda=None):
+        if not pubkey:
+            pubkey = _c().mac_public_key(None)
+        return create(self.api, name, gpu, location, data_gb=data_gb, volume=volume, image=image, container_gb=os_gb, pubkey=pubkey,
+                      min_cuda=min_cuda, spot=spot, wait=wait, ssh_config=ssh_config, say=say)

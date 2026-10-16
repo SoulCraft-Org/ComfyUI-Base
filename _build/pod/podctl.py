@@ -66,7 +66,8 @@ _runpod = _hosts.load_provider("runpod", BASE_DIR)
 RunPodProvider = _runpod.RunPodProvider
 for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "Api", "pod_image", "pod_volume_id", "env_verdicts", "pod_facts",
            "BOOT_GUARD", "image_config", "wrap_entry", "sshd_bootstrap_text", "wait_for", "ensure", "stop", "start", "restart", "deploy_body",
-           "deploy", "volume_size_gb", "record_volume"):
+           "deploy", "volume_size_gb", "record_volume", "POD_READ", "pod_volume", "volume_line", "stock", "cuda_floor", "allowed_cuda",
+           "create_body", "create"):
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -772,11 +773,11 @@ def _preflight(io, env, script):
     return rc, out, err, "preflight"
 
 
-def _install_base_only(io, it, every, timeout, today, suite=True):
+def _install_base_only(io, it, every, timeout, today, suite=True, env=""):
     """Step one when a package install follows (3.2.0): install the base onto the volume, then its own suite only when
     this base version has not already passed on this machine (state/base-suite.ok: VERSION + the manifest's cksum).
     suite=False (a buyer's machine, BASE_NO_SUITE=1) installs only."""
-    rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && BASE_REEXEC=1 bash comfyui-base/base.sh install-self")
+    rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && %sBASE_REEXEC=1 bash comfyui-base/base.sh install-self" % env)
     if rc != 0:
         io.say("STOP: installing %s on the pod failed (exit %d)\n%s" % (it["name"], rc, _tail(out + err))); return False
     io.say("  installed on the volume (its packs, venv and restart are the package run's)")
@@ -786,8 +787,8 @@ def _install_base_only(io, it, every, timeout, today, suite=True):
     key = '"$(cat %s/VERSION) $(cksum < %s/MANIFEST.sha256)"' % (_sq(home), _sq(home))
     ok_file = _sq(home + "/state/base-suite.ok")
     inner = ('K=%s; if [ "$(cat %s 2>/dev/null)" = "$K" ]; then echo "  base suite already green on this machine for this base"; '
-             'echo "STEP RC=0"; else bash %s test; rc=$?; if [ "$rc" = 0 ]; then printf "%%s\\n" "$K" > %s; fi; echo "STEP RC=$rc"; fi'
-             % (key, ok_file, _sq(home + "/comfyui-base-script.sh"), ok_file))
+             'echo "STEP RC=0"; else %sbash %s test; rc=$?; if [ "$rc" = 0 ]; then printf "%%s\\n" "$K" > %s; fi; echo "STEP RC=$rc"; fi'
+             % (key, ok_file, env, _sq(home + "/comfyui-base-script.sh"), ok_file))
     step_rc, text, console = _run_logged(io, it["name"] + " suite", it["slug"], inner, every=every, timeout=timeout)
     if step_rc is None:
         return False
@@ -833,7 +834,7 @@ def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_
             # venv, the newest pass, the restart): the base is installed, never run as a second whole pipeline. A buyer's
             # machine (BASE_NO_SUITE=1: no pytest there) skips the base's suite too.
             suite = (run_env or {}).get("BASE_NO_SUITE") != "1"
-            if not _install_base_only(io, it, every, timeout, today, suite=suite):
+            if not _install_base_only(io, it, every, timeout, today, suite=suite, env=_env_prefix(run_env)):
                 return 1
             io.say("  %s: green" % it["name"])
             continue
@@ -1282,6 +1283,26 @@ def cmd_prune(prov, args):
     return prune(_SshIO(), print, yes=args.yes)
 
 
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def env_pair(text):
+    """argparse type for --env KEY=VALUE: (KEY, VALUE). The value may be empty and may hold '='; the name must be a shell name."""
+    name, eq, value = text.partition("=")
+    if not eq or not ENV_NAME.match(name):
+        raise argparse.ArgumentTypeError("%r is not KEY=VALUE with KEY a shell variable name" % text)
+    return (name, value)
+
+
+def install_run_env(args):
+    """3.7.3: what `install` prefixes to every remote run: --env pairs in order (a later one wins), then --no-suite's
+    BASE_NO_SUITE=1, which also stops the base's own suite step (install() reads it from run_env)."""
+    run_env = dict(getattr(args, "env", None) or [])
+    if getattr(args, "no_suite", False):
+        run_env["BASE_NO_SUITE"] = "1"
+    return run_env
+
+
 def cmd_install(prov, args):
     if getattr(args, "no_latest", False):
         print("STOP: --no-latest is retired in 3.0.0: every install takes ComfyUI, the packs and every package to their newest")
@@ -1315,9 +1336,12 @@ def cmd_install(prov, args):
         print(write_host_env(prov))
         if getattr(args, "comfy_ref", None):
             print("comfyui ref %s (from --comfy-ref; this install only: the next one without it returns the store to the newest release)" % args.comfy_ref)
+        run_env = install_run_env(args)
+        if run_env:
+            print("env     every run on the machine gets: %s" % ", ".join(sorted(run_env)))
         env = dict(os.environ); env.setdefault("PODCTL_GATE_CACHE", str(pathlib.Path.home() / ".cache" / "podctl" / "gate"))
         return install(args.pod, dirs, PodIO(prov, pod, env=env), every=args.every, timeout=args.timeout, save_pins=args.save_pins,
-                       comfy_ref=getattr(args, "comfy_ref", None), provider=getattr(prov, "name", "verda"))
+                       comfy_ref=getattr(args, "comfy_ref", None), provider=getattr(prov, "name", "verda"), run_env=run_env or None)
     finally:
         lease_release(me)
 
@@ -1545,17 +1569,37 @@ def cmd_availability(prov, args):
 
 
 def cmd_create(prov, args):
+    """A machine from nothing. The stock check comes first and names every location that has the GPU now; a location
+    the user named (or the existing volume's) that has none stops here, before anything is created or billed."""
     _offered(prov, "create_machine", "availability")
-    loc = args.location
-    if not loc:
-        locs = prov.availability(args.gpu, spot=args.spot)
-        if not locs:
-            print("STOP: %s is sold out in every location right now%s" % (args.gpu, " (spot)" if args.spot else "")); return 1
-        loc = locs[0]
+    loc, volume, spot = args.location, getattr(args, "volume", None), " (spot)" if args.spot else ""
+    if volume:
+        _offered(prov, "volume_location")                # 3.7.3: reuse an existing volume (RunPod); its data centre is fixed
+        vloc = prov.volume_location(volume)
+        if loc and loc != vloc:
+            raise PodctlError("volume %s is in %s, not %s: a pod can only mount a volume in its own data centre" % (volume, vloc, loc))
+        loc = vloc
+    elif not args.data_gb:
+        raise PodctlError("--data-gb N (a new volume) or --volume <id> (an existing one)")
+    locs = prov.availability(args.gpu, spot=args.spot)
+    print("stock   %s%s free now in: %s" % (args.gpu, spot, ", ".join(locs) if locs else "no location"))
+    if not locs:
+        print("STOP: %s is sold out in every location right now%s" % (args.gpu, spot)); return 1
+    if loc and loc not in locs:
+        print("STOP: %s has no %s free right now%s; it is free in: %s%s" % (
+            loc, args.gpu, spot, ", ".join(locs), " (the volume pins the data centre: wait, or create a new volume there)" if volume else ""))
+        return 1
+    loc = loc or locs[0]
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
+    extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None))) if v}
+    import inspect
+    takes = inspect.signature(prov.create_machine).parameters
+    for k in extra:
+        if k not in takes:
+            raise PodctlError("--%s: not offered by host %s" % (k.replace("_", "-"), getattr(prov, "name", "?")))
     pod_id = prov.create_machine(args.name, args.gpu, loc, args.data_gb, os_gb=args.os_gb, pubkey=pub, spot=args.spot,
-                                 wait=not args.no_wait, ssh_config=args.ssh_config)
-    print("next: podctl ensure %s · podctl buyer-install %s --runtime <runtime.json> --base-zip comfyui-base.zip <package zips>" % (pod_id, pod_id))
+                                 wait=not args.no_wait, ssh_config=args.ssh_config, **extra)
+    print("next: podctl ensure %s · podctl install %s --base --pkg <dir> (or buyer-install with --runtime and the zips)" % (pod_id, pod_id))
 
 
 def cmd_pause(prov, args):
@@ -1629,6 +1673,9 @@ def build_parser():
     p.add_argument("--no-save-pins", dest="save_pins", action="store_false", help="do not write the printed pins back after a green run")
     p.add_argument("--force-lease", action="store_true", help="install even though another session holds the GPU lease")
     p.add_argument("--no-gate", action="store_true", help="skip the Mac gate (each zip's own suite, run from the extracted zip) before uploading")
+    p.add_argument("--no-suite", dest="no_suite", action="store_true", help="no suite ON THE MACHINE: BASE_NO_SUITE=1 for the base step and every package run (the Mac gate still runs)")
+    p.add_argument("--env", dest="env", action="append", default=[], metavar="KEY=VALUE", type=env_pair,
+                   help="an environment variable for every run on the machine (repeatable); names are printed, values never")
     p = sub.add_parser("prune", help="list the old-layout folders the 2026-09-12 rename left under /workspace/packages (and their workflow copies); --yes removes them")
     p.add_argument("pod"); p.add_argument("--yes", action="store_true", help="remove them (without it, only the list)")
     p = sub.add_parser("pins", help="apply a records artefact a green install measured for OTHER packages (deliberate, by that package's session)")
@@ -1656,10 +1703,16 @@ def build_parser():
     sub.add_parser("balance", help="the account's prepaid balance")
     p = sub.add_parser("availability", help="the locations where a GPU type can be deployed now"); p.add_argument("--gpu", required=True, help="an instance type, e.g. 1RTXPRO6000.30V")
     p.add_argument("--spot", action="store_true")
-    p = sub.add_parser("create", help="a buyer's machine from nothing: an NVMe data disk, then the instance with its own OS disk (no startup script; ensure configures it)")
-    p.add_argument("--name", required=True); p.add_argument("--gpu", required=True, help="an instance type")
-    p.add_argument("--location", help="default: the first location with the GPU available now"); p.add_argument("--data-gb", dest="data_gb", type=int, required=True)
-    p.add_argument("--os-gb", dest="os_gb", type=int, default=100); p.add_argument("--spot", action="store_true"); p.add_argument("--no-wait", dest="no_wait", action="store_true")
+    p = sub.add_parser("create", help="a machine from nothing, after a stock check that names where the GPU is free: a data volume (or --volume), "
+                                      "then the machine on it (Verda: NVMe disk + instance; RunPod: network volume + Secure Cloud pod); ensure configures it")
+    p.add_argument("--name", required=True); p.add_argument("--gpu", required=True, help="Verda: an instance type; RunPod: a GPU type id, e.g. 'NVIDIA B200'")
+    p.add_argument("--location", help="Verda: a location; RunPod: a data centre id (default: the first with the GPU free now)")
+    p.add_argument("--data-gb", dest="data_gb", type=int, help="the size of a NEW data volume (RunPod: a network volume in that data centre)")
+    p.add_argument("--volume", help="RunPod: an EXISTING network volume id to put the pod on (its data centre is the pod's)")
+    p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
+    p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: read from the image tag)")
+    p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
+    p.add_argument("--spot", action="store_true"); p.add_argument("--no-wait", dest="no_wait", action="store_true")
     p = sub.add_parser("pause", help="delete the instance and keep its disks (the same as stop --wait): only storage bills"); p.add_argument("pod")
     p = sub.add_parser("put-away", help="copy output/ and input/ to this Mac; with --yes, then delete the machine and its disks (to the trash)")
     p.add_argument("pod"); p.add_argument("--to", required=True, help="the local folder the images go to"); p.add_argument("--yes", action="store_true")
