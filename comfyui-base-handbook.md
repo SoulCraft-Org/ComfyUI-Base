@@ -441,7 +441,10 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   basenames the index may adopt. Pin a row to a commit (3.12.0): `resolve/<40-hex commit>/<path>` for a file,
   `hf://owner/repo@<40-hex commit>` for a snapshot (a branch after the `@` is refused). The revision a row names is
   the one downloaded, and every Hub download is checked with `hf cache verify` against the sha256 (LFS) or git hash the
-  Hub states for that revision before it moves into place; a file that fails is deleted, never resumed. An unpinned
+  Hub states for that revision before it moves into place; a file that fails is deleted, never resumed. A file is
+  hashed once, when it downloads (inside its own fetch job, so beside the other downloads), and its commit and etag go
+  to `state/verified.tsv` from the metadata `hf download` writes anyway; a later run checks size and that record and
+  hashes nothing, unless the row's pin moved to a commit whose file differs (one HEAD tells). An unpinned
   row follows `main`, so its bytes break the day the repository changes. `base.sh gen-models <pkg dir> --pin` prints
   the rows pinned to the commits they are at now. A Hub error retrying cannot fix (a gated repository, a refused
   token, a missing repository, file or revision) is said once in one plain line and not retried. `base.sh gen-hashes <pkg dir> [--check]` (3.4.0) writes `models.sha256` beside the
@@ -708,7 +711,12 @@ for any invocation that somehow arrives without the environment. The suite asser
   sleeps. (6) `base.sh gen-models <dir> --pin` prints the rows pinned to the commits they are at now (the first hop's
   `x-repo-commit`, the API's `sha` for a snapshot); stamp-models links a pinned snapshot to its `/tree/<commit>`. The
   hf_xet fast path (`HF_XET_HIGH_PERFORMANCE`, 32 range gets, no chunk cache) and resumable downloads were already in
-  place and are unchanged. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
+  place and are unchanged. Speed first (Paul, 2026-10-16): a file is hashed ONCE, in its own fetch job beside the
+  other downloads, never in a pass afterwards; `state/verified.tsv` records its commit and etag from hf's own
+  `--local-dir` metadata (no request), and a file already in place costs nothing on any later run (size + record; one
+  HEAD only when its row's pin moved). Measured: `hf cache verify`'s hash runs at 2.6 GB/s on an M4, so the 174 GB
+  Video Replacer set is about 70 s of hashing in total on a fresh volume, spread over the parallel downloads, and 0 s
+  on a volume that has it. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
   real Hub for `hf cache verify` (a flipped byte fails it, exit 1); not on a pod.
 - 3.10.0: a package can set ComfyUI's launch environment, and ComfyUI starts sized to the container's CPU quota
   (2026-10-16). `LAUNCH_ENV=( "KEY=value" ... )` (§4): an allowlist of thread, tokenizer, allocator and CTranslate2

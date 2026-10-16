@@ -184,3 +184,80 @@ def test_unit_stamp_models_links_a_pinned_snapshot_to_its_tree():
     text = f'MODELS=(\n "LLM|||Snap/|hf://o/r@{COMMIT}|4096||"\n "LLM|||Main/|hf://o/m|4096||"\n)\n'
     urls = {e["name"]: e["url"] for e in mod.entries(text)}
     assert urls == {"Snap": f"https://huggingface.co/o/r/tree/{COMMIT}", "Main": "https://huggingface.co/o/m"}
+
+
+# ---------------------------------------------------------------- hashed once (3.12.0): the record, and a pin that moves
+OLD = "f" * 40
+ETAG = "e" * 64
+
+
+def test_unit_a_download_records_its_commit_and_etag_from_hfs_own_metadata(tmp_path):
+    b = tmp_path / "bin"; b.mkdir(); log = tmp_path / "hf.log"
+    _exe(b / "hf", f"""\
+        echo "hf $*" >> "{log}"
+        if [ "$1" = cache ]; then exit 0; fi
+        d=""; f="$3"; while [ $# -gt 0 ]; do case "$1" in --local-dir) d="$2"; shift;; esac; shift; done
+        mkdir -p "$d/$(dirname "$f")" "$d/.cache/huggingface/download/$(dirname "$f")"
+        python3 -c "open('$d/$f','wb').truncate(4096)"
+        printf '{COMMIT}\\n{ETAG}\\n1.0\\n' > "$d/.cache/huggingface/download/$f.metadata"
+        """)
+    state = tmp_path / "state"
+    r, dest = _dl(tmp_path, {"PATH": f"{b}:{os.environ['PATH']}"}, "https://huggingface.co/o/r/resolve/main/vae/x.safetensors",
+                  extra=f'BASE_STATE="{state}"; ')
+    assert "RC=0" in r.stdout, r.stdout + r.stderr
+    assert (state / "verified.tsv").read_text() == f"{dest}\t{COMMIT}\t{ETAG}\n"        # the commit main resolved to, not "main"
+
+
+def _moved(tmp_path, record, url, hub_etag=ETAG):
+    b = tmp_path / "bin"; b.mkdir(parents=True, exist_ok=True); log = tmp_path / "curl.log"
+    _exe(b / "curl", f"""\
+        echo "curl $*" >> "{log}"
+        printf 'HTTP/2 200\\r\\nx-linked-size: 4096\\r\\nx-linked-etag: "{hub_etag}"\\r\\n\\r\\n'
+        """)
+    state = tmp_path / "state"; state.mkdir(parents=True, exist_ok=True)
+    if record:
+        (state / "verified.tsv").write_text("/lib/x.safetensors\t%s\t%s\n" % record)
+    r = _bash(f'BASE_STATE="{state}"; BASE_NO_NET=0; if _base_pin_moved /lib/x.safetensors "{url}"; then echo MOVED; else echo KEPT; fi',
+              env={"PATH": f"{b}:{os.environ['PATH']}"})
+    calls = log.read_text() if log.exists() else ""
+    return r.stdout.strip().splitlines()[-1], calls, (state / "verified.tsv").read_text() if record else ""
+
+
+def test_unit_a_file_in_place_is_never_hashed_or_asked_about_unless_its_pin_moved(tmp_path):
+    pinned = f"https://huggingface.co/o/r/resolve/{COMMIT}/x.safetensors"
+    assert _moved(tmp_path / "a", None, pinned)[:2] == ("KEPT", "")                        # never recorded: the size is the check
+    assert _moved(tmp_path / "b", (COMMIT, ETAG), pinned)[:2] == ("KEPT", "")              # verified at this very commit
+    assert _moved(tmp_path / "c", (OLD, ETAG), "https://huggingface.co/o/r/resolve/main/x.safetensors")[:2] == ("KEPT", "")  # unpinned
+
+
+def test_unit_a_moved_pin_with_the_same_file_costs_one_head_and_updates_the_record(tmp_path):
+    verdict, calls, rec = _moved(tmp_path, (OLD, ETAG), f"https://huggingface.co/o/r/resolve/{COMMIT}/x.safetensors")
+    assert verdict == "KEPT" and calls.count("curl ") == 1, calls
+    assert rec.splitlines()[-1] == f"/lib/x.safetensors\t{COMMIT}\t{ETAG}"                 # no HEAD next time
+
+
+def test_unit_a_moved_pin_whose_file_differs_is_fetched_again(tmp_path):
+    verdict, calls, _ = _moved(tmp_path, (OLD, ETAG), f"https://huggingface.co/o/r/resolve/{COMMIT}/x.safetensors", hub_etag="d" * 64)
+    assert verdict == "MOVED"
+    verdict, calls, _ = _moved(tmp_path / "s", (OLD, "-"), f"hf://o/r@{COMMIT}")
+    assert verdict == "MOVED" and calls == ""                                                # a snapshot: hf fetches what changed
+
+
+def test_unit_base_models_refetches_a_file_whose_pin_moved_and_keeps_one_whose_did_not(tmp_path):
+    c = tmp_path / "ComfyUI"; (c / "models").mkdir(parents=True); (c / "main.py").write_text("")
+    env, log = _hf(tmp_path)
+    b = tmp_path / "bin"; clog = tmp_path / "curl.log"
+    _exe(b / "curl", f"""\
+        echo "curl $*" >> "{clog}"
+        case "$*" in *resolve/{COMMIT}/a.safetensors*) e="{"d" * 64}";; *) e="{ETAG}";; esac
+        printf 'HTTP/2 200\\r\\nx-linked-size: 4096\\r\\nx-linked-etag: "%s"\\r\\n\\r\\n' "$e"
+        """)
+    rows = " ".join('"vae|Example|Real|%s.safetensors|https://huggingface.co/x/y/resolve/%s/%s.safetensors|4096|n|"' % (n, COMMIT, n) for n in "ab")
+    env.update({"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path), "BASE_FAKE_DL": "real"})
+    r = _bash(f'MODELS=({rows}); base_env_setup; base_discover quiet; d="$M/vae/Example/Real"; mkdir -p "$d" "$BASE_STATE";'
+              f' for n in a b; do python3 -c "open(\'$d/$n.safetensors\',\'wb\').truncate(4096)";'
+              f' printf "%s\\t{OLD}\\t{ETAG}\\n" "$d/$n.safetensors" >> "$BASE_STATE/verified.tsv"; done;'
+              f' BASE_NO_NET=0 base_models; echo DL=${{#MODEL_DL[@]}} OK=${{#MODEL_OK[@]}}', env=env)
+    out = r.stdout
+    assert "a.safetensors: its row now pins a commit whose file differs" in out and "DL=1 OK=1" in out, out + r.stderr
+    assert f"hf download x/y a.safetensors --revision {COMMIT}" in log.read_text() and "b.safetensors" not in log.read_text()

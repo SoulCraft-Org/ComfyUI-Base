@@ -228,6 +228,40 @@ _base_hf_verify(){ # <hf> <repo> <revision> <dir> [--fail-on-missing-files] → 
   printf '%s\n' "$out" | grep -vi 'do not exist on the remote' | tail -6
   return 1
 }
+# The record of what was verified (3.12.0): state/verified.tsv, "<dest>\t<commit>\t<etag>", appended, the last line per
+# dest wins. A file is hashed ONCE, when it downloads; every later run takes its size and this record and hashes nothing.
+# The commit and etag come from the metadata `hf download --local-dir` writes anyway, so recording costs no request.
+_base_verified_add(){ # <dest> <commit> [etag]
+  [ -n "${BASE_STATE:-}" ] || return 0
+  mkdir -p "$BASE_STATE"; printf '%s\t%s\t%s\n' "$1" "$2" "${3:--}" >> "$BASE_STATE/verified.tsv"
+}
+_base_verified_get(){ # <dest> → "<commit>\t<etag>", or nothing
+  [ -n "${BASE_STATE:-}" ] && [ -f "$BASE_STATE/verified.tsv" ] || return 0
+  awk -F'\t' -v d="$1" '$1==d{r=$2"\t"$3} END{if(r!="")print r}' "$BASE_STATE/verified.tsv"
+}
+_base_verified_meta(){ # <dest> <hf .metadata file> → recorded (commit on its first line, etag on its second)
+  local c e
+  { read -r c; read -r e; } < "$2" 2>/dev/null || return 0
+  if [[ "$c" =~ ^[0-9a-f]{40}$ ]]; then _base_verified_add "$1" "$c" "$e"; fi
+  return 0
+}
+_base_pin_moved(){ # <dest> <url> → 0 when the row pins a commit other than the one this file was verified at AND the Hub's
+  # file there differs. Only then is anything fetched or hashed again: an unpinned row, a file never recorded (adopted, or
+  # from before 3.12.0) and a pin at the recorded commit cost nothing; a moved pin costs one HEAD (a snapshot: hf fetches
+  # only the files that changed, then they are verified).
+  local nrev rec rcommit retag h
+  IFS='|' read -r _ nrev _ <<< "$(_base_hf_ref "$2")"
+  [[ "$nrev" =~ ^[0-9a-f]{40}$ ]] || return 1
+  rec="$(_base_verified_get "$1")"; [ -n "$rec" ] || return 1
+  IFS=$'\t' read -r rcommit retag <<< "$rec"
+  [ "$rcommit" != "$nrev" ] || return 1
+  case "$2" in hf://*) return 0;; esac
+  [ "$BASE_NO_NET" != "1" ] || return 1
+  h="$(_base_hub_sha256 "$2")"
+  [ -n "$h" ] || return 1                                 # the Hub states no sha256 here: the size stands, as before
+  if [ "$h" = "$retag" ]; then _base_verified_add "$1" "$nrev" "$retag"; return 1; fi
+  return 0
+}
 
 # ---------------------------------------------------------------- sizes
 _base_expected(){ # <url> → exact:<bytes> from the Hub (x-linked-size beats content-length; a non-2xx final hop counts for nothing) | approx:0
@@ -273,13 +307,13 @@ _base_curl_dl(){ # <staged file> <url> [curl args] — the GitHub leg: curl, res
   tail -3 "$out"; rm -f "$out"; return 1
 }
 _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets BASE_DL_SECS
-  local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS
+  local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS rfile=""
   base="$(basename "$dest")"; stage="$STAGING/$base.d"; mkdir -p "$stage"
   if [ "$BASE_NO_NET" = "1" ] && [ "${BASE_FAKE_DL:-}" != "real" ]; then   # BASE_FAKE_DL=real: the real branches with stubbed tools on PATH
     if [ "${BASE_FAKE_DL:-}" = "fail" ]; then err "fake download failed (BASE_FAKE_DL=fail)"; rm -rf "$stage"; return 1; fi
     staged="$stage/$base"; _base_sparse "$staged" "$bytes"      # fake: a sparse file at the declared size
   elif [[ "$url" == https://huggingface.co/*/resolve/* ]]; then
-    local repo rev rfile hfbin _dlout rargs=()
+    local repo rev hfbin _dlout rargs=()
     IFS='|' read -r repo rev rfile <<< "$(_base_hf_ref "$url")"
     [ -n "$rev" ] && rargs=(--revision "$rev")      # 3.12.0: the URL's revision is the one fetched (it was dropped: always main)
     hfbin="$VENV/bin/hf"; [ -x "$hfbin" ] || hfbin="$(command -v hf || true)"
@@ -309,7 +343,11 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
     done
   fi
   if [ -f "$staged" ] && _base_size_ok "$(_base_fsize "$staged")" "$bytes"; then
-    mkdir -p "$(dirname "$dest")"; mv "$staged" "$dest" && rm -rf "$stage" && rc=0
+    mkdir -p "$(dirname "$dest")"
+    if mv "$staged" "$dest"; then
+      [ -z "${rfile:-}" ] || _base_verified_meta "$dest" "$stage/.cache/huggingface/download/$rfile.metadata"   # a Hub file, verified above
+      rm -rf "$stage"; rc=0
+    fi
     BASE_DL_SECS=$(( SECONDS - t0 ))
   else
     [ -f "$staged" ] && err "staged file has $(_base_fsize "$staged") bytes, expected $bytes — kept in $stage for resume"
@@ -339,6 +377,9 @@ _base_snapshot(){ # <hf://owner/repo[@commit]> <dest dir> <bytes> → a repo sna
   if ! _base_hf_verify "$hfbin" "$repo" "$rev" "$dest" --fail-on-missing-files; then
     err "${1#hf://} does not match the hashes the Hub states for ${rev:-main}: kept in $dest for a resumed re-run"; return 1
   fi
+  local meta; meta="$(find "$dest/.cache/huggingface/download" -name '*.metadata' 2>/dev/null | head -1)"
+  [ -z "$meta" ] || _base_verified_meta "$dest" "$meta"
+  return 0
 }
 _base_add_gb(){ awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f", a+b}'; }
 _base_move_dir_into_place(){ # <src dir> <dest dir> → mv on one device, else copy, verify the byte total, remove the source
@@ -572,7 +613,7 @@ base_models(){
       local snap_ok=0 sdir="" sdir_c
       if [ -d "$dest" ]; then
         if [ "$url" = "LOCAL" ]; then [ -f "$dest/config.json" ] && snap_ok=1
-        elif [ "$(_base_dir_size "$dest")" = "$bytes" ]; then snap_ok=1; fi
+        elif [ "$(_base_dir_size "$dest")" = "$bytes" ] && ! _base_pin_moved "$dest" "$url"; then snap_ok=1; fi
       fi
       if [ "$snap_ok" = "1" ]; then
         sz="$(_base_dir_size "$dest")"; ok "$rel  (snapshot, $(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"
@@ -601,8 +642,9 @@ base_models(){
       if [ "$staged_later" = "0" ] && [ "$BASE_DRY" != "1" ]; then _base_standin_drop "$dest"; fi   # not staged here: simply absent
     elif [ -f "$dest" ]; then
       sz="$(_base_fsize "$dest")"
-      if _base_size_ok "$sz" "$bytes"; then ok "$rel  ($(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"; continue; fi
-      miss "$rel is $(_base_bytes_to_gb "$sz") GB, expected $(_base_bytes_to_gb "$bytes") GB — partial"
+      if _base_size_ok "$sz" "$bytes" && ! _base_pin_moved "$dest" "$url"; then ok "$rel  ($(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"; continue; fi
+      if _base_size_ok "$sz" "$bytes"; then miss "$rel: its row now pins a commit whose file differs from this one — fetched again"
+      else miss "$rel is $(_base_bytes_to_gb "$sz") GB, expected $(_base_bytes_to_gb "$bytes") GB — partial"; fi
       if [ "$BASE_DRY" = "1" ]; then would "rename to $base.partial and re-fetch"
       else mv "$dest" "$dest.partial"; DEL_FILES+=("$dest.partial"); DEL_BYTES=$((DEL_BYTES + sz)); fi
       MODEL_PARTIAL+=("$rel"); was_partial=1
