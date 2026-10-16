@@ -395,6 +395,25 @@ def test_unit_verify_asks_for_a_gpu_except_in_a_seed_build(tmp_path):
     assert "BASE_NO_GPU=0" in _bash(f'PY="{py}"; unset BASE_SEED; _base_venv_verify; echo "$BASE_TORCH_INFO"').stdout
 
 
+def test_unit_import_check_runs_on_cpu_in_a_seed_build_only(tmp_path):
+    """3.10.0: the seed build's import check ran `main.py --quick-test-for-ci` where no GPU is and ComfyUI died "Found no
+    NVIDIA driver" before importing a pack (runpod-template image job, 2026-10-16). Both the full and the scoped check
+    pass --cpu for BASE_SEED=1 alone; a real machine's check still starts on its GPU."""
+    comfy = tmp_path / "comfy"; comfy.mkdir()
+    py = tmp_path / "py"; py.write_text('#!/bin/sh\necho "ARGS $*"\n'); py.chmod(0o755)
+    log = tmp_path / "check.log"
+    def args(seed, scoped):
+        call = ('_base_import_scope(){ echo packA; }; _base_quick_test_scoped' if scoped else '_base_quick_test') + f' "{log}"'
+        r = _bash(f'COMFY="{comfy}"; PY="{py}"; {"BASE_SEED=1" if seed else "unset BASE_SEED"}; {call}')
+        assert r.returncode == 0, r.stdout + r.stderr
+        return [ln for ln in log.read_text().splitlines() if ln.startswith("ARGS")]
+    for scoped in (False, True):
+        seeded, real = args(True, scoped), args(False, scoped)
+        assert seeded and all("--quick-test-for-ci" in ln and " --cpu" in ln for ln in seeded), (scoped, seeded)
+        assert real and not any("--cpu" in ln for ln in real), (scoped, real)
+    assert "--whitelist-custom-nodes packA" in args(True, True)[0]
+
+
 def test_unit_verify_checks_the_whole_startup_closure_and_extra_imports():
     src = (BASE / "py" / "venv_verify.py").read_text()
     for needle in ("_base_executable", "pyvenv.cfg", ".pth", "sys.path", "BASE_EXTRA_IMPORTS", "BASE_WANT_SM", "BASE_WANT_PY"):
@@ -2337,7 +2356,7 @@ def test_unit_a_snapshot_download_keeps_the_token_off_argv_and_shows_its_error(t
               env={"PATH": "%s:%s" % (bin_, os.environ["PATH"])})
     calls = log.read_text()
     assert "--token" not in calls and "hf env HF_TOKEN=hf_env_value" in calls
-    assert calls.count("hf argv:") == 1                         # 3.11.0: a 401 is said once, never retried
+    assert calls.count("hf argv:") == 1                         # 3.12.0: a 401 is said once, never retried
     assert "Unauthorized" in r.stdout and "refused HF_TOKEN" in r.stdout and "RC=1" in r.stdout, r.stdout + r.stderr
 
 
@@ -2409,6 +2428,120 @@ def test_unit_the_hand_off_line_is_runnable_as_printed(tmp_path):
               % (vol, bin_ / "python", comfy, tmp_path / "nohup.out"), env={"PATH": "%s:/usr/bin:/bin" % bin_})
     assert "RC=0" in r.stdout and "HF_HOME=%s/huggingface" % vol in r.stdout, r.stdout + r.stderr
     assert log.exists() and "python env HF_HOME=%s/huggingface cwd=%s" % (vol, comfy) in log.read_text(), (r.stdout, (tmp_path / "nohup.out").read_text())
+
+
+def _cgroup(tmp_path, v2=None, v1=None):
+    """A fake /sys/fs/cgroup: v2 is cpu.max's text ("max 100000", "250000 100000"); v1 is (quota_us, period_us)."""
+    root = tmp_path / "cgroup"; root.mkdir(parents=True, exist_ok=True)
+    if v2 is not None: (root / "cpu.max").write_text(v2 + "\n")
+    if v1 is not None:
+        d = root / "cpu,cpuacct"; d.mkdir(exist_ok=True)
+        (d / "cpu.cfs_quota_us").write_text("%s\n" % v1[0]); (d / "cpu.cfs_period_us").write_text("%s\n" % v1[1])
+    return root
+
+
+def test_unit_the_cpu_quota_is_the_cgroups_not_the_hosts(tmp_path):
+    """3.10.0: a RunPod container is a slice of a big host. nproc and torch see the HOST's CPUs while the CFS quota lets
+    the container run its own, so a thread pool sized by the host is throttled. The quota is cpu.max (v2) or
+    cpu.cfs_quota_us / cpu.cfs_period_us (v1), rounded up, never more than the CPUs online; unlimited says nothing."""
+    online = int(_bash("_base_cpus_online").stdout.strip())
+    cases = [({"v2": "250000 100000"}, "3"), ({"v2": "100000 100000"}, "1"), ({"v2": "50000 100000"}, "1"),
+             ({"v2": "max 100000"}, ""), ({"v1": (200000, 100000)}, "2"), ({"v1": (-1, 100000)}, ""),
+             ({"v2": "%d 100000" % ((online + 7) * 100000)}, str(online)), ({}, "")]
+    for i, (kw, want) in enumerate(cases):
+        root = _cgroup(tmp_path / str(i), **kw) if kw else tmp_path / "none"
+        r = _bash("_base_cpu_quota", env={"BASE_CGROUP_ROOT": str(root)})
+        assert r.returncode == 0 and r.stdout.strip() == want, (kw, r.stdout, r.stderr)
+
+
+def test_unit_launch_env_is_a_contract_not_a_free_for_all():
+    """3.10.0: LAUNCH_ENV=( "KEY=value" ) lets a package set what ComfyUI is started with. Only thread counts and allocator
+    tuning (and CTranslate2's CT2_*), one word of [A-Za-z0-9_.,:+-] each: no path, no library, no credential, no
+    variable the base owns, no shell expansion. A key set twice, or anything else, refuses the package's declarations."""
+    good = ["OMP_NUM_THREADS=16", "MKL_NUM_THREADS=8", "CT2_VERBOSE=1", "CT2_USE_EXPERIMENTAL_PACKED_GEMM=1",
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512", "TOKENIZERS_PARALLELISM=false"]
+    bad = ["PATH=/usr/bin", "LD_PRELOAD=libx.so", "LD_LIBRARY_PATH=/x", "PYTHONPATH=/x", "HF_HOME=/x", "HF_TOKEN=hf_x",
+           "VHS_FORCE_FFMPEG_PATH=/x", "COMFY_BASE_STATE=/x", "OMP_NUM_THREADS=", "OMP_NUM_THREADS=$(id)", "OMP_NUM_THREADS=1 2",
+           "OMP_NUM_THREADS=/tmp", "OMP_NUM_THREADS=`id`", "ct2_verbose=1", "CT2_=1x;", "OMP_NUM_THREADS", "=1"]
+    for kv in good + bad:
+        r = _bash('_base_launch_env_ok "$KV" && echo YES || echo NO', env={"KV": kv})
+        assert r.stdout.strip() == ("YES" if kv in good else "NO"), (kv, r.stdout, r.stderr)
+    r = _bash('LAUNCH_ENV=("OMP_NUM_THREADS=8" "CT2_VERBOSE=1"); _base_launch_env_rows; echo RC=$?')
+    assert r.stdout == "OMP_NUM_THREADS=8\nCT2_VERBOSE=1\nRC=0\n", r.stdout + r.stderr
+    r = _bash('LAUNCH_ENV=("OMP_NUM_THREADS=8" "LD_PRELOAD=x" "OMP_NUM_THREADS=4"); _base_launch_env_rows; echo RC=$?')
+    assert "RC=1" in r.stdout and "LD_PRELOAD=x" in r.stderr and "sets OMP_NUM_THREADS twice" in r.stderr, r.stdout + r.stderr
+    decl = 'PKG_ID=p; PKG_NAME=P; PKG_VERSION=1.0.0; BASE_MIN=1.0.0; COMFY_MIN=0.0.0; WF_NAME=""; PACKS=(); MODELS=(); '
+    r = _bash(decl + 'LAUNCH_ENV=("PATH=/x"); _base_validate_tables; echo RC=$?')
+    assert "RC=1" in r.stdout and "PATH=/x" in r.stderr, r.stdout + r.stderr
+    r = _bash(decl + 'LAUNCH_ENV=("OMP_NUM_THREADS=8"); _base_validate_tables; echo RC=$?; _base_declare_dump')
+    assert "RC=0" in r.stdout and "LAUNCHENV OMP_NUM_THREADS=8" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_launch_env_precedence_machine_then_packages_then_the_quota(tmp_path):
+    """The machine's own environment wins (a pod env var someone set on purpose); then the packages' files in name order,
+    the first naming a key winning and a different later value named; then the base's OMP_NUM_THREADS from the quota.
+    A line a package file should never hold (the folder is on a shared volume) is left out and said."""
+    state = tmp_path / "state"; d = state / "launch.d"; d.mkdir(parents=True); cg = _cgroup(tmp_path, v2="300000 100000")
+    (d / "a-pkg.env").write_text("# a\nOMP_NUM_THREADS=8\nCT2_VERBOSE=1\n")
+    (d / "b-pkg.env").write_text("OMP_NUM_THREADS=4\nPYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\nPATH=/evil\nCT2_VERBOSE=1")
+    env = {"BASE_CGROUP_ROOT": str(cg)}; le = 'BASE_STATE="%s"; _base_launch_env' % state      # base.sh resets BASE_STATE on source
+    r = _bash(le, env=env)
+    assert r.stdout.splitlines() == ["OMP_NUM_THREADS=8", "CT2_VERBOSE=1", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"], r.stdout + r.stderr
+    assert "a-pkg sets 8, b-pkg sets 4: 8 is used" in r.stderr and "'PATH=/evil' is not an allowed launch variable" in r.stderr, r.stderr
+    assert "CT2_VERBOSE" not in r.stderr                                    # the same value twice is no conflict
+    (d / "a-pkg.env").unlink(); (d / "b-pkg.env").unlink()
+    r = _bash(le, env=env)
+    assert r.stdout == "OMP_NUM_THREADS=3\n" and r.stderr == "", r.stdout + r.stderr          # no package says: the quota does
+    r = _bash(le, env=dict(env, OMP_NUM_THREADS="5"))
+    assert r.stdout == "" and "OMP_NUM_THREADS=5 is set in this machine's environment: it wins over OMP_NUM_THREADS=3 (the CPU quota)" in r.stderr, r.stdout + r.stderr
+    r = _bash(le, env={"BASE_CGROUP_ROOT": str(tmp_path / "nothing")})
+    assert r.stdout == "", r.stdout                                          # no quota, no package: torch keeps its own default
+    # the boot knows BASE_HOME (boot.env), not BASE_STATE: the same folder, found from there; 85-launch.sh alone, as boot.sh sources it
+    (d / "a-pkg.env").write_text("OMP_NUM_THREADS=6\n")
+    sh = "/bin/bash" if os.path.exists("/bin/bash") else "bash"           # the Mac's bash 3.2, the oldest the boot must run on
+    r = subprocess.run([sh, "-c", '. "%s/lib/85-launch.sh"; BASE_HOME="%s"; _base_launch_env' % (BASE, tmp_path)], capture_output=True, text=True,
+                       env={"PATH": os.environ["PATH"], "BASE_CGROUP_ROOT": str(cg)})
+    assert r.stdout == "OMP_NUM_THREADS=6\n", r.stdout + r.stderr
+
+
+def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path):
+    """The variables are exported into ComfyUI's process (the subshell that starts it), printed on the hand-off line in a
+    form nohup runs verbatim, and never exported into the installing shell, which would then read the base's own value
+    back as the machine's at the next install."""
+    bin_ = tmp_path / "bin"; bin_.mkdir(); log = tmp_path / "calls.log"; up = tmp_path / "up"
+    (bin_ / "python").write_text('#!/bin/bash\necho "python env OMP=${OMP_NUM_THREADS:-unset} CT2=${CT2_VERBOSE:-unset} argv=$*" >> "%s"; touch "%s"\n' % (log, up))
+    (bin_ / "curl").write_text('#!/bin/bash\n[ -e "%s" ]\n' % up)
+    for p in (bin_ / "python", bin_ / "curl"): p.chmod(0o755)
+    comfy = tmp_path / "ComfyUI"; comfy.mkdir(); state = tmp_path / "state"; (state / "launch.d").mkdir(parents=True)
+    (state / "launch.d" / "pkg.env").write_text("CT2_VERBOSE=1\n"); cg = _cgroup(tmp_path, v2="200000 100000")
+    env = {"PATH": "%s:/usr/bin:/bin" % bin_, "BASE_CGROUP_ROOT": str(cg)}
+    r = _bash('BASE_STATE="%s"; PY="%s"; COMFY="%s"; PORT=8188; HOSTPORT=127.0.0.1:8188; ARGS_FILE=/nonexistent; COMFY_LOG="%s"; BASE_START_TRIES=3; '
+              '_base_start_comfy; echo RC=$? PARENT_OMP=${OMP_NUM_THREADS:-unset}' % (state, bin_ / "python", comfy, tmp_path / "comfyui.log"), env=env)
+    assert "RC=0 PARENT_OMP=unset" in r.stdout and "launch env: CT2_VERBOSE=1 OMP_NUM_THREADS=2" in r.stdout, r.stdout + r.stderr
+    assert "python env OMP=2 CT2=1 argv=main.py --listen" in log.read_text(), log.read_text()
+    log.unlink()
+    r = _bash('BASE_STATE="%s"; PY="%s"; PORT=8188; ARGS_FILE=/nonexistent; line="$(_base_start_cmd)"; echo "LINE=$line"; cd "%s" && nohup $line > "%s" 2>&1; echo RC=$?'
+              % (state, bin_ / "python", comfy, tmp_path / "nohup.out"), env=env)
+    assert "LINE=env CT2_VERBOSE=1 OMP_NUM_THREADS=2 %s main.py" % (bin_ / "python") in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
+    assert "python env OMP=2 CT2=1" in log.read_text()
+
+
+def test_unit_launch_env_is_written_per_package_and_removed_when_dropped(tmp_path):
+    """One store serves several packages and each install knows only its own LAUNCH_ENV, so each writes its own file,
+    state/launch.d/<PKG_ID>.env; a package that stops declaring one has its file removed. A change is a restart reason."""
+    state = tmp_path / "state"; f = state / "launch.d" / "pkg-a.env"
+    base = 'BASE_STATE="%s"; PKG_ID=pkg-a; PKG_NAME="Pkg A"; PKG_VERSION=1.2.0; BASE_DRY=0; BASE_CHANGED=(); ' % state
+    r = _bash(base + 'LAUNCH_ENV=("OMP_NUM_THREADS=12" "CT2_VERBOSE=1"); base_launch_env_write; echo CHANGED=${#BASE_CHANGED[@]}')
+    assert f.read_text().splitlines()[1:] == ["OMP_NUM_THREADS=12", "CT2_VERBOSE=1"] and "Pkg A V1.2.0" in f.read_text(), f.read_text()
+    assert "CHANGED=1" in r.stdout, r.stdout + r.stderr
+    r = _bash(base + 'LAUNCH_ENV=("OMP_NUM_THREADS=12" "CT2_VERBOSE=1"); base_launch_env_write; echo CHANGED=${#BASE_CHANGED[@]}')
+    assert "CHANGED=0" in r.stdout and "launch env current" in r.stdout, r.stdout + r.stderr
+    r = _bash(base + 'BASE_DRY=1; LAUNCH_ENV=(); base_launch_env_write')
+    assert f.exists() and "remove" in r.stdout, r.stdout + r.stderr
+    r = _bash(base + 'LAUNCH_ENV=(); base_launch_env_write; echo CHANGED=${#BASE_CHANGED[@]}')
+    assert not f.exists() and "CHANGED=1" in r.stdout, r.stdout + r.stderr
+    src = code_only((BASE / "lib" / "75-boot.sh").read_text())
+    assert "base_launch_env_write" in src[src.index("base_boot_install(){"):]
 
 
 def test_unit_combofix_reports_a_widget_order_the_server_would_reject(tmp_path, capsys):
@@ -2489,12 +2622,17 @@ def test_unit_snapshot_console_errors_are_classified_not_counted(tmp_path):
              "[error] ComfyApp graph accessed before initialization",
              "[error] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'ColorOverlay' already registered",
              "[error] TypeError: Cannot read properties of undefined (reading 'foo') at ourNode.js:12",
+             # 3.10.0: comfyui-obvpm 0.2.16 hands ComfyUI-Manager's wrapper an explicit undefined (reproduced, frontend 1.55.17)
+             "[error] Error loading previous workflow TypeError: Cannot read properties of undefined (reading 'extra')\n    at app.loadGraphData (http://127.0.0.1:8211/extensions/ComfyUI-Manager/components-manager.js:741:29)",
+             "[error] TypeError: Cannot read properties of undefined (reading 'extra')\n    at app.loadGraphData (http://127.0.0.1:8211/extensions/ComfyUI-Manager/components-manager.js:741:29)",
+             "[error] TypeError: Cannot read properties of undefined (reading 'extra')\n    at x (http://127.0.0.1:8211/extensions/other/x.js:1:1)",
              "[log] fine"]
     known, unexplained = m.classify_console(lines)
-    assert len(known) == 6 and len(unexplained) == 1 and "TypeError" in unexplained[0]
+    assert len(known) == 8 and len(unexplained) == 2 and all("TypeError" in u for u in unexplained)
     assert all(reason for _line, reason in known) and len({reason for _l, reason in known}) >= 3
     assert set(m.console_summary(lines).keys()) == {"errors", "known", "unexplained", "reasons"}
-    assert m.console_summary(lines)["unexplained"] == ["[error] TypeError: Cannot read properties of undefined (reading 'foo') at ourNode.js:12"]
+    assert m.console_summary(lines)["unexplained"][0] == "[error] TypeError: Cannot read properties of undefined (reading 'foo') at ourNode.js:12"
+    assert "other/x.js" in m.console_summary(lines)["unexplained"][1]     # the same TypeError from anywhere else stays unexplained
 
 
 def test_unit_foreign_source_is_parsed_with_its_syntax_warnings_accounted_for(tmp_path):

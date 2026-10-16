@@ -9,7 +9,7 @@
 #             | LOCAL   (must already exist somewhere on the pod; relocated into place, else the run FAILS — a file, or
 #             |          with a trailing / on file, a snapshot FOLDER of that name holding a config.json)
 #             | hf://owner/repo[@<commit>]  with file ending in "/"  (a repo snapshot into that directory)
-#             3.11.0: the revision is honoured. A 40-hex commit in a resolve URL, or hf://owner/repo@<commit>, pins the
+#             3.12.0: the revision is honoured. A 40-hex commit in a resolve URL, or hf://owner/repo@<commit>, pins the
 #             row: what downloads is that commit's file, and every Hub file is checked against the sha256 the Hub states
 #             for that revision before it is moved into place. `base.sh gen-models <dir> --pin` prints the rows pinned.
 #   bytes     = exact size; 0 only with LOCAL (any size, must exist). `base.sh gen-models <dir>` fills it in.
@@ -182,7 +182,7 @@ _base_idx_find(){ # <basename>... → "size<TAB>path" lines with an exact (case-
        { p=$2; sub(/.*\//,"",p); if (tolower(p) in want) print }' "$IDX"
 }
 
-# ---------------------------------------------------------------- the Hub: one parser, one auth, one error reader (3.11.0)
+# ---------------------------------------------------------------- the Hub: one parser, one auth, one error reader (3.12.0)
 _base_hf_ref(){ # <url> → "repo|revision|path" for a Hub resolve URL or an hf:// snapshot; revision empty = the default branch
   local u="$1" repo rev="" path=""
   case "$u" in
@@ -194,7 +194,7 @@ _base_hf_ref(){ # <url> → "repo|revision|path" for a Hub resolve URL or an hf:
   echo "$repo|$rev|$path"
 }
 _base_hub_auth(){ # <url> → BASE_HUB_AUTH=( -H @<0600 file> ) for a Hub URL when HF_TOKEN is set, else empty. The token
-  # rides a header FILE, never curl's argv: argv is on the process list, readable by every user on the machine (3.11.0;
+  # rides a header FILE, never curl's argv: argv is on the process list, readable by every user on the machine (3.12.0;
   # the size and sha256 HEADs had put it there since 2.0, against §0.9).
   BASE_HUB_AUTH=()
   [[ "$1" == https://huggingface.co/* ]] && [ -n "${HF_TOKEN:-}" ] || return 0
@@ -203,7 +203,7 @@ _base_hub_auth(){ # <url> → BASE_HUB_AUTH=( -H @<0600 file> ) for a Hub URL wh
   BASE_HUB_AUTH=(-H "@$f")
 }
 _base_hf_permanent(){ # <repo> <tool output> → 0 and one plain line when retrying cannot help (gated, token refused, not
-  # found); 1 otherwise. A transient error is retried; these were retried three times, ten seconds of nothing (3.11.0).
+  # found); 1 otherwise. A transient error is retried; these were retried three times, ten seconds of nothing (3.12.0).
   local repo="$1" out="$2"
   case "$out" in
     *"requires approval"*|*"gated repo"*|*"Access denied"*|*"is restricted"*)
@@ -281,7 +281,7 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
   elif [[ "$url" == https://huggingface.co/*/resolve/* ]]; then
     local repo rev rfile hfbin _dlout rargs=()
     IFS='|' read -r repo rev rfile <<< "$(_base_hf_ref "$url")"
-    [ -n "$rev" ] && rargs=(--revision "$rev")      # 3.11.0: the URL's revision is the one fetched (it was dropped: always main)
+    [ -n "$rev" ] && rargs=(--revision "$rev")      # 3.12.0: the URL's revision is the one fetched (it was dropped: always main)
     hfbin="$VENV/bin/hf"; [ -x "$hfbin" ] || hfbin="$(command -v hf || true)"
     if [ -z "$hfbin" ]; then err "hf CLI missing — the venv step installs huggingface_hub[hf-xet]"; return 1; fi
     for attempt in 1 2 3; do
@@ -296,7 +296,7 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
       [ "$attempt" = 3 ] || { note "attempt $attempt failed — retrying (hf download resumes)"; sleep 5; }
     done
     staged="$stage/$rfile"
-    # the Hub's own sha256 for this revision, before the file goes anywhere (3.11.0); a mismatch is deleted, never resumed
+    # the Hub's own sha256 for this revision, before the file goes anywhere (3.12.0); a mismatch is deleted, never resumed
     if [ -f "$staged" ] && _base_size_ok "$(_base_fsize "$staged")" "$bytes" && ! _base_hf_verify "$hfbin" "$repo" "$rev" "$stage"; then
       err "$base does not match the sha256 the Hub states for ${rev:-main}: deleted (a corrupt transfer, or the file changed on the Hub; pin the row)"
       rm -rf "$stage"; return 1
@@ -317,7 +317,7 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
   return $rc
 }
 _base_snapshot(){ # <hf://owner/repo[@commit]> <dest dir> <bytes> → a repo snapshot in place, verified by total size and by
-  # the Hub's own hashes for that revision (3.11.0)
+  # the Hub's own hashes for that revision (3.12.0)
   local repo rev dest="$2" bytes="$3" hfbin attempt rargs=() ok=0
   IFS='|' read -r repo rev _ <<< "$(_base_hf_ref "$1")"
   [ -n "$rev" ] && rargs=(--revision "$rev")
@@ -936,7 +936,7 @@ _base_pin_url(){ # <url> → the same URL pinned to the commit its revision is a
   case "$url" in hf://*) echo "hf://$repo@$c";; *) echo "https://huggingface.co/$repo/resolve/$c/$path";; esac
 }
 base_gen_models(){ # <pkg dir> [--pin] → the package's MODELS rows with bytes filled from HEAD; exit 1 on drift or an unreadable size
-  # --pin (3.11.0): every Hub row comes back pinned to the commit its revision is at now (resolve/<commit>/…, hf://…@<commit>)
+  # --pin (3.12.0): every Hub row comes back pinned to the commit its revision is at now (resolve/<commit>/…, hf://…@<commit>)
   local d="${1%/}" pin="${2:-}" s rows rc=0 cat fam purp file url bytes note alts exp pinned
   if [ -n "$pin" ] && [ "$pin" != "--pin" ]; then echo "  !! gen-models <dir> [--pin], not '$pin'" >&2; return 2; fi
   _base_tmp                                                             # here, not inside the $( ) below: a temp dir made in a subshell is never cleaned

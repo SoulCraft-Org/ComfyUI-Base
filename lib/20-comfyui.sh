@@ -54,7 +54,7 @@ _base_token_validate(){ # <NAME> <from> — 200 accepted; 401/403 FAIL naming th
   [ -n "${BASE_TMPD:-}" ] || _base_tmp
   local body="$BASE_TMPD/.whoami-$name" role
   code="$( (umask 077; curl -s -o "$body" -w '%{http_code}' --max-time 20 -H "@$(_base_auth_file "$name")" "$url" 2>/dev/null) || echo 000)"
-  # 3.11.0: least privilege. The install only reads, so a token that can write is more than it needs; only the role is
+  # 3.12.0: least privilege. The install only reads, so a token that can write is more than it needs; only the role is
   # read out of the answer (it also names the account, which is nobody's business here), and the answer is deleted.
   role="$("$SYS_PY" -c 'import json,sys; print(((json.load(open(sys.argv[1])).get("auth") or {}).get("accessToken") or {}).get("role",""))' "$body" 2>/dev/null || true)"
   rm -f "$body"

@@ -135,7 +135,7 @@ _base_quick_test_scoped(){ # <log>: the import check. Only own packs changed: Co
   only="$(_base_import_scope | tr '\n' ' ')"
   if [ -z "${only// /}" ]; then _base_quick_test "$1"; return $?; fi
   note "only this package's own packs changed: ComfyUI loads just those (${only% })"
-  (cd "$COMFY" && _base_timeout 900 "$PY" main.py --quick-test-for-ci --disable-auto-launch --disable-all-custom-nodes --whitelist-custom-nodes $only >"$1" 2>&1) || rc=$?
+  (cd "$COMFY" && _base_timeout 900 "$PY" main.py --quick-test-for-ci --disable-auto-launch $(_base_quick_cpu) --disable-all-custom-nodes --whitelist-custom-nodes $only >"$1" 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] && ! grep -q "IMPORT FAILED" "$1"; then return 0; fi
   note "the scoped check did not pass: the full check judges (an own pack may import another pack when it loads)"
   _base_quick_test "$1"

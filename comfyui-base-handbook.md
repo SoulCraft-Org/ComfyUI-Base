@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.11.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.12.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -71,10 +71,10 @@ run once per machine as **step one**; then each workflow package is **step two**
    aliases `HUGGING_FACE_HUB_TOKEN` / `HF_HUB_TOKEN`), else `state/tokens.env` (0600), else one prompt. Template
    placeholders (`token_here`, `replace_with_ids`…) are named and ignored; a token its service rejects fails the run
    before anything downloads. No token ever appears in a log or on the process list: `hf` reads it from its
-   environment, every `curl` to the Hub reads it from a 0600 header file (`-H @file`, 3.11.0), and the suite runs with
+   environment, every `curl` to the Hub reads it from a 0600 header file (`-H @file`, 3.12.0), and the suite runs with
    every token name stripped. The install only reads, so a token whose role is `write` is accepted and named as more
    than it needs (a warning: a read-only or fine-grained read token is enough); only the role is read out of the
-   Hub's answer, never the account it names (3.11.0). JupyterLab's token rides `JUPYTER_TOKEN` (or
+   Hub's answer, never the account it names (3.12.0). JupyterLab's token rides `JUPYTER_TOKEN` (or
    `JUPYTER_PASSWORD`) in its environment; without one the boot does not start it and says so (2.1.0). Since 2.5.6,
    where `BASE_LISTEN` is loopback (every host but RunPod, so the terminal is reachable only through an ssh tunnel)
    the boot GENERATES a token instead of leaving the terminal dark, and writes it owner-only to `state/tokens.env`.
@@ -103,7 +103,8 @@ run once per machine as **step one**; then each workflow package is **step two**
     wherever the datacenter has the GPU free — else the host's support with the machine id.
 12. **An unattended machine is a mode, not a fork; nothing is ever frozen** (2.1.0, 3.0.0). `BASE_NONINTERACTIVE=1`
     makes every prompt take its default. A baked image may carry the base built at the volume's own paths by a
-    project's image generator (`BASE_SEED=1`: toolchain and packs, no models), parked on the container disk; a boot
+    project's image generator (`BASE_SEED=1`: toolchain and packs, no models, built where no GPU is, so its venv check
+    asks for no device and its import check runs ComfyUI with `--cpu`, 3.9.1 and 3.10.0), parked on the container disk; a boot
     extension (`ext/`, §9) copies it onto an empty volume once, and the first install then takes everything to its
     newest like any machine. 3.0.0 retired the frozen mode (`BASE_PINNED`) and `COMFY_TAG`: they held a machine below
     its newest, which §0.3 forbids. The base ships neither the generator nor the extension.
@@ -397,6 +398,29 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   records `own <dir> <version> <digest>`; `BASE_DECLARE_ONLY=1` prints `OWNROW dir|version|digest`. A package no longer
   needs its own copy loop in a hook; one that still has it is harmless (the base saves the live copy before the hooks and
   mirrors after them).
+- `LAUNCH_ENV=( "KEY=value" ... )` (3.10.0, optional): variables ComfyUI is started with. A package cannot reach the
+  pod's start command or the boot unit, so this is its only way to set ComfyUI's environment. The install writes the
+  validated list to `state/launch.d/<PKG_ID>.env` (removed when the package stops declaring one) and every launch, the
+  install's restart and every boot alike, reads the whole folder (`lib/85-launch.sh`, `_base_launch_env`). Allowed keys:
+  `OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS
+  TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING` and CTranslate2's `CT2_*`;
+  a value is one word of `[A-Za-z0-9_.,:+-]`. Anything else (a path, a library, a token, a variable the base owns such
+  as `HF_HOME`) refuses the package's declarations before anything downloads, and a key set twice does too.
+  Precedence: the machine's own environment (a variable set on the pod, in the unit) wins; then the packages' files in
+  name order, the first naming a key winning and a different later value named in the launch's output; then the
+  base's one default, `OMP_NUM_THREADS` from the container's CPU quota. `BASE_DECLARE_ONLY=1` prints
+  `LAUNCHENV KEY=value`. A base before 3.10.0 ignores the array, so a package that depends on it sets `BASE_MIN`.
+- The CPU quota (3.10.0): when nothing sets `OMP_NUM_THREADS`, the base sets it to the CPUs the container's cgroup
+  quota allows (`cpu.max`, v2, or `cpu.cfs_quota_us` / `cpu.cfs_period_us`, v1; rounded up; never more than the CPUs
+  online), and leaves it unset when there is no quota. A RunPod container is a slice of a large host: `nproc` and torch
+  both see the host's CPUs while the CFS quota lets the container run only its own. Its effect on torch: the intra-op
+  pool (`torch.get_num_threads()`, every CPU op: preprocessing, CPU offload, a CPU-side VAE or encoder) is sized by
+  `OMP_NUM_THREADS` when set, else by the CPU count torch sees, so without it a container with (say) a 16-CPU quota on
+  a host torch counts as 112 cores runs 112 threads on 16 CPUs' worth of time and is throttled. The same variable sizes
+  OpenBLAS's pool (numpy) and CTranslate2's: faster-whisper on CPU uses 4 threads unless `cpu_threads` or
+  `OMP_NUM_THREADS` says otherwise (its `WhisperModel` docstring), and a node that never passes `cpu_threads` gets the
+  quota's count. Inter-op threads, the GPU and CUDA kernels are unaffected. On a machine with no quota torch keeps its
+  own default (the physical cores it sees), the right number there.
 - Hooks, called if defined, dry-run aware via `$BASE_DRY`: `pkg_pre_venv pkg_post_venv pkg_pre_models
   pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`, and `pkg_cmd_<name>` per
   `PKG_COMMANDS` row `name|function|help`. A failing hook fails the run. A package whose `pkg_post_venv` compiles
@@ -414,7 +438,7 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
   fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
-  basenames the index may adopt. Pin a row to a commit (3.11.0): `resolve/<40-hex commit>/<path>` for a file,
+  basenames the index may adopt. Pin a row to a commit (3.12.0): `resolve/<40-hex commit>/<path>` for a file,
   `hf://owner/repo@<40-hex commit>` for a snapshot (a branch after the `@` is refused). The revision a row names is
   the one downloaded, and every Hub download is checked with `hf cache verify` against the sha256 (LFS) or git hash the
   Hub states for that revision before it moves into place; a file that fails is deleted, never resumed. An unpinned
@@ -552,7 +576,7 @@ listens beyond loopback.
 every source), `boot.sh`, `comfy-base-boot.service` (the unit's text, always written; installed under
 `/etc/systemd/system` on a VM host), `ext/` when a project's image put extensions there (§9), `state/` (`boot.env`,
 `host.env` (`BASE_HOST`, `BASE_VOLUME`, written by the driver), `comfyui_args.txt`, `tokens.env` 0600, `apps.d/<package>.list`
-(3.9.0: the package's `APP_PORTS` rows),
+(3.9.0: the package's `APP_PORTS` rows), `launch.d/<id>.env` (3.10.0: each package's `LAUNCH_ENV`, §4),
 `constraints-torch.txt`, `boot-facts.txt`, `volume.env` on RunPod, `gpu.lease`, `packages/<id>.manifest`, `logs/`: install
 logs, `boot_<ts>.log`, `comfyui.log`, `jupyter.log`, `app_proxy.log`, `fetch-later_<ts>.log`; 3.1.0: `last-run/<id>` (the last run's
 verdict), `runtime.json` and `runtime.stamp` (the applied runtime), and for a staged install `standins.list`,
@@ -669,7 +693,7 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
-- 3.11.0: the Hub, pinned and checked (Paul, 2026-10-16: Hugging Face best practices). (1) A row's revision is what
+- 3.12.0: the Hub, pinned and checked (Paul, 2026-10-16: Hugging Face best practices). (1) A row's revision is what
   downloads: the file leg parsed `resolve/<revision>/` and then dropped it, so a commit-pinned URL silently fetched
   `main`; it now passes `--revision`. Snapshots take `hf://owner/repo@<commit>` (the 40-hex form only), which the
   base could not pin before. (2) Every Hub download is checked with `hf cache verify` against the hashes the Hub states
@@ -686,6 +710,27 @@ for any invocation that somehow arrives without the environment. The suite asser
   hf_xet fast path (`HF_XET_HIGH_PERFORMANCE`, 32 range gets, no chunk cache) and resumable downloads were already in
   place and are unchanged. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
   real Hub for `hf cache verify` (a flipped byte fails it, exit 1); not on a pod.
+- 3.10.0: a package can set ComfyUI's launch environment, and ComfyUI starts sized to the container's CPU quota
+  (2026-10-16). `LAUNCH_ENV=( "KEY=value" ... )` (§4): an allowlist of thread, tokenizer, allocator and CTranslate2
+  (`CT2_*`) variables, each value one word, so no path or secret can reach a file or a log; anything else, or a key set
+  twice, refuses the package's declarations before anything downloads. The install writes `state/launch.d/<id>.env`
+  (removed when a package drops the array; a change restarts ComfyUI) and every launch, install restart and boot alike,
+  reads the folder: the machine's own environment first, then the packages in name order (a conflicting later value is
+  named), then the base's one default, `OMP_NUM_THREADS` from cgroup `cpu.max` (v2) or `cpu.cfs_quota_us` (v1), rounded
+  up, capped at the CPUs online, unset with no quota. Exported only in ComfyUI's own shell and printed on the launch
+  line. Why: a RunPod container is a quota on a large host, and torch's intra-op pool, OpenBLAS and CTranslate2 sized
+  themselves to the host's CPU count and were throttled; faster-whisper on CPU, which ran 4 threads unless told
+  otherwise, now takes the quota's count with no package change (the Video Replacer only raises `BASE_MIN`). Checked
+  on this Mac: torch honours `OMP_NUM_THREADS` (`get_num_threads()`); owed on a pod: the boot log's `launch env:` line.
+  And `_build/canvas/snapshot.py` names a console error it used to leave unexplained: ComfyUI-Manager's
+  `loadGraphData` wrapper reading `undefined.extra` when comfyui-obvpm 0.2.16's wrapper turns the frontend's
+  zero-argument startup call into a one-argument one (the startup default graph then does not load). Matched only with
+  Manager's frame on top; the one-line fixes belong upstream in either pack. And a seed build gets past its import
+  check: with `BASE_SEED=1` (the template image, built where no GPU is) `main.py --quick-test-for-ci` died "Found no
+  NVIDIA driver" before importing a pack, the next wall after 3.9.1's venv verify (runpod-template's image job,
+  2026-10-16). Both the full and the scoped check now pass `--cpu` for a seed build alone (`_base_quick_cpu`): every
+  pack is still imported and judged, and a real machine's check still starts on its GPU. Unit tests on fakes (cgroup
+  root, stub python, the bash 3.2 boot path, the import check's arguments) and the classifier test.
 - 3.9.2: three harness fixes (2026-10-16). Two were found porting the Video Replacer 5.1.0 into its own repository.
   `basetest.fake_pod` copies every path a package's `ZIP_EXTRA` ships (new helper `zip_extra`), so a shipped
   directory that is not a node pack reaches the fake machine (the Replacer's `app/`, which its install test had copied by

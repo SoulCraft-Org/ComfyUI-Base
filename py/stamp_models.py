@@ -67,7 +67,7 @@ def entries(script_text, sums=None):
         if url == "LOCAL" or not url:
             continue
         if url.startswith("hf://"):
-            repo, _, rev = url[len("hf://"):].partition("@")        # 3.11.0: hf://owner/repo@<commit> is a pinned snapshot
+            repo, _, rev = url[len("hf://"):].partition("@")        # 3.12.0: hf://owner/repo@<commit> is a pinned snapshot
             url = "https://huggingface.co/" + repo + ("/tree/" + rev if rev else "")
         directory = "/".join(x for x in (cat, fam, purp) if x)
         name = file.rstrip("/")

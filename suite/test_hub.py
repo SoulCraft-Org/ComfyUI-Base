@@ -1,4 +1,4 @@
-"""unit tier, 3.11.0: the Hub, pinned and checked.
+"""unit tier, 3.12.0: the Hub, pinned and checked.
 
 A row's revision is what downloads (resolve/<commit>/… and hf://owner/repo@<commit>; the file leg used to drop it and
 fetch main), every Hub file is checked against the hashes the Hub states for that revision (`hf cache verify`) before it

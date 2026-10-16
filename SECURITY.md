@@ -16,7 +16,7 @@ is the authority; this page is the summary.
 | Node packs a package declares (`PACKS`), and the base's six | github.com, each pack's own repository | git; the row's sha is the **last-tested record**, not a pin: the install takes the pack's newest commit and prints the sha it got |
 | Python packages (ComfyUI's and every pack's requirements, uv, JupyterLab, comfy-cli, huggingface_hub, pytest) | pypi.org, pypi.nvidia.com, download.pytorch.org | uv's resolver, at the newest versions; no pack's `==` pin is honoured (handbook §0.3) |
 | CPython | uv's managed builds (python-build-standalone on github.com) | uv |
-| Model files a package declares (`MODELS`) | huggingface.co or github.com only; a row naming any other host is refused | the exact byte size on every row, after the download and on every later run; every Hub download (file or snapshot) is checked with `hf cache verify` against the hashes the Hub states for the row's revision (sha256 for LFS files) before it moves into place, and a file that fails is deleted (3.11.0); a row pinned to a commit (`resolve/<commit>/…`, `hf://owner/repo@<commit>`) downloads exactly that commit; the Hub's sha256 for each file is also recorded in the package's `models.sha256` (`base.sh gen-hashes`). A GitHub asset is checked by size only |
+| Model files a package declares (`MODELS`) | huggingface.co or github.com only; a row naming any other host is refused | the exact byte size on every row, after the download and on every later run; every Hub download (file or snapshot) is checked with `hf cache verify` against the hashes the Hub states for the row's revision (sha256 for LFS files) before it moves into place, and a file that fails is deleted (3.12.0); a row pinned to a commit (`resolve/<commit>/…`, `hf://owner/repo@<commit>`) downloads exactly that commit; the Hub's sha256 for each file is also recorded in the package's `models.sha256` (`base.sh gen-hashes`). A GitHub asset is checked by size only |
 | OS packages and the NVIDIA driver (`nvidia-open`, `cuda-toolkit`) | the distribution's apt mirrors and developer.download.nvidia.com | apt's signed repositories (NVIDIA's added from its `cuda-keyring`) |
 | SageAttention | github.com, built on the machine | built from source |
 | The base library itself (`lib/`, `py/`, `suite/`, `hosts/`) | the zip you uploaded or this repository | every file against `MANIFEST.sha256`, on every run |
@@ -33,7 +33,7 @@ maintainer's own sweep and changes nothing else.
 **Tokens.** `HF_TOKEN` (or its aliases) and provider keys come from the environment, the provider's own config, or
 `state/tokens.env` (mode 0600). No token is ever printed, logged or put on a command line (curl reads it from a 0600 header file, `hf` from its environment); the suite runs with every
 token name stripped from its environment. The install only reads from the Hub: use a read-only or fine-grained read
-token; a token whose role is `write` is accepted with a warning (3.11.0). JupyterLab starts only with a token or password of its own.
+token; a token whose role is `write` is accepted with a warning (3.12.0). JupyterLab starts only with a token or password of its own.
 
 **Exposure.** On every host except RunPod ComfyUI and JupyterLab listen on loopback only (reach them over an ssh
 tunnel). On RunPod they sit behind RunPod's proxy; a new pod is private unless `podctl create --public` (3.8.1).
