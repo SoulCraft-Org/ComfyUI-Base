@@ -300,7 +300,12 @@ provision_server() {
   mm="$(_testbed_python_pick)" || return 1
   _testbed_venv "$mm" || return 1
   uv python upgrade "$mm" >/dev/null 2>&1 || true
-  note "installing torch (CPU) + every requirement at its newest: this is the slow part …"
+  # 3.18.2: on Linux PyPI's torch IS the CUDA build (2.14.1+cu130 plus every nvidia-* wheel, a 6.7-7.2 GB venv on x64 and
+  # arm64 alike), which every CI gate downloaded again on runners that keep no cache (error log row 108). The testbed
+  # never sees a GPU, so on Linux every uv install below takes torch from the CPU index. macOS wheels are CPU already,
+  # and the pod's install (lib/30-venv.sh) chooses its own backend: neither changes.
+  if [ "$(uname -s)" = Linux ]; then export UV_TORCH_BACKEND=cpu; fi
+  note "installing torch (CPU${UV_TORCH_BACKEND:+, uv --torch-backend $UV_TORCH_BACKEND}) + every requirement at its newest: this is the slow part …"
   uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
   # one pin-free set: ComfyUI's own == pins (its frontend packages) and every pack's are lifted by the base's reqlift
   local row dir files=("ComfyUI=$COMFY/requirements.txt") derived="$COMFY/.testbed-derived.txt"   # inside the ignored testbed tree
