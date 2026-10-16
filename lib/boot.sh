@@ -147,6 +147,14 @@ boot_tokens(){ # 2.1.0: the tokens an earlier install saved (state/tokens.env, 0
   # pack reads its own name. Values are exported, never echoed. 20-comfyui.sh's _base_tokens_export_buttons is the
   # install-time twin; boot.sh sources none of lib/[0-9]* so it carries its own lines.
   local f="$BOOT_HOME/state/tokens.env" name val n=0
+  # 3.19.0: a RunPod Secret reference RunPod could not resolve (the account has no secret of that name) reaches the pod
+  # as the literal "{{ RUNPOD_SECRET_<NAME> }}". It is a placeholder, never a token: unset, so a saved one applies and
+  # nothing hands the literal to the Hub as a bearer token. The same rule as 20-comfyui.sh's _base_token_is_placeholder.
+  local ph=""
+  for name in HF_TOKEN HUGGING_FACE_HUB_TOKEN HF_HUB_TOKEN CIVITAI_TOKEN CIVITAI_API_KEY CIVITAI_API_TOKEN; do
+    case "${!name:-}" in "{{"*) unset "$name"; ph="$ph $name";; esac
+  done
+  [ -z "$ph" ] || echo "boot: unresolved RunPod Secret references ignored (placeholders, not tokens):$ph"
   if [ -f "$f" ]; then
     while IFS='=' read -r name val; do
       [[ "$name" =~ ^[A-Z_]+$ ]] || continue

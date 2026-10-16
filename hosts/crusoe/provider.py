@@ -24,7 +24,9 @@ THE API
                 (RawURLEncoding both ways, HMAC-SHA256, time.RFC3339 in UTC) and the Python in
                 crusoe-registry-token-rotator. The worked example in the prose docs does NOT reproduce under any
                 reading, so the code is the authority and the first live 200 is the proof.
-  credentials   env CRUSOE_ACCESS_KEY_ID and CRUSOE_SECRET_KEY, else ~/.crusoe/config:
+  credentials   env CRUSOE_ACCESS_KEY_ID and CRUSOE_SECRET_KEY, else (3.19.0, on a Mac) the login Keychain items whose
+                accounts are those two names, else ~/.crusoe/config (a pair counts only when both halves come from the
+                same one of the three; the project name may come from the file either way):
                   [default]
                   access_key_id = ...
                   secret_key = ...
@@ -76,7 +78,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from comfyui_hosts import Address, PodctlError, Provider
+from comfyui_hosts import Address, PodctlError, Provider, keychain
 
 HERE = pathlib.Path(__file__).resolve().parent
 VOLUME_ROOT = "/workspace"                          # where startup.sh mounts the data disk; the base's BASE_VOLUME here
@@ -122,16 +124,27 @@ def _unquote(v):
 
 
 def load_credentials(env=None, path=None):
-    """(access_key_id, secret_key, default_project): the environment first, then ~/.crusoe/config. Never echoed.
+    """(access_key_id, secret_key, default_project): the environment first, then (3.19.0, a Mac only) the login Keychain
+    items whose accounts are CRUSOE_ACCESS_KEY_ID and CRUSOE_SECRET_KEY, then ~/.crusoe/config. Never echoed.
 
     The file is read loosely on purpose: `[default]` headers, comments, `export ` prefixes and either separator all
-    appear in the wild, and a credential file that parses only one way is a support question waiting to happen."""
+    appear in the wild, and a credential file that parses only one way is a support question waiting to happen.
+    3.19.0: the key pair counts only when both halves come from the SAME source (an id from the environment and a
+    secret from the file are never joined). The project is a name, not a credential: CRUSOE_PROJECT, else the file's."""
     env = os.environ if env is None else env
-    akid = (env.get("CRUSOE_ACCESS_KEY_ID") or "").strip()
-    secret = (env.get("CRUSOE_SECRET_KEY") or "").strip()
     project = (env.get("CRUSOE_PROJECT") or "").strip()
     path = pathlib.Path(path) if path else CREDENTIALS_PATH
-    if (not akid or not secret or not project) and path.exists():
+    pair = None
+    akid = (env.get("CRUSOE_ACCESS_KEY_ID") or "").strip()
+    secret = (env.get("CRUSOE_SECRET_KEY") or "").strip()
+    if akid and secret:
+        pair = (akid, secret)
+    if pair is None:
+        akid = (keychain("CRUSOE_ACCESS_KEY_ID") or "").strip()
+        secret = (keychain("CRUSOE_SECRET_KEY") or "").strip() if akid else ""
+        if akid and secret:
+            pair = (akid, secret)
+    if (pair is None or not project) and path.exists():
         found = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -147,12 +160,13 @@ def load_credentials(env=None, path=None):
                 found["secret"] = _unquote(m.group(2))
             elif key in ("default_project", "crusoe_project", "project"):
                 found["project"] = _unquote(m.group(2))
-        akid = akid or found.get("id", "")
-        secret = secret or found.get("secret", "")
+        if pair is None and found.get("id") and found.get("secret"):
+            pair = (found["id"], found["secret"])
         project = project or found.get("project", "")
-    if akid and secret:
-        return akid, secret, project
-    raise PodctlError("no Crusoe credentials: export CRUSOE_ACCESS_KEY_ID and CRUSOE_SECRET_KEY, or write both as "
+    if pair:
+        return pair[0], pair[1], project
+    raise PodctlError("no Crusoe credentials: export CRUSOE_ACCESS_KEY_ID and CRUSOE_SECRET_KEY, or (on a Mac) keep both in "
+                      "the login Keychain as items whose accounts are those two names, or write both as "
                       "`access_key_id = ...` and `secret_key = ...` lines in %s (hosts/crusoe/README.md)" % path)
 
 

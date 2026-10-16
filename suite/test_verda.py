@@ -327,6 +327,36 @@ def test_unit_verda_token_exchange_sends_the_secret_in_the_body_only_and_reuses_
         fake.close()
 
 
+def test_unit_verda_pair_order_is_env_then_the_keychain_then_the_file_and_never_mixed(tmp_path, keychain_stub, capsys):
+    """3.19.0: VERDA_CLIENT_ID + VERDA_CLIENT_SECRET from the environment, else the login Keychain items whose accounts are
+    those names, else ~/.verda/credentials. A pair counts only when both halves come from the same source."""
+    podctl = _load()
+    mod = _verda(podctl)
+    f = tmp_path / "credentials"
+    f.write_text("client_id = file-id\nclient_secret = file-secret\n", encoding="utf-8")
+    keychain_stub.serve({"VERDA_CLIENT_ID": "kc-id", "VERDA_CLIENT_SECRET": "kc-secret"})
+    assert mod.load_credentials(env={"VERDA_CLIENT_ID": "env-id", "VERDA_CLIENT_SECRET": "env-secret"}, path=f) == ("env-id", "env-secret")
+    assert keychain_stub.calls() == []
+    assert mod.load_credentials(env={"VERDA_CLIENT_ID": "env-id"}, path=f) == ("kc-id", "kc-secret")
+    assert keychain_stub.calls() == ["find-generic-password -a VERDA_CLIENT_ID -w", "find-generic-password -a VERDA_CLIENT_SECRET -w"]
+    # only the id in the Keychain: the file's whole pair, never kc-id with file-secret
+    keychain_stub.serve({"VERDA_CLIENT_ID": "kc-id"})
+    assert mod.load_credentials(env={"VERDA_CLIENT_SECRET": "env-secret"}, path=f) == ("file-id", "file-secret")
+    # no id in the Keychain: the secret is not even asked for
+    keychain_stub.serve({"VERDA_CLIENT_SECRET": "kc-secret"})
+    n = len(keychain_stub.calls())
+    assert mod.load_credentials(env={}, path=f) == ("file-id", "file-secret")
+    assert keychain_stub.calls()[n:] == ["find-generic-password -a VERDA_CLIENT_ID -w"]
+    # half everywhere: no pair, and the error names every place
+    f.write_text("client_secret = file-secret\n", encoding="utf-8")
+    with pytest.raises(podctl.PodctlError) as ei:
+        mod.load_credentials(env={"VERDA_CLIENT_ID": "env-id"}, path=f)
+    msg = str(ei.value)
+    assert "VERDA_CLIENT_ID" in msg and "VERDA_CLIENT_SECRET" in msg and "login Keychain" in msg and str(f) in msg, msg
+    out = capsys.readouterr()
+    assert "secret" not in (out.out + out.err).replace("VERDA_CLIENT_SECRET", "")
+
+
 def test_unit_verda_credentials_come_from_env_or_the_file_and_a_missing_pair_names_both(tmp_path):
     podctl = _load()
     mod = _verda(podctl)

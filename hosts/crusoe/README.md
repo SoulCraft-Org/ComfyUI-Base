@@ -80,6 +80,10 @@ systemd drop-in for the unit, which nothing writes yet.
 
 ## What the driver will do once implemented
 
+- credentials: `CRUSOE_ACCESS_KEY_ID` + `CRUSOE_SECRET_KEY` in the environment, else (3.19.0, on a Mac) the login
+  Keychain items whose accounts are those two names (`BASE_KEYCHAIN=0` skips the lookup), else `~/.crusoe/config`
+  (`access_key_id`, `secret_key`, `default_project`). A pair counts only when both halves come from the same place;
+  the project is `CRUSOE_PROJECT`, else the file's.
 - `pods`, `status`: list and read VMs through the signed REST client (or `crusoe ... --json`), normalising the state
   case-insensitively (RUNNING; STOPPED or SHUTOFF; anything else transitional) and reading the public IP from
   `network_interfaces[0].ips[0].public_ipv4.address`.

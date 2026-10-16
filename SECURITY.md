@@ -30,8 +30,13 @@ maintainer's own sweep and changes nothing else.
 **Nothing is uploaded.** comfy-cli's and huggingface_hub's telemetry are switched off before they run (`DO_NOT_TRACK`,
 `COMFY_NO_TELEMETRY`, `HF_HUB_DISABLE_TELEMETRY`). ComfyUI is launched with `--disable-api-nodes`.
 
-**Tokens.** `HF_TOKEN` (or its aliases) and provider keys come from the environment, the provider's own config, or
-`state/tokens.env` (mode 0600). No token is ever printed, logged or put on a command line (curl reads it from a 0600 header file, `hf` from its environment); the suite runs with every
+**Tokens.** `HF_TOKEN` and `CIVITAI_TOKEN` (or their aliases) come from the environment, the machine's own environment
+or `state/tokens.env` (mode 0600). Provider keys on the Mac come from the environment, else (3.19.0) the macOS login
+Keychain item whose account is the variable's name, else the provider's own config; a key pair counts only when both
+halves come from one of those. A token value starting with `{{` is an unresolved RunPod Secret reference and is ignored
+as a placeholder. A RunPod pod made by `podctl create` references the account's RunPod Secrets `HF_TOKEN` and
+`CIVITAI_TOKEN` by name when they exist (podctl lists names only and never sees a value); the reference resolves inside
+the account that owns the pod, so a customer's pod never gets the operator's keys. No token is ever printed, logged or put on a command line (curl reads it from a 0600 header file, `hf` from its environment); the suite runs with every
 token name stripped from its environment. The install only reads from the Hub: use a read-only or fine-grained read
 token; a token whose role is `write` is accepted with a warning (3.12.0). JupyterLab starts only with a token or password of its own.
 

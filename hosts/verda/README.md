@@ -22,12 +22,15 @@ Verda authenticates with a client id and a client secret (OAuth2 client credenti
 token at `POST /oauth2/token`). Make the pair in the console under API keys, then put it in ONE of these places:
 
 - the environment: `export VERDA_CLIENT_ID=... VERDA_CLIENT_SECRET=...`
+- (3.19.0, on a Mac) the login Keychain: two items whose accounts are `VERDA_CLIENT_ID` and `VERDA_CLIENT_SECRET` (any
+  service name; `BASE_KEYCHAIN=0` skips the lookup)
 - the file `~/.verda/credentials`, mode 600:
 
       client_id = your-client-id
       client_secret = "your-client-secret"
 
-  Quoted or unquoted values are both read; `#` lines are comments. The pair is never printed, logged or placed in
+  Quoted or unquoted values are both read; `#` lines are comments. They are tried in that order, and a pair counts
+  only when both halves come from the same place. The pair is never printed, logged or placed in
   an argument or a URL: it travels once, in the JSON body of the token request, and the token travels as
   `Authorization: Bearer`.
 

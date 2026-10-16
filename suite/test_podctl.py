@@ -69,6 +69,9 @@ class FakeRunPod:
         self.move_port_on_reset = False                   # 3.10.1: and RunPod maps 22/tcp to a new port
         self.stale_reads = 0                              # 3.10.1: reads that still answer with the pod as it was before the PATCH
         self._stale = []
+        self.secrets = []                                 # 3.19.0: the account's RunPod Secret NAMES (REST v2 GET /v2/account/secrets)
+        self.secrets_fail = None                          # 3.19.0: an HTTP status the listing answers with instead
+        self.secrets_auth = []                            # 3.19.0: the Authorization header of every listing
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -92,6 +95,12 @@ class FakeRunPod:
                 path = self.path.split("?")[0]            # 3.7.3: every pod read carries includeMachine/includeNetworkVolume
                 if path == "/pods/" + srv.pod["id"] and srv._stale:
                     return self._send(200, srv._stale.pop())
+                if path == "/v2/account/secrets":             # 3.19.0: listSecrets as docs.runpod.io/api-reference-v2 has it: names, never a value
+                    srv.secrets_auth.append(self._auth())
+                    if srv.secrets_fail:
+                        return self._send(srv.secrets_fail, {"title": "refused", "status": srv.secrets_fail, "detail": "the fake refuses"})
+                    return self._send(200, {"secrets": [{"id": "sec%04d" % i, "name": n, "description": None, "createdAt": "2026-10-16T00:00:00Z",
+                                                         "valueLastUpdatedAt": None} for i, n in enumerate(srv.secrets)]})
                 if srv.rest:
                     res = srv.rest("GET", path, None)
                     if res is not None:
@@ -2290,3 +2299,130 @@ def test_unit_podctl_stop_removes_a_registered_runner_and_never_asks_github_with
     for cmd in ("def cmd_stop", "def cmd_pause"):
         assert "runner_off(args.pod)" in src[src.index(cmd):src.index(cmd) + 200], cmd
     assert "runner_off(pod_id, say=io.say)" in src[src.index("def put_away"):src.index("def cmd_stop")]
+
+
+# ---------------------------------------------------------------- 3.19.0: the Mac's login Keychain, RunPod Secrets on new pods
+
+def test_unit_runpod_key_order_is_env_then_the_keychain_then_runpodctls_config(tmp_path, keychain_stub, capsys):
+    """RUNPOD_API_KEY, else the login Keychain item whose ACCOUNT is RUNPOD_API_KEY (`security find-generic-password -a
+    RUNPOD_API_KEY -w`, no service filter), else runpodctl's config. The stub `security` stands in for the real one."""
+    podctl = _load()
+    cfg = tmp_path / "config.toml"; cfg.write_text('apikey = "file-fake"\n', encoding="utf-8")
+    keychain_stub.serve({"RUNPOD_API_KEY": "kc-fake"})
+    # 1. the environment wins, and the Keychain is not even asked
+    assert podctl.load_api_key(env={"RUNPOD_API_KEY": "env-fake"}, config_path=cfg) == "env-fake"
+    assert keychain_stub.calls() == []
+    # 2. then the Keychain, by account, the trailing newline stripped
+    assert podctl.load_api_key(env={}, config_path=cfg) == "kc-fake"
+    assert keychain_stub.calls() == ["find-generic-password -a RUNPOD_API_KEY -w"]
+    # 3. no such item (the stub exits 44, as `security` does): runpodctl's config
+    keychain_stub.serve({"SOME_OTHER_ACCOUNT": "x"})
+    assert podctl.load_api_key(env={}, config_path=cfg) == "file-fake"
+    # nowhere: the error names all three places
+    with pytest.raises(podctl.PodctlError) as ei:
+        podctl.load_api_key(env={}, config_path=tmp_path / "absent.toml")
+    msg = str(ei.value)
+    assert "export RUNPOD_API_KEY" in msg and "login Keychain" in msg and "runpodctl config --apiKey" in msg, msg
+    out = capsys.readouterr()
+    assert not any(v in out.out + out.err for v in ("kc-fake", "env-fake", "file-fake"))
+
+
+def test_unit_keychain_lookup_asks_only_on_a_mac_with_the_switch_on_and_never_hangs(keychain_stub, monkeypatch, capsys):
+    """keychain(VAR) runs `security` only when sys.platform is darwin, `security` is on PATH and BASE_KEYCHAIN is not 0.
+    The switch is read from the process environment, so a loader's env={} cannot turn it on (the suite runs with it off).
+    Any non-zero exit, and a dialog nobody answers (the timeout), is None. The value is returned, never printed."""
+    import time
+    podctl = _load()
+    keychain_stub.serve({"RUNPOD_API_KEY": "kc-fake-77"})
+    assert podctl.keychain("RUNPOD_API_KEY") == "kc-fake-77"
+    assert podctl.keychain("VERDA_CLIENT_ID") is None                                   # exit 44: no such item
+    asked = len(keychain_stub.calls())
+    assert asked == 2
+    monkeypatch.setenv("BASE_KEYCHAIN", "0")
+    assert podctl.keychain("RUNPOD_API_KEY") is None
+    monkeypatch.setenv("BASE_KEYCHAIN", "1")
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert podctl.keychain("RUNPOD_API_KEY") is None
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("PATH", "/nonexistent-dir")                                     # no `security` at all
+    assert podctl.keychain("RUNPOD_API_KEY") is None
+    assert len(keychain_stub.calls()) == asked                                          # none of the three asked
+    monkeypatch.setenv("PATH", str(keychain_stub.d) + os.pathsep + "/usr/bin:/bin")
+    keychain_stub.hang()
+    monkeypatch.setattr(sys.modules["comfyui_hosts"], "KEYCHAIN_TIMEOUT", 1)
+    t = time.monotonic()
+    assert podctl.keychain("RUNPOD_API_KEY") is None
+    assert time.monotonic() - t < 10
+    out = capsys.readouterr()
+    assert "kc-fake-77" not in out.out + out.err
+
+
+def test_unit_runpod_v2_listing_never_pairs_a_fake_rest_base_with_the_live_v2_host(monkeypatch):
+    """The Secrets listing is REST v2. RunPod's own v1 base pairs with RunPod's v2; any other base (the suite's fake, a
+    proxy) uses its own /v2, so no test that points v1 at a fake can reach the live API through the listing."""
+    podctl = _load()
+    monkeypatch.delenv("RUNPOD_API_V2_URL", raising=False)
+    monkeypatch.delenv("RUNPOD_API_URL", raising=False)
+    assert podctl.Api("k").v2 == podctl.DEFAULT_API_V2_URL == "https://api.runpod.io/v2"
+    assert podctl.Api("k", base_url="http://127.0.0.1:5").v2 == "http://127.0.0.1:5/v2"
+    monkeypatch.setenv("RUNPOD_API_V2_URL", "http://127.0.0.1:6/v2/")
+    assert podctl.Api("k").v2 == "http://127.0.0.1:6/v2"
+
+
+def test_unit_runpod_create_references_only_the_secrets_the_account_has(tmp_path, capsys):
+    """podctl create lists the account's RunPod Secret NAMES (REST v2) and, for HF_TOKEN and CIVITAI_TOKEN, sets
+    env[VAR] = "{{ RUNPOD_SECRET_VAR }}" only when a secret of exactly that name exists. One line names what it referenced.
+    A value is never in the body, the listing or the output: RunPod puts it in when the pod starts."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    srv.secrets = ["HF_TOKEN", "civitai_token", "CIVITAI_TOKEN_OLD", "SOMETHING_ELSE"]
+    try:
+        assert _create(podctl, srv, pub, "--data-gb", "500") in (None, 0)
+        out = capsys.readouterr().out
+        body = srv.bodies[-1][1]
+        assert body["env"]["HF_TOKEN"] == "{{ RUNPOD_SECRET_HF_TOKEN }}", body["env"]
+        assert "CIVITAI_TOKEN" not in body["env"]                                       # civitai_token is not the name
+        assert set(body["env"]) == {"PUBLIC_KEY", "JUPYTER_TOKEN", "BASE_LINK_TOKEN", "HF_TOKEN"}
+        assert srv.secrets_auth == ["Bearer rp_key_create"]
+        said = [l for l in out.splitlines() if l.strip().startswith("secrets")]
+        assert len(said) == 1 and "HF_TOKEN" in said[0] and "CIVITAI_TOKEN" not in said[0], out
+        # both names: both referenced, on a private pod as well
+        srv.secrets = ["CIVITAI_TOKEN", "HF_TOKEN"]
+        assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
+        out = capsys.readouterr().out
+        body = srv.bodies[-1][1]
+        assert body["env"] == {"PUBLIC_KEY": "ssh-ed25519 AAAAMAC mac@key", "BASE_LISTEN": "127.0.0.1",
+                               "HF_TOKEN": "{{ RUNPOD_SECRET_HF_TOKEN }}", "CIVITAI_TOKEN": "{{ RUNPOD_SECRET_CIVITAI_TOKEN }}"}
+        said = [l for l in out.splitlines() if l.strip().startswith("secrets")]
+        assert len(said) == 1 and "CIVITAI_TOKEN, HF_TOKEN" in said[0], out
+        # none: nothing referenced, and the line says so
+        srv.secrets = []
+        assert _create(podctl, srv, pub, "--data-gb", "500") in (None, 0)
+        out = capsys.readouterr().out
+        assert not {"HF_TOKEN", "CIVITAI_TOKEN"} & set(srv.bodies[-1][1]["env"])
+        assert "secrets  none referenced" in out, out
+    finally:
+        srv.close()
+    # the read-back names a reference as one, never as "set"
+    facts = podctl.pod_facts(_pod(env={"HF_TOKEN": "{{ RUNPOD_SECRET_HF_TOKEN }}"}))
+    assert "RunPod Secret reference ({{ RUNPOD_SECRET_HF_TOKEN }})" in facts, facts
+
+
+def test_unit_runpod_create_warns_when_the_secrets_cannot_be_listed_and_still_makes_the_pod(tmp_path, capsys):
+    """A failed listing is a warning, never a failed create: the pod is made with no reference and the install's own
+    token sources apply."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    srv.secrets = ["HF_TOKEN"]
+    srv.secrets_fail = 403
+    try:
+        assert _create(podctl, srv, pub, "--data-gb", "500") in (None, 0)
+        out = capsys.readouterr().out
+    finally:
+        srv.close()
+    body = srv.bodies[-1][1]
+    assert srv.posts[-1] == "/pods" and not {"HF_TOKEN", "CIVITAI_TOKEN"} & set(body["env"]), body["env"]
+    assert "RunPod Secrets could not be listed" in out and "HTTP 403" in out and "created newpod0000001" in out, out
+    assert "rp_key_create" not in out

@@ -3,8 +3,9 @@
 verbatim; the driver reaches it through RunPodProvider, and the driver's own shared helpers (ssh, scp, the Host block) are
 reached back through _c(), the driver module registered as comfyui_podctl.
 
-The API key is read from RUNPOD_API_KEY, else from runpodctl's ~/.runpod/config.toml (`apiKey = "..."`). It is sent as a
-bearer header and never printed, logged or placed in an argument.
+The API key is read from RUNPOD_API_KEY, else (3.19.0, on a Mac) the login Keychain item whose account is RUNPOD_API_KEY,
+else from runpodctl's ~/.runpod/config.toml (`apiKey = "..."`). It is sent as a bearer header and never printed, logged or
+placed in an argument.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from comfyui_hosts import Address, PodctlError, Provider
+from comfyui_hosts import Address, PodctlError, Provider, keychain
 
 VOLUME_ROOT = "/workspace"          # RunPod mounts the network volume here (volumeMountPath); the base's BASE_VOLUME on this host
 
@@ -48,6 +49,7 @@ def _sq(s):
 
 DEFAULT_API_URL = "https://rest.runpod.io/v1"
 DEFAULT_GRAPHQL_URL = "https://api.runpod.io/graphql"   # 3.7.3: stock per data centre lives only here (REST v1 has no stock call)
+DEFAULT_API_V2_URL = "https://api.runpod.io/v2"         # 3.19.0: the account's Secrets (names only) live only here
 
 
 PLACEHOLDERS = {"token_here", "replace_with_ids", "changeme", ""}
@@ -57,9 +59,13 @@ SECRET_NAMES = re.compile(r"token|key|secret|password", re.I)
 
 
 def load_api_key(env=None, config_path=None):
-    """RUNPOD_API_KEY, else runpodctl's config file. Never echoed by anything in this module."""
+    """RUNPOD_API_KEY, else the login Keychain item whose account is RUNPOD_API_KEY (3.19.0, a Mac only), else runpodctl's
+    config file. Never echoed by anything in this module."""
     env = os.environ if env is None else env
     key = (env.get("RUNPOD_API_KEY") or "").strip()
+    if key:
+        return key
+    key = (keychain("RUNPOD_API_KEY") or "").strip()
     if key:
         return key
     path = pathlib.Path(config_path) if config_path else pathlib.Path.home() / ".runpod" / "config.toml"
@@ -73,7 +79,8 @@ def load_api_key(env=None, config_path=None):
                     return key
                 # 2.0.56: `apikey = ''` (what runpodctl writes before a key is set) matched with every group empty,
                 # and next() over an empty generator raised StopIteration -- a traceback where the line below belongs.
-    raise PodctlError("no RunPod API key: run `runpodctl config --apiKey=<your key>` once, or export RUNPOD_API_KEY")
+    raise PodctlError("no RunPod API key: export RUNPOD_API_KEY, or (on a Mac) keep it in the login Keychain as an item whose "
+                      "account is RUNPOD_API_KEY, or run `runpodctl config --apiKey=<your key>` once")
 
 
 def _base_version():
@@ -89,10 +96,15 @@ BASE_VERSION_FOR_UA = _base_version()
 class Api:
     """The few REST v1 calls podctl needs. JSON in, JSON out; errors carry the status and the body, never the key."""
 
-    def __init__(self, key, base_url=None, graphql_url=None):
+    def __init__(self, key, base_url=None, graphql_url=None, v2_url=None):
         self.key = key
         self.base = (base_url or os.environ.get("RUNPOD_API_URL") or DEFAULT_API_URL).rstrip("/")
         self.graphql_url = graphql_url or os.environ.get("RUNPOD_GRAPHQL_URL") or DEFAULT_GRAPHQL_URL
+        # 3.19.0: REST v2 for the Secrets listing. A REST base that is not RunPod's own (the suite's fake, a proxy) is
+        # never paired with RunPod's real v2 host: its /v2 is used instead, so a test that points v1 at a fake cannot
+        # reach the live API through the one call it did not think to point.
+        v2 = v2_url or os.environ.get("RUNPOD_API_V2_URL")
+        self.v2 = (v2 or (DEFAULT_API_V2_URL if self.base == DEFAULT_API_URL else self.base + "/v2")).rstrip("/")
 
     USER_AGENT = "podctl/%s (ComfyUI Base; RunPod REST v1 client)" % BASE_VERSION_FOR_UA
 
@@ -132,6 +144,16 @@ class Api:
 
     def delete(self, path):
         return self._call("DELETE", path)
+
+    def store_names(self):
+        """3.19.0: the NAMES of the account's RunPod Secrets, from REST v2 GET /account/secrets (docs.runpod.io
+        api-reference-v2, listSecrets: {"secrets": [{id, name, description, createdAt, valueLastUpdatedAt}]}). A value
+        is never part of the answer ("Secret values are write-only and are never returned"), and none is read here."""
+        out = self._call("GET", "/account/secrets", url=self.v2 + "/account/secrets")
+        rows = out.get("secrets") if isinstance(out, dict) else None
+        if not isinstance(rows, list):
+            raise PodctlError("GET /account/secrets answered without a secrets list")
+        return {r["name"] for r in rows if isinstance(r, dict) and isinstance(r.get("name"), str)}
 
     def graphql(self, query, variables=None):
         """RunPod's GraphQL API, for what REST v1 does not answer (stock per data centre). Same bearer header."""
@@ -188,7 +210,9 @@ def env_verdicts(env):
     out = {}
     for name, value in sorted((env or {}).items()):
         v = (value or "").strip()
-        if v in PLACEHOLDERS:
+        if v.startswith("{{"):                                 # 3.19.0: a reference, never a value; RunPod resolves it at start
+            out[name] = "RunPod Secret reference (%s)" % v
+        elif v in PLACEHOLDERS:
             out[name] = "placeholder (%s)" % (v or "empty")
         elif SECRET_NAMES.search(name):
             out[name] = "set"
@@ -911,7 +935,7 @@ def encryption_words(pod, gb=None):
 
 
 def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None, names=None,
-                template_id=None, token=None, link=None, start=None, pod_gb=None):
+                template_id=None, token=None, link=None, start=None, pod_gb=None, refs=None):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
     data centre, the ports, PUBLIC_KEY, the CUDA floor. No start command: `ensure` installs the base's boot guard from the
     image's own entry, as for every other pod; and no templateId but the port-names one (3.9.0), which carries nothing else.
@@ -926,7 +950,9 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
     3.14.0 link: the pod's own BASE_LINK_TOKEN, the key every proxied link but the terminal's needs (a private pod has none
     to lock: its ports are on loopback).
     3.18.0 pod_gb: a PUBLIC pod on a POD VOLUME of that size instead of a network volume (a fresh pod where the GPU is
-    and no network volume is): the same ports, names, tokens and key as a network-volume pod."""
+    and no network volume is): the same ports, names, tokens and key as a network-volume pod.
+    3.19.0 refs: {VAR: "{{ RUNPOD_SECRET_VAR }}"} from env_refs, joined to the env of every kind of pod: references
+    by name, which RunPod resolves at the pod's start; never a value."""
     body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
             "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
@@ -945,11 +971,44 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
         del body["networkVolumeId"]
         body.update({"volumeInGb": int(private_gb), "ports": list(PRIVATE_PORTS),
                      "env": {"PUBLIC_KEY": pubkey.strip(), "BASE_LISTEN": "127.0.0.1"}})
+    if refs:
+        body["env"].update(refs)
     if cuda:
         body["allowedCudaVersions"] = list(cuda)
     if start:
         body.update(start)                                     # 3.14.0: create_start, the base's boot from the first start
     return body
+
+
+REF_VARS = ("HF_TOKEN", "CIVITAI_TOKEN")    # 3.19.0: the variables a new pod takes from the account's RunPod Secrets
+
+
+def env_ref(var):
+    """The env value RunPod replaces with the account Secret called `var` when the pod starts."""
+    return "{{ RUNPOD_SECRET_%s }}" % var
+
+
+def env_refs(api, say=print):
+    """3.19.0: {VAR: "{{ RUNPOD_SECRET_VAR }}"} for each of REF_VARS the account holds a RunPod Secret of EXACTLY that
+    name. podctl lists names only and never sees a value: RunPod puts the value in when the pod starts, inside the
+    account it belongs to, so a pod made with somebody else's RunPod key gets that account's secrets or none, never the
+    operator's. A name with no secret is left out, never referenced (RunPod would leave the literal in the pod's env).
+    A failed listing is a warning, never a failed create: the pod is made without them and the base asks as before."""
+    try:
+        names = api.store_names()
+    except Exception as e:
+        say("  !! the account's RunPod Secrets could not be listed (%s): the pod references none, so %s come from "
+            "the install's own sources" % (str(e)[:200], " and ".join(REF_VARS)))
+        return {}
+    return {v: env_ref(v) for v in REF_VARS if v in names}
+
+
+def refs_line(refs):
+    """The one line create prints about them: the variables referenced, by name."""
+    if refs:
+        return ("  secrets  %s: references to the account's RunPod Secrets of the same names (RunPod puts the values in at "
+                "start; podctl never sees one)" % ", ".join(sorted(refs)))
+    return "  secrets  none referenced: the account has no RunPod Secret named %s" % " or ".join(REF_VARS)
 
 
 def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_gb=100, pubkey=None, min_cuda=None, spot=False,
@@ -994,10 +1053,11 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
             tid = names_template(api, names, image, say=say, sleep=sleep)
         except PodctlError as e:                # the names are the console's, never a reason to have no pod
             say("  !! the port names could not be written (%s): the Connect tab will say \"HTTP Service\"" % e)
+    refs = env_refs(api, say=say)
     body = create_body(name, gpu, dc, vid, image, container_gb, pubkey, cuda=cuda, spot=spot, names=names, template_id=tid,
                        token=jupyter_token(),     # printed once, as the Jupyter Terminal link; RunPod keeps it in the pod's env
                        link=link_token(),         # 3.14.0: and the key, inside every other link printed below
-                       start=create_start(sshd_bootstrap_text()), pod_gb=pod_gb)
+                       start=create_start(sshd_bootstrap_text()), pod_gb=pod_gb, refs=refs)
     try:
         made_pod = api.post("/pods", body)
         pod_id = made_pod["id"]
@@ -1015,6 +1075,7 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
         (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
     say("  names    %s%s" % (" · ".join("%d %s" % (int(p), n) for p, n in names),
                              (" (template %s)" % tid) if tid else " (not in the console: no template)"))
+    say(refs_line(refs))
     back = made_pod.get("ports")
     if back and sorted(back) != sorted(body["ports"]):
         say("  !! %s came back with ports %s, not %s" % (pod_id, " ".join(back), " ".join(body["ports"])))
@@ -1075,8 +1136,9 @@ def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pu
     if not data_gb:
         raise PodctlError("--private needs --data-gb N: the size of the pod volume at %s" % VOLUME_ROOT)
     say(PRIVATE_UNENCRYPTED)
+    refs = env_refs(api, say=say)
     body = create_body(name, gpu, dc, None, image, container_gb, pubkey, cuda=cuda, spot=spot, private_gb=data_gb,
-                       start=create_start(sshd_bootstrap_text()))
+                       start=create_start(sshd_bootstrap_text()), refs=refs)
     pod_id = api.post("/pods", body)["id"]
     back = api.get("/pods/%s%s" % (pod_id, POD_READ))
     ports = back.get("ports") or body["ports"]
@@ -1085,6 +1147,7 @@ def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pu
     say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · %s · ports %s only · "
         "ComfyUI on loopback · CUDA %s%s" % (pod_id, name, image, gpu, dc, int(container_gb), encryption_words(back, data_gb),
                                               " ".join(PRIVATE_PORTS), (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
+    say(refs_line(refs))
     say("  private: no proxy URL; ComfyUI is http://localhost:8188 through podctl tunnel %s, which also names the Jupyter "
         "Terminal (its token made by the boot, on this volume) and each app port. The volume is this machine's (kept across "
         "stop/start, deleted with the pod)." % pod_id)

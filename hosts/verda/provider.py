@@ -6,8 +6,9 @@ a shared filesystem created, attached to two machines at once and mounted as the
 migration, and six volumes restored from the trash after a zero balance. hosts/verda/README.md records what the
 live runs answered and what they measured.
 
-The credentials are a client id + client secret pair: VERDA_CLIENT_ID + VERDA_CLIENT_SECRET, else ~/.verda/credentials
-(`client_id = ...` / `client_secret = ...`, quoted or not). They are exchanged for a bearer token at POST /oauth2/token
+The credentials are a client id + client secret pair: VERDA_CLIENT_ID + VERDA_CLIENT_SECRET, else (3.19.0, on a Mac) the
+login Keychain items whose accounts are those two names, else ~/.verda/credentials (`client_id = ...` / `client_secret = ...`,
+quoted or not). A pair counts only when both halves come from the same one of the three. They are exchanged for a bearer token at POST /oauth2/token
 and are never printed, logged or placed in a URL or an argument. Everything is lazy: constructing the provider reads
 nothing and opens no socket; the first REST call loads the pair and takes the token.
 
@@ -33,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 
-from comfyui_hosts import Address, PodctlError, Provider
+from comfyui_hosts import Address, PodctlError, Provider, keychain
 
 HERE = pathlib.Path(__file__).resolve().parent
 VOLUME_ROOT = "/workspace"                         # where startup.sh mounts the data volume; the base's BASE_VOLUME here
@@ -84,10 +85,17 @@ def _unquote(v):
 
 
 def load_credentials(env=None, path=None):
-    """(client_id, client_secret): VERDA_CLIENT_ID + VERDA_CLIENT_SECRET, else ~/.verda/credentials. Never echoed."""
+    """(client_id, client_secret): VERDA_CLIENT_ID + VERDA_CLIENT_SECRET, else (3.19.0, a Mac only) the login Keychain
+    items whose accounts are those two names, else ~/.verda/credentials. Never echoed.
+    3.19.0: a pair counts only when both halves come from the SAME source. An id from the environment and a secret from
+    the file used to be joined, and a half-set environment then signed in with a pair nobody had put together."""
     env = os.environ if env is None else env
     cid = (env.get("VERDA_CLIENT_ID") or "").strip()
     secret = (env.get("VERDA_CLIENT_SECRET") or "").strip()
+    if cid and secret:
+        return cid, secret
+    cid = (keychain("VERDA_CLIENT_ID") or "").strip()
+    secret = (keychain("VERDA_CLIENT_SECRET") or "").strip() if cid else ""
     if cid and secret:
         return cid, secret
     path = pathlib.Path(path) if path else CREDENTIALS_PATH
@@ -105,12 +113,11 @@ def load_credentials(env=None, path=None):
                 found["id"] = _unquote(m.group(2))
             elif key in ("client_secret", "verda_client_secret"):
                 found["secret"] = _unquote(m.group(2))
-        cid = cid or found.get("id", "")
-        secret = secret or found.get("secret", "")
-    if cid and secret:
-        return cid, secret
-    raise PodctlError("no Verda credentials: export VERDA_CLIENT_ID and VERDA_CLIENT_SECRET, or write both as "
-                      "`client_id = ...` and `client_secret = ...` lines in %s (hosts/verda/README.md)" % path)
+        if found.get("id") and found.get("secret"):
+            return found["id"], found["secret"]
+    raise PodctlError("no Verda credentials: export VERDA_CLIENT_ID and VERDA_CLIENT_SECRET, or (on a Mac) keep both in the "
+                      "login Keychain as items whose accounts are those two names, or write both as `client_id = ...` and "
+                      "`client_secret = ...` lines in %s (hosts/verda/README.md)" % path)
 
 
 # ---------------------------------------------------------------- the REST client

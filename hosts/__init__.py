@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import os
 import pathlib
+import shutil
+import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -30,6 +33,33 @@ sys.modules.setdefault("comfyui_hosts", sys.modules.get(__name__))
 
 class PodctlError(Exception):
     """A user-facing failure: the message is the whole diagnosis, exit code 1."""
+
+
+KEYCHAIN_TIMEOUT = 10        # seconds; a locked keychain's dialog left unanswered is a None, never a hung podctl
+
+
+def keychain(var):
+    """3.19.0: the value of the macOS login Keychain item whose ACCOUNT is the environment variable `var` (RUNPOD_API_KEY,
+    VERDA_CLIENT_ID, ...), or None. `security find-generic-password -a <var> -w`, no service filter, so the item's service
+    name (its label) is the operator's own choice. Only on a Mac with `security` on PATH, and never when BASE_KEYCHAIN=0
+    (the suite sets that for every test; the tests of this lookup put a stub `security` first on PATH instead).
+    The switch and PATH are read from the PROCESS environment, never from an `env` a caller hands a loader: a test's
+    env={} must not turn the lookup on. The value is returned, never printed or logged; stderr (the "could not be
+    found" line) is swallowed; any non-zero exit, a timeout or a missing binary is None."""
+    if sys.platform != "darwin" or os.environ.get("BASE_KEYCHAIN") == "0":
+        return None
+    exe = shutil.which("security")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "find-generic-password", "-a", var, "-w"], capture_output=True, text=True,
+                           timeout=KEYCHAIN_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    value = r.stdout[:-1] if r.stdout.endswith("\n") else r.stdout
+    return value or None
 
 
 @dataclasses.dataclass

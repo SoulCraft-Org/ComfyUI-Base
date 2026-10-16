@@ -10,8 +10,9 @@
 The provider is --provider (before or after the command), else $PODCTL_PROVIDER, else the one brand.toml host of the
 repository this base sits in, else runpod. It answers where the machine is and how it starts, stops, clones and hands
 its boot to the base; the driver does ssh, scp, upload, install, the lease, the tunnel and the GPU gate the same way
-on every host. Credentials (RunPod's key, Verda's client secret) are read by the provider from the environment or its
-tool's config file and are never printed, logged or placed in an argument.
+on every host. Credentials (RunPod's key, Verda's and Crusoe's pairs) are read by the provider from the environment, else
+(3.19.0, on a Mac) the login Keychain item whose account is the variable's name, else its tool's config file, and are
+never printed, logged or placed in an argument.
 """
 from __future__ import annotations
 
@@ -61,6 +62,7 @@ _gpu_fit = _load_by_path("comfyui_gpu_fit", BASE_DIR / "py" / "gpu_fit.py")     
 _appproxy = _load_by_path("comfyui_app_proxy", BASE_DIR / "py" / "app_proxy.py")   # 3.9.0: the one APP_PORTS row rule
 PodctlError = _hosts.PodctlError
 Provider = _hosts.Provider
+keychain = _hosts.keychain                                                       # 3.19.0: the providers' Mac lookup
 
 # The RunPod half lives in hosts/runpod/provider.py since 2.2.0; its functions stay reachable here for the suite and for
 # any caller that grew up with them.
@@ -72,7 +74,8 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "create_body", "create",
            "save_port_names", "names_template", "template_state", "http_ports", "jupyter_token", "proxy_url",   # 3.9.0
            "link_token", "named_volumes", "DEFAULT_VOLUME_NAME",                                               # 3.14.0
-           "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB"):                                           # 3.18.0
+           "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB",                                            # 3.18.0
+           "REF_VARS", "env_ref", "env_refs", "refs_line", "DEFAULT_API_V2_URL"):                  # 3.19.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
