@@ -2274,8 +2274,8 @@ def build_parser():
     p = sub.add_parser("create", help="a machine from nothing, after a stock check that names where the GPU is free: a data volume (or --volume), "
                                       "then the machine on it (Verda: NVMe disk + instance; RunPod: network volume + Secure Cloud pod); ensure configures it")
     p.add_argument("--name", required=True); p.add_argument("--gpu", help="Verda: an instance type (required); RunPod: a GPU type id (default: "
-                                                                      "'NVIDIA B200', 'NVIDIA B300 SXM6 AC', 'NVIDIA RTX PRO 6000 Blackwell Server "
-                                                                      "Edition', 'NVIDIA H200', the first with stock)")
+                                                                      "'NVIDIA B200', 'NVIDIA B300 SXM6 AC', 'NVIDIA H200', 'NVIDIA H100 80GB HBM3', "
+                                                                      "'NVIDIA RTX PRO 6000 Blackwell Server Edition', the first with stock)")
     p.add_argument("--location", help="Verda: a location; RunPod: a data centre id (default: the first with the GPU free now)")
     p.add_argument("--data-gb", dest="data_gb", type=int, help="the size of a NEW data volume (RunPod: a network volume in that data centre)")
     p.add_argument("--volume", help="RunPod: an EXISTING network volume id to put the pod on (its data centre is the pod's)")

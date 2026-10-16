@@ -1865,12 +1865,13 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
 
 
 def test_unit_runpod_create_order_goes_past_b300_and_says_what_each_gpu_means():
-    """3.16.0 (Paul, 2026-10-16: rendering speed first): B200, B300, then the next tier, RunPod's exact ids (never a
-    MIG slice, never the Workstation or Max-Q PRO 6000), and a note for each GPU past the B200 that a package must act on."""
+    """3.16.0 (Paul, 2026-10-16: rendering speed first, his order): B200, B300, H200, H100, RTX PRO 6000, RunPod's exact
+    ids (the SXM H100 and H200, the PRO 6000 Server Edition, never a MIG slice), and a note for each GPU past the B200."""
     podctl = _load()
     order = podctl.RunPodProvider.default_gpus
-    assert order == ("NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA H200")
-    assert not any("MIG" in g or "Workstation" in g or "Max-Q" in g for g in order)
+    assert order == ("NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA H200", "NVIDIA H100 80GB HBM3",
+                     "NVIDIA RTX PRO 6000 Blackwell Server Edition")
+    assert not any(w in g for g in order for w in ("MIG", "Workstation", "Max-Q", "NVL", "PCIe"))
     notes = podctl.RunPodProvider.gpu_notes
     assert set(notes) == set(order[1:]) and "fp8" in notes["NVIDIA B300 SXM6 AC"] and "INT8" in notes["NVIDIA B300 SXM6 AC"]
     assert podctl.RunPodProvider.fresh_pod_gb == podctl.FRESH_POD_GB == 400

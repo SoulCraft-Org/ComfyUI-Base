@@ -292,9 +292,8 @@ create reads it live):
   RTX GPU, which these are not.
 
 **Past B200 and B300, and no volume needed (3.16.0, Paul, 2026-10-16: rendering speed first).** `podctl create` with no
-`--gpu` asks for `NVIDIA B200`, `NVIDIA B300 SXM6 AC`, then `NVIDIA RTX PRO 6000 Blackwell Server Edition` and
-`NVIDIA H200` (the third and fourth are provisional until a 2-step benchmark per GPU confirms them; `DEFAULT_GPUS`,
-`hosts/runpod/provider.py`). The GPU order comes first: for each GPU in turn, the network volume `--volume-name` where
+`--gpu` asks for `NVIDIA B200`, `NVIDIA B300 SXM6 AC`, then `NVIDIA H200`, `NVIDIA H100 80GB HBM3` and `NVIDIA RTX PRO 6000
+Blackwell Server Edition` (Paul's order; `DEFAULT_GPUS`, `hosts/runpod/provider.py`). The GPU order comes first: for each GPU in turn, the network volume `--volume-name` where
 that GPU is free, else a **fresh pod** in the first data centre that has it, on a pod volume of `--pod-gb` (default 400),
 where the install downloads the models again, six at a time and pinned (§5). So a B200 with no volume beside it beats a
 B300 that has one. `--location`, `--volume` and `--data-gb` keep their meaning; `--no-fresh` is 3.14.0's rule. When it
@@ -810,8 +809,8 @@ for any invocation that somehow arrives without the environment. The suite asser
 ## 10. Record
 
 - 3.16.0: the GPU order past B200 and B300, no volume needed, and the balance projected (Paul, 2026-10-16: rendering
-  speed first). `podctl create` with no `--gpu` asks for B200, B300, then the RTX PRO 6000 Server Edition and the H200
-  (provisional), and takes the first GPU with stock: on the reusable network volume where that GPU is free, else as a
+  speed first). `podctl create` with no `--gpu` asks for B200, B300, H200, H100, then the RTX PRO 6000 Server Edition
+  (Paul's order), and takes the first GPU with stock: on the reusable network volume where that GPU is free, else as a
   FRESH public pod on a pod volume (`--pod-gb`, default 400) in the first data centre that has it, models downloaded
   again (`--no-fresh` keeps 3.14.0's rule). It names what the chosen GPU means (B300: INT8 is slow, load fp8 weights;
   H200: nvfp4 is emulated). RunPod's provider gains `balance()` (GraphQL `myself { clientBalance currentSpendPerHr

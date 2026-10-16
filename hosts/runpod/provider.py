@@ -803,11 +803,12 @@ PRIVATE_PORTS = ["22/tcp"]                               # 3.7.4 --private: sshd
 CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
 # 3.8.0: with no --gpu, `create` asks for these in order (the video packages' GPU_PREFER, py/gpu_fit.py): B200 first,
 # then B300. "NVIDIA B300 SXM6 AC MIG 1g.34gb" is a 34 GB slice of a B300 and is never on this list.
-# 3.16.0 (Paul, 2026-10-16: rendering speed first): then the next tier, so a sold-out B200 and B300 still give a pod,
-# fastest first. The third and fourth are provisional until the 2-step benchmark per GPU confirms them: Paul asked for
-# the RTX PRO 6000 third; the first research put an H200 at about twice a PRO 6000. The ids are RunPod's (GraphQL
-# gpuTypes, 2026-10-16); the PRO 6000 is the Server Edition (the Workstation and Max-Q ones, and the MIG slices, are not).
-DEFAULT_GPUS = ("NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA H200")
+# 3.16.0 (Paul, 2026-10-16: rendering speed first, his order): then Hopper and the RTX PRO 6000, so a sold-out B200 and
+# B300 still give a pod, fastest first: H200 (141 GB), H100 SXM (80 GB), then the PRO 6000 (96 GB). The ids are
+# RunPod's (GraphQL gpuTypes, 2026-10-16): the SXM H100 (not the NVL or PCIe one), the SXM H200 (not the NVL one), the
+# PRO 6000 Server Edition (not the Workstation or Max-Q one), and never a MIG slice.
+DEFAULT_GPUS = ("NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA H200", "NVIDIA H100 80GB HBM3",
+                "NVIDIA RTX PRO 6000 Blackwell Server Edition")
 # 3.16.0: what `create` says when it picks one of these, before anything bills. Hardware facts, nothing about a package.
 # INT8: NVIDIA's HGX table lists HGX B300 at 3 POPS of INT8 tensor throughput (8 GPUs, sparse) against 72 for HGX B200,
 # with FP8 equal on both (nvidia.com/en-us/data-center/hgx, read 2026-10-16): about 0.19 POPS dense per B300.
@@ -817,6 +818,8 @@ GPU_NOTES = {
                            "int8-quantized weights run slow here: a package should load its fp8 (or bf16) weights on this GPU",
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": "sm_120, 96 GB: less memory than the B200's 180 GB",
     "NVIDIA H200": "sm_90 (Hopper): ComfyUI emulates nvfp4 weights here (native from sm_100), so they run slower",
+    "NVIDIA H100 80GB HBM3": "sm_90 (Hopper), 80 GB: ComfyUI emulates nvfp4 weights here, and the big models may not all "
+                             "stay loaded at once",
 }
 # 3.16.0: the pod volume of a fresh pod (no network volume where the GPU is): the models download again, in parallel and
 # pinned (lib/50-models.sh), so it only needs to hold one install. --pod-gb overrides it.

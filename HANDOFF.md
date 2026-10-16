@@ -144,10 +144,8 @@ is not (on 2026-10-16 the volume was in EU-RO-1, which then had only RTX PRO 600
 with no pod. And RunPod's balance trails its spend: a $5 stop rule let it reach -$1.24 and RunPod removed the pods.
 
 **What changed.**
-- `hosts/runpod/provider.py`: `DEFAULT_GPUS` is B200, B300, RTX PRO 6000 Blackwell Server Edition, H200 (RunPod's ids
-  from GraphQL `gpuTypes`). The third and fourth are PROVISIONAL: Paul asked for the PRO 6000 third, the first research
-  put an H200 at about twice a PRO 6000, and a 2-step benchmark per GPU (the Video Replacer's `_build/ab_speed.py`)
-  decides. `GPU_NOTES` says what a pick means before anything bills (B300: INT8 is about 1/24 of a B200's, NVIDIA's HGX
+- `hosts/runpod/provider.py`: `DEFAULT_GPUS` is B200, B300, H200, H100 80GB HBM3, RTX PRO 6000 Blackwell Server
+  Edition (Paul's order, 2026-10-16; RunPod's ids from GraphQL `gpuTypes`). `GPU_NOTES` says what a pick means before anything bills (B300: INT8 is about 1/24 of a B200's, NVIDIA's HGX
   table, so load fp8 weights; H200: nvfp4 is emulated). `create_body(pod_gb=)` / `create(pod_gb=)`: a PUBLIC pod on a
   pod volume. `balance()`: GraphQL `myself { clientBalance currentSpendPerHr spendLimit }`.
 - `podctl create`: per GPU in order, the reusable volume where it is free, else a fresh pod on a `--pod-gb` (default
@@ -168,4 +166,3 @@ against the fake RunPod, balance and guard; `test_ports.py`: reuse, now fresh by
   time with no volume (six at a time, pinned).
 - `podctl balance` against the live account while a pod runs: how far `clientBalance` actually trails, to set
   `--lag-min` from a measurement instead of 30.
-- The final third and fourth GPU, from the orchestrator after the benchmark: a one-line change to `DEFAULT_GPUS`.
