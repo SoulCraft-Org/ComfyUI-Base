@@ -36,5 +36,6 @@ token name stripped from its environment. The install only reads from the Hub: u
 token; a token whose role is `write` is accepted with a warning (3.12.0). JupyterLab starts only with a token or password of its own.
 
 **Exposure.** On every host except RunPod ComfyUI and JupyterLab listen on loopback only (reach them over an ssh
-tunnel). On RunPod they sit behind RunPod's proxy; a new pod is private unless `podctl create --public` (3.8.1).
-ComfyUI has no login of its own: anyone who can reach its port can queue any workflow.
+tunnel). On RunPod they sit behind RunPod's proxy; a new pod is public with named links (3.14.0), and every link but JupyterLab's (which has its own token) is locked by the pod's own key: `?token=` once, then an HttpOnly, Secure, SameSite=Lax cookie; `podctl create --private` is the opt-in for ssh only.
+ComfyUI has no login of its own: anyone who can reach its port can queue any workflow, which is why on a public
+bind it listens on 127.0.0.1 only and `py/app_proxy.py` holds its port, behind that key.

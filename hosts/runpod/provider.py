@@ -544,6 +544,8 @@ def deploy_body(src, name=None, gpu=None):
             body[k] = list(src[k])
     if body["env"].get("JUPYTER_TOKEN"):            # 3.9.0: a token is per pod; the clone gets its own
         body["env"]["JUPYTER_TOKEN"] = jupyter_token()
+    if body["env"].get("BASE_LINK_TOKEN"):          # 3.14.0: and so is the key to its links
+        body["env"]["BASE_LINK_TOKEN"] = link_token()
     return body
 
 
@@ -736,6 +738,25 @@ def jupyter_token():
     return secrets.token_hex(24)
 
 
+def link_token():
+    """3.14.0: a fresh key for one pod's links (ComfyUI and every app; py/app_proxy.py checks it): 48 hex characters from
+    the OS's CSPRNG. It rides the link podctl prints once (?token=), then lives in the browser as a cookie."""
+    import secrets
+    return secrets.token_hex(24)
+
+
+DEFAULT_VOLUME_NAME = "comfy-base-data"   # 3.14.0: the network volume a public create reuses in a data centre, so models download once
+
+
+def named_volumes(api, name):
+    """3.14.0: {data centre: volume} for every network volume called `name`, the first in RunPod's order per data centre."""
+    out = {}
+    for v in api.get("/networkvolumes") or []:
+        if isinstance(v, dict) and v.get("name") == name and v.get("dataCenterId"):
+            out.setdefault(v["dataCenterId"], v)
+    return out
+
+
 def proxy_url(pod, port):
     """RunPod's proxy URL for a port the pod exposes as http, else None (a --private pod exposes none)."""
     if "%d/http" % int(port) not in (pod.get("ports") or []):
@@ -844,7 +865,7 @@ def encryption_words(pod, gb=None):
 
 
 def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None, names=None,
-                template_id=None, token=None):
+                template_id=None, token=None, link=None):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
     data centre, the ports, PUBLIC_KEY, the CUDA floor. No start command: `ensure` installs the base's boot guard from the
     image's own entry, as for every other pod; and no templateId but the port-names one (3.9.0), which carries nothing else.
@@ -855,7 +876,9 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
     RunPod's storage docs name one way: the console's "Encrypt volume" box.
     3.9.0 names: [(port, name)], every one an http port (default the base's two); template_id: the template that names
     them in the console; token: the pod's own JUPYTER_TOKEN (JupyterLab is never tokenless). A private pod takes none of
-    the three: no http port, so nothing to name, and the boot makes its token on the pod volume."""
+    the three: no http port, so nothing to name, and the boot makes its token on the pod volume.
+    3.14.0 link: the pod's own BASE_LINK_TOKEN, the key every proxied link but the terminal's needs (a private pod has none
+    to lock: its ports are on loopback)."""
     body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
             "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
@@ -863,6 +886,8 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
         body["ports"] = http_ports(names) if names else list(CREATE_PORTS)
         if token:
             body["env"]["JUPYTER_TOKEN"] = token
+        if link:
+            body["env"]["BASE_LINK_TOKEN"] = link
         if template_id:
             body["templateId"] = template_id
     if private_gb:
@@ -875,8 +900,10 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
 
 
 def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_gb=100, pubkey=None, min_cuda=None, spot=False,
-           wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print, private=False, names=None, name_ports=True):
-    """A pod from nothing: a network volume of `data_gb` in `dc` (or the existing `volume`), then the pod on it. A refused
+           wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print, private=False, names=None, name_ports=True,
+           volume_name=None):
+    """A pod from nothing: a network volume of `data_gb` in `dc` named `volume_name` (default <name>-data; podctl create
+    passes comfy-base-data, the one a later create reuses), or the existing `volume`, then the pod on it. A refused
     pod (sold out between the stock check and the create) takes a volume THIS call made with it, so nothing is left
     billing; an existing volume is never deleted. With wait: until sshd answers, then `Host runpod` -> the new pod.
     Returns the pod id. Prints names and counts, never the key."""
@@ -896,8 +923,9 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     else:
         if not data_gb:
             raise PodctlError("--data-gb N (a new network volume) or --volume <id> (an existing one)")
-        made = vid = api.post("/networkvolumes", {"name": "%s-data" % name, "size": int(data_gb), "dataCenterId": dc})["id"]
-        say("created network volume %s (%s-data): %d GB in %s" % (vid, name, int(data_gb), dc))
+        vname = volume_name or "%s-data" % name
+        made = vid = api.post("/networkvolumes", {"name": vname, "size": int(data_gb), "dataCenterId": dc})["id"]
+        say("created network volume %s (%s): %d GB in %s" % (vid, vname, int(data_gb), dc))
     names = list(names or _c().BASE_PORT_NAMES)
     tid = None
     if name_ports:
@@ -906,7 +934,8 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
         except PodctlError as e:                # the names are the console's, never a reason to have no pod
             say("  !! the port names could not be written (%s): the Connect tab will say \"HTTP Service\"" % e)
     body = create_body(name, gpu, dc, vid, image, container_gb, pubkey, cuda=cuda, spot=spot, names=names, template_id=tid,
-                       token=jupyter_token())     # printed once, as the Jupyter Terminal link; RunPod keeps it in the pod's env
+                       token=jupyter_token(),     # printed once, as the Jupyter Terminal link; RunPod keeps it in the pod's env
+                       link=link_token())         # 3.14.0: and the key, inside every other link printed below
     try:
         made_pod = api.post("/pods", body)
         pod_id = made_pod["id"]
@@ -928,7 +957,10 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
         say("  !! %s came back with ports %s, not %s" % (pod_id, " ".join(back), " ".join(body["ports"])))
     # 3.9.0 (simple first): the ready links, the terminal's with its token, so nothing has to be looked up. They answer
     # once the base is installed and has booted the pod (podctl ensure, then install); podctl status prints them again.
-    for line in _c().links_lines(names, lambda p: proxy_url({"id": pod_id, "ports": body["ports"]}, p), body["env"].get("JUPYTER_TOKEN")):
+    # 3.14.0: every other link carries the pod's key once; the first click sets it as a cookie, so the Connect tab's own
+    # links open straight away from then on, in that browser.
+    for line in _c().links_lines(names, lambda p: proxy_url({"id": pod_id, "ports": body["ports"]}, p), body["env"].get("JUPYTER_TOKEN"),
+                                 link=body["env"].get("BASE_LINK_TOKEN")):
         say("  " + line)
     if not wait:
         return pod_id
@@ -1096,6 +1128,10 @@ class RunPodProvider(Provider):
         rows = stock(self.api, gpu)
         return ", ".join("%s (%s)" % r for r in rows) if rows else "nowhere"
 
+    def named_volumes(self, name):
+        """3.14.0: {data centre: volume id} for the network volumes called `name` (the ones a public create reuses)."""
+        return {dc: v["id"] for dc, v in named_volumes(self.api, name).items()}
+
     def volume_location(self, volume_id):
         v = self.api.get("/networkvolumes/%s" % volume_id)
         if not isinstance(v, dict) or not v.get("dataCenterId"):
@@ -1103,12 +1139,13 @@ class RunPodProvider(Provider):
         return v["dataCenterId"]
 
     def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True,
-                       ssh_config=None, say=print, volume=None, min_cuda=None, private=False, names=None, name_ports=True):
+                       ssh_config=None, say=print, volume=None, min_cuda=None, private=False, names=None, name_ports=True,
+                       volume_name=None):
         if not pubkey:
             pubkey = _c().mac_public_key(None)
         return create(self.api, name, gpu, location, data_gb=data_gb, volume=volume, image=image, container_gb=os_gb, pubkey=pubkey,
                       min_cuda=min_cuda, spot=spot, wait=wait, ssh_config=ssh_config, say=say, private=private, names=names,
-                      name_ports=name_ports)
+                      name_ports=name_ports, volume_name=volume_name)
 
     def http_url(self, pod, port):
         """3.9.0: the URL a browser opens for one of the pod's ports, or None when the host does not proxy it."""
@@ -1117,3 +1154,7 @@ class RunPodProvider(Provider):
     def pod_token(self, pod):
         """3.9.0: the JupyterLab token the pod's own env carries (podctl create sets one per pod), else None."""
         return ((pod.get("env") or {}).get("JUPYTER_TOKEN") or "").strip() or None
+
+    def pod_link_token(self, pod):
+        """3.14.0: the key to the pod's links its own env carries (podctl create sets one per pod), else None."""
+        return ((pod.get("env") or {}).get("BASE_LINK_TOKEN") or "").strip() or None

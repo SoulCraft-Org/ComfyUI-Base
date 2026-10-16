@@ -3,6 +3,8 @@
 # beyond starting the server. boot.sh sources this file from <volume>/comfy-base/lib/. BASE_LISTEN (2.2.0) is the bind
 # address, resolved by base_env_setup or boot_host: 0.0.0.0 on RunPod, whose HTTP proxy needs it; 127.0.0.1 on every
 # other host, reached through the driver's tunnel. A caller that sources this file raw gets the pre-2.2.0 default, 0.0.0.0.
+# 3.14.0: on a public bind ComfyUI itself listens on 127.0.0.1 (_base_comfy_listen): py/app_proxy.py --front serves its port
+# on the machine's other addresses, behind the per-machine key, so a proxy URL never reaches an unlocked ComfyUI.
 # 3.0.3: which processes ARE ComfyUI (the matcher below) lives here too, so the boot can find and stop one it did not start,
 # and so the boot's own wait can tell a live server from a dead one (before 3.0.3 boot.sh had no matcher at all).
 
@@ -204,13 +206,16 @@ _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedenc
     else echo "$k=$v"; fi
   done
 }
+_base_comfy_listen(){ # 3.14.0: where ComfyUI binds: BASE_LISTEN when that is loopback; on any public bind 127.0.0.1, behind the key's front
+  case "${BASE_LISTEN:-0.0.0.0}" in 127.*|localhost|::1) echo "$BASE_LISTEN" ;; *) echo 127.0.0.1 ;; esac
+}
 _base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints what would actually run
   local extra pv hf ff le
   extra="$(_base_launch_args 2>/dev/null | tr '\n' ' ')"; extra="${extra% }"
   pv="$(_base_preview_flags)"; hf="$(_base_hf_home)"; ff="$(_base_ffmpeg_path)"
   le="$(_base_launch_env 2>/dev/null | tr '\n' ' ')"; le="${le% }"     # 3.10.0: the launch environment, after the base's own two
   # `env HF_HOME=…`, not a bare assignment: the line is printed after `nohup`, and nohup would execute the assignment (2.0.11)
-  printf '%s%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "${le:+env $le }" "$PY" "${BASE_LISTEN:-0.0.0.0}" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
+  printf '%s%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "${le:+env $le }" "$PY" "$(_base_comfy_listen)" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
 }
 _base_start_comfy(){
   local extra=() w pv=()
@@ -232,7 +237,8 @@ _base_start_comfy(){
      # 3.1.0: where the base keeps its state, so a package's own route reads state/progress.json without guessing
      # (boot.sh knows BASE_HOME from boot.env; an install knows BASE_STATE)
      _cbs="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; if [ -n "$_cbs" ]; then export COMFY_BASE_STATE="$_cbs"; fi
-     nohup "$PY" main.py --listen "${BASE_LISTEN:-0.0.0.0}" --port "$PORT" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} >> "$COMFY_LOG" 2>&1 & })
+     unset BASE_LINK_TOKEN                        # 3.14.0: the key is the forwarder's alone; no pack in ComfyUI reads it
+     nohup "$PY" main.py --listen "$(_base_comfy_listen)" --port "$PORT" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} >> "$COMFY_LOG" 2>&1 & })
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
   # (ComfyUI-SeedVR2_VideoUpscaler 67 s, and thirty more packs behind it), so a flat 180 s window
   # declared `restart FAILED`, skipped smoke and combos, and failed the whole install — while the

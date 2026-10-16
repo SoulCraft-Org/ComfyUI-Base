@@ -356,11 +356,13 @@ def test_unit_runpod_create_names_every_port_through_a_private_template(tmp_path
         assert re.fullmatch(r"[0-9a-f]{48}", tok) and body["env"]["PUBLIC_KEY"] == "ssh-ed25519 AAAAMAC mac@key"
         assert "rp_key_names" not in out
         # simple first: the ready links, named, the terminal's with its token (the one line that carries it)
+        key = body["env"]["BASE_LINK_TOKEN"]                                        # 3.14.0: the key to every other link
+        assert re.fullmatch(r"[0-9a-f]{48}", key) and key != tok
         links = [l.strip() for l in out.splitlines() if l.strip().startswith("links ")]
         assert [re.split(r"\s{2,}", l)[1:] for l in links] == [
-            ["ComfyUI", "https://newpod0000001-8188.proxy.runpod.net"],
+            ["ComfyUI", "https://newpod0000001-8188.proxy.runpod.net/?token=%s" % key],
             ["Jupyter Terminal", "https://newpod0000001-8888.proxy.runpod.net/lab?token=%s" % tok],
-            ["Video Thing App", "https://newpod0000001-8189.proxy.runpod.net"]], out
+            ["Video Thing App", "https://newpod0000001-8189.proxy.runpod.net/?token=%s" % key]], out
         assert [l for l in out.splitlines() if tok in l] == [l for l in out.splitlines() if "Jupyter Terminal" in l and "token=" in l]
         tmpl = [b for p, b in srv.bodies if p == "/templates"][0]
         assert tmpl["isPublic"] is False and tmpl["env"] == {} and tmpl["dockerStartCmd"] == [] and tmpl["volumeInGb"] == 0
@@ -376,16 +378,22 @@ def test_unit_runpod_create_names_every_port_through_a_private_template(tmp_path
         assert [p for p, _ in srv.bodies].count("/templates") == 1 and len(store.saved) == n_saved
         body2 = [b for p, b in srv.bodies if p == "/pods"][-1]
         assert body2["templateId"] == "tpl001" and body2["env"]["JUPYTER_TOKEN"] != tok          # a token per pod
+        assert body2["env"]["BASE_LINK_TOKEN"] != key                                            # and a key per pod
         # --no-names: the same ports, no template
         assert podctl.cmd_create(prov, podctl.build_parser().parse_args(argv + ["--no-names"])) in (None, 0)
         body3 = [b for p, b in srv.bodies if p == "/pods"][-1]
         assert "templateId" not in body3 and body3["ports"] == body["ports"]
-        # the default (3.8.1), private: 22/tcp only, no template, no token in RunPod's env
+        # 3.14.0: no flag is public (the same pod as --public); --private is the opt-in: 22/tcp only, no template, no token
+        # and no key in RunPod's env
+        plain = [a for a in argv if a != "--public"]
+        assert podctl.cmd_create(prov, podctl.build_parser().parse_args(plain)) in (None, 0)
+        body5 = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert body5["ports"] == body["ports"] and body5["templateId"] == "tpl001" and "BASE_LINK_TOKEN" in body5["env"]
         capsys.readouterr()
-        priv = [a for a in argv if a != "--public"]
-        assert podctl.cmd_create(prov, podctl.build_parser().parse_args(priv)) in (None, 0)
+        assert podctl.cmd_create(prov, podctl.build_parser().parse_args(plain + ["--private"])) in (None, 0)
         body4 = [b for p, b in srv.bodies if p == "/pods"][-1]
         assert body4["ports"] == ["22/tcp"] and "templateId" not in body4 and "JUPYTER_TOKEN" not in body4["env"]
+        assert "BASE_LINK_TOKEN" not in body4["env"]
         assert "podctl tunnel newpod0000001 prints the links" in capsys.readouterr().out
     finally:
         srv.close()
@@ -504,3 +512,230 @@ def test_unit_private_create_hands_the_token_over_ssh_and_prints_the_tunnels_nam
     assert podctl._runpod.seed_jupyter_token(say=lambda *a: None) == "keptone"
     monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None, input=None: subprocess.CompletedProcess(cmd, 255, "", "x"))
     assert podctl._runpod.seed_jupyter_token(say=lambda *a: None) is None
+
+
+# ---------------------------------------------------------------- 3.14.0: the key on every public link
+
+KEY = "k3y" + "0" * 45
+
+
+def test_unit_app_proxy_key_rules_pure():
+    """The key in the query is taken out byte for byte, compared in constant time, traded for a cookie on GET/HEAD;
+    a cookie opens without touching the target; loopback peers pass; no secret means every outside request is denied."""
+    m = _proxy_mod()
+    assert m.split_token("/x?a=1&token=%s&b=%%20" % KEY) == (KEY, "/x?a=1&b=%20")
+    assert m.split_token("/x?token=%s" % KEY) == (KEY, "/x") and m.split_token("/x?tokens=1") == (None, "/x?tokens=1")
+    assert m.split_token("/x") == (None, "/x") and m.split_token("/?token=a%2Bb&token=z") == ("a+b", "/")
+    out = "1.2.3.4"
+    assert m.authorize(KEY, "GET", "/?token=%s" % KEY, [], out) == ("set", "/")
+    assert m.authorize(KEY, "HEAD", "/v?x=1&token=%s" % KEY, [], out) == ("set", "/v?x=1")
+    assert m.authorize(KEY, "POST", "/prompt?token=%s" % KEY, [], out) == ("open", "/prompt")
+    assert m.authorize(KEY, "GET", "/?token=nope", [], out) == ("deny", None)
+    assert m.authorize(KEY, "GET", "/", [], out) == ("deny", None)
+    assert m.authorize(KEY, "GET", "/", ["Cookie: a=1; base_link=wrong"], out) == ("deny", None)
+    ck = ["Cookie: a=1; base_link=%s" % KEY]
+    assert m.authorize(KEY, "GET", "/app?token=theirs", ck, out) == ("open", "/app?token=theirs")   # an app's own ?token= passes
+    assert m.authorize(KEY, "GET", "/", ck, "::ffff:10.0.0.2") == ("open", "/")
+    for peer in ("127.0.0.1", "127.8.9.1", "::1", "::ffff:127.0.0.1"):
+        assert m.authorize(KEY, "GET", "/", [], peer) == ("open", "/") and m.loopback(peer)
+    assert m.authorize(None, "GET", "/?token=x", [], out) == ("deny", None)
+    assert m.authorize(None, "GET", "/", [], "127.0.0.1") == ("open", "/")
+    assert m.same(KEY, KEY) and not m.same(KEY, KEY[:-1]) and not m.same(KEY, "é" * 48)
+    assert m.public("0.0.0.0") and m.public("::") and m.public("10.1.2.3") and not m.public("127.0.0.1") and not m.public("localhost")
+    head, _ = m.rewrite_head(b"GET / HTTP/1.1\r\nHost: x\r\nCookie: a=1; base_link=%s; b=2\r\nCookie: base_link=%s\r\n\r\n" % (KEY.encode(), KEY.encode()), lambda l: l)
+    assert KEY.encode() not in head and b"Cookie: a=1; b=2\r\n" in head and head.count(b"Cookie") == 1, head
+    assert all(not m.loopback(a) for a in m.front_addrs())
+
+
+def _start_gated(tmp_path, args, key=KEY):
+    """The forwarder as a pod runs it, but with every peer counted as outside (the suite can only connect from loopback)."""
+    w = tmp_path / "outside.py"
+    w.write_text("import importlib.util, sys\nspec = importlib.util.spec_from_file_location('ap', %r)\nm = importlib.util.module_from_spec(spec)\n"
+                 "spec.loader.exec_module(m)\nm.loopback = lambda peer: False\nsys.exit(m.main(sys.argv[1:]))\n" % str(PROXY))
+    env = {k: v for k, v in os.environ.items() if k != "BASE_LINK_TOKEN"}
+    if key:
+        env["BASE_LINK_TOKEN"] = key
+    p = subprocess.Popen([sys.executable, str(w), *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    return p
+
+
+def _wait_listen(port, p=None):
+    for _ in range(100):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.2).close(); return
+        except OSError:
+            time.sleep(0.05)
+    if p is None:
+        raise AssertionError("nothing listened on %d" % port)
+    p.kill(); raise AssertionError("never listened: %s" % p.communicate(timeout=10)[0])
+
+
+def test_unit_app_proxy_key_locks_the_app_and_comfyuis_front_and_trades_the_link_for_a_cookie(tmp_path):
+    up = Upstream(); app, front = _free_port(), _free_port()
+    p = _start_gated(tmp_path, ["--map", "%d=vr" % app, "--upstream", "127.0.0.1:%d" % up.port, "--listen", "127.0.0.1",
+                                "--front", str(front), "--front-listen", "127.0.0.1"])
+    try:
+        _wait_listen(app, p); _wait_listen(front, p)
+        for port in (app, front):
+            r = _raw(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            assert r.startswith(b"HTTP/1.1 401") and b"This link needs its key" in r and b"no-store" in r, r
+            assert _raw(port, b"GET /?token=wrong HTTP/1.1\r\nHost: x\r\n\r\n").startswith(b"HTTP/1.1 401")
+        assert up.seen == []                                        # nothing reached ComfyUI unlocked
+        r = _raw(app, b"GET /index.html?a=1&token=%s&b=2 HTTP/1.1\r\nHost: pod-8189.proxy.runpod.net\r\n\r\n" % KEY.encode())
+        head = r.split(b"\r\n\r\n")[0].decode()
+        assert head.startswith("HTTP/1.1 303") and "\r\nLocation: /index.html?a=1&b=2\r\n" in head, head
+        cookie = re.search(r"(?m)^Set-Cookie: (.*)$", head).group(1).strip()
+        assert cookie == "base_link=%s; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax" % KEY and "Domain" not in head
+        assert "Referrer-Policy: no-referrer" in head and up.seen == []
+        # with the cookie: through, and the key never reaches ComfyUI (the cookie is taken out of the header it forwards)
+        ck = b"Cookie: theme=dark; base_link=%s\r\n" % KEY.encode()
+        assert _raw(app, b"GET /app.js HTTP/1.1\r\nHost: x\r\n" + ck + b"\r\n").endswith(b"saw /apps/vr/app.js 0")
+        assert "Cookie: theme=dark" in up.seen[-1][0] and KEY not in up.seen[-1][0]
+        assert _raw(front, b"GET /system_stats HTTP/1.1\r\nHost: x\r\n" + ck + b"\r\n").endswith(b"saw /system_stats 0")  # unchanged path
+        body = b"{}"
+        r = _raw(front, b"POST /prompt?token=%s HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}" % KEY.encode())
+        assert r.endswith(b"saw /prompt 2") and up.seen[-1][1] == body and KEY not in up.seen[-1][0]
+        s = socket.create_connection(("127.0.0.1", front), timeout=5)
+        s.sendall(b"GET /ws?clientId=a HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" + ck + b"\r\n")
+        got = b""
+        while b"\r\n\r\n" not in got:
+            got += s.recv(4096)
+        assert got.startswith(b"HTTP/1.1 101"); s.close()
+    finally:
+        p.terminate(); out = p.communicate(timeout=10)[0]; up.close()
+    assert KEY not in out and "every link needs the key" in out and ("ComfyUI on 127.0.0.1:%d" % front) in out, out
+
+
+def test_unit_app_proxy_with_no_key_refuses_every_outside_request(tmp_path):
+    up = Upstream(); app = _free_port()
+    p = _start_gated(tmp_path, ["--map", "%d=vr" % app, "--upstream", "127.0.0.1:%d" % up.port, "--listen", "127.0.0.1"], key=None)
+    try:
+        _wait_listen(app, p)
+        assert _raw(app, b"GET /?token= HTTP/1.1\r\nHost: x\r\n\r\n").startswith(b"HTTP/1.1 401")
+        assert _raw(app, b"GET / HTTP/1.1\r\nHost: x\r\nCookie: base_link=\r\n\r\n").startswith(b"HTTP/1.1 401") and up.seen == []
+    finally:
+        p.terminate(); out = p.communicate(timeout=10)[0]; up.close()
+    assert "no BASE_LINK_TOKEN: every request from outside this machine is refused" in out, out
+
+
+def test_unit_app_proxy_binds_a_busy_port_once_it_is_free():
+    """An install starts the forwarder BEFORE it restarts ComfyUI, so an older ComfyUI may still hold the front's port:
+    the forwarder says so once and takes the port the moment it is free."""
+    import asyncio
+    m = _proxy_mod(); said = []
+    blocker = socket.socket(); blocker.bind(("127.0.0.1", 0)); blocker.listen(1); port = blocker.getsockname()[1]
+
+    async def go():
+        servers = await m.serve([], "0.0.0.0", ("127.0.0.1", 1), say=said.append, secret=KEY, front=port,
+                                front_listen=["127.0.0.1"], retry=0.05)
+        assert servers == [] and "NOT served on 127.0.0.1:%d yet" % port in said[0], said
+        blocker.close()
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if servers:
+                break
+        assert len(servers) == 1 and any("ComfyUI on 127.0.0.1:%d" % port in x for x in said), said
+        for srv in servers:
+            srv.close(); await srv.wait_closed()
+    asyncio.run(go())
+    assert sum("NOT served" in x for x in said) == 1, said
+
+
+def test_unit_boot_makes_the_key_on_a_public_bind_and_starts_comfyuis_front(tmp_path):
+    """On a public bind boot_apps runs the forwarder even with no app (it is ComfyUI's only way in), makes the key when
+    neither the env nor state/tokens.env has one (saved 0600, never in the output, never in argv), and ComfyUI binds 127.0.0.1."""
+    home = _boot_home(tmp_path)
+    port = int(re.search(r"\d+", (home / "state" / "boot.env").read_text()).group())
+    env = {k: v for k, v in os.environ.items() if k != "BASE_LINK_TOKEN"}
+    env.update({"BOOT_HOME": str(home), "BASE_LISTEN": "0.0.0.0", "BASE_HOST": "vm", "BOOT_ROOT": str(tmp_path / "root"),
+                "BOOT_FRONT_LISTEN": "127.0.0.1"})
+    boot = BASE / "lib" / "boot.sh"
+    pids = lambda: subprocess.run(["pgrep", "-f", "app_proxy\\.py --state %s/state" % home], capture_output=True, text=True).stdout.split()
+    try:
+        r = subprocess.run(["bash", str(boot), "--apps"], capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == 0 and "the key's front" in r.stdout and "key generated" in r.stdout, r.stdout + r.stderr
+        tf = home / "state" / "tokens.env"
+        key = tf.read_text().split("BASE_LINK_TOKEN=", 1)[1].strip()
+        assert re.fullmatch(r"[0-9a-f]{64}", key) and oct(tf.stat().st_mode & 0o777) == "0o600" and key not in r.stdout + r.stderr
+        _wait_listen(port)          # (no request: in the suite the front's address and ComfyUI's are both 127.0.0.1, so it would reach itself)
+        ps = subprocess.run(["ps", "-ax", "-o", "args"], capture_output=True, text=True).stdout
+        assert "--front %d" % port in ps and key not in ps
+        # a second boot reuses the saved key; the env's own wins over it
+        r = subprocess.run(["bash", str(boot), "--apps"], capture_output=True, text=True, env=env, timeout=60)
+        assert "key generated" not in r.stdout and tf.read_text().count("BASE_LINK_TOKEN=") == 1
+        # a loopback bind: no front, no key made
+        home2 = _boot_home(tmp_path / "two")
+        r = subprocess.run(["bash", str(boot), "--apps"], capture_output=True, text=True, timeout=60,
+                           env={**env, "BOOT_HOME": str(home2), "BASE_LISTEN": "127.0.0.1"})
+        assert "app ports: none declared" in r.stdout and "front" not in r.stdout and not (home2 / "state" / "tokens.env").exists()
+    finally:
+        subprocess.run(["pkill", "-f", "app_proxy\\.py --state %s/state" % home])
+    sh = 'source "%s/lib/boot.sh"; BOOT_HOME=%s; ' % (BASE, _sh(home))
+    got = subprocess.run(["bash", "-c", sh + "BASE_LISTEN=0.0.0.0 BASE_LINK_TOKEN=fromenv; boot_link_token; echo $BASE_LINK_TOKEN $BOOT_LINK_MADE"],
+                         capture_output=True, text=True, env={**env, "BOOT_ROOT": ""}).stdout.split()
+    assert got == ["fromenv", "0"], got
+    pid1 = tmp_path / "environ"; pid1.write_bytes(b"A=1\0BASE_LINK_TOKEN=frompid1\0")
+    got = subprocess.run(["bash", "-c", sh + "unset BASE_LINK_TOKEN; BASE_LISTEN=0.0.0.0; boot_link_token; echo $BASE_LINK_TOKEN"],
+                         capture_output=True, text=True, env={**env, "BOOT_PID1_ENVIRON": str(pid1)}).stdout.split()
+    assert got == ["frompid1"], got
+    launch = 'source "%s/lib/85-launch.sh"; ' % BASE
+    for listen, want in (("0.0.0.0", "127.0.0.1"), ("", "127.0.0.1"), ("10.0.0.5", "127.0.0.1"), ("127.0.0.1", "127.0.0.1"), ("::1", "::1")):
+        out = subprocess.run(["bash", "-c", launch + "BASE_LISTEN=%s; _base_comfy_listen" % _sh(listen)], capture_output=True, text=True).stdout.strip()
+        assert out == want, (listen, out)
+
+
+def test_unit_create_reuses_the_named_network_volume_where_the_gpu_is_free(tmp_path, capsys):
+    """Models download once: a public create with no --volume goes onto comfy-base-data in a data centre that has it and
+    has the GPU free; only where none is does --data-gb make one, under that name; with neither it stops, naming both ways."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    vols = {"vmine": {"id": "vmine", "name": "comfy-base-data", "dataCenterId": "US-CA-2", "size": 500},
+            "vother": {"id": "vother", "name": "someone-elses-data", "dataCenterId": "EU-RO-1", "size": 300}}
+    srv = FakeRunPod(_pod(), volumes=dict(vols), gql=B200_STOCK)
+    prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    run = lambda *a: podctl.cmd_create(prov, podctl.build_parser().parse_args(
+        ["--pubkey", str(pub), "create", "--name", "r1", "--gpu", "NVIDIA B200", "--image", "x/c:cu130", "--no-wait", "--no-names", *a]))
+    try:
+        assert run() in (None, 0)
+        body = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert body["networkVolumeId"] == "vmine" and body["dataCenterIds"] == ["US-CA-2"] and "/networkvolumes" not in srv.posts
+        assert "vmine (comfy-base-data) in US-CA-2: reused" in capsys.readouterr().out
+        # the named volume only where the GPU is sold out, and no --data-gb: STOP, nothing billed
+        srv.volumes["vmine"]["dataCenterId"] = "US-NE-1"; srv.posts.clear()
+        assert run() == 1
+        out = capsys.readouterr().out
+        assert "STOP: comfy-base-data is only in US-NE-1, which has no NVIDIA B200 free" in out and "--data-gb N for a new comfy-base-data" in out and [p for p in srv.posts if p != "/graphql"] == [], out
+        # ... with --data-gb: a new one where the GPU is, under the name the next create reuses
+        assert run("--data-gb", "200") in (None, 0)
+        made = [b for p, b in srv.bodies if p == "/networkvolumes"][-1]
+        assert made["name"] == "comfy-base-data" and made["dataCenterId"] == "EU-RO-1"
+        # --volume-name picks another; --private never reuses a network volume
+        srv.posts.clear()
+        assert run("--volume-name", "someone-elses-data") in (None, 0)
+        assert [b for p, b in srv.bodies if p == "/pods"][-1]["networkVolumeId"] == "vother" and "/networkvolumes" not in srv.posts
+        assert run("--private", "--data-gb", "50") in (None, 0)
+        assert "networkVolumeId" not in [b for p, b in srv.bodies if p == "/pods"][-1]
+        with pytest.raises(podctl.PodctlError):
+            run("--public", "--private", "--data-gb", "50")
+    finally:
+        srv.close()
+
+
+def test_unit_status_and_deploy_carry_the_pods_key():
+    podctl = _load()
+    prov = podctl.RunPodProvider(api=object())
+    pod = _pod(id="p7", ports=["8188/http", "8888/http", "8189/http", "22/tcp"], env={"JUPYTER_TOKEN": "jt", "BASE_LINK_TOKEN": "envkey"})
+    lines = podctl.status_links(prov, pod, [(8189, "v", "V App", "v")], machine=("jm", []), link="machinekey")
+    assert [l.split()[-1] for l in lines] == ["https://p7-8188.proxy.runpod.net/?token=envkey", "https://p7-8888.proxy.runpod.net/lab?token=jt",
+                                             "https://p7-8189.proxy.runpod.net/?token=envkey"], lines
+    pod2 = _pod(id="p8", ports=["8188/http"], env={})
+    assert podctl.status_links(prov, pod2, [], link="machinekey")[0].endswith("/?token=machinekey")
+    assert podctl.status_links(prov, pod2, [])[0].endswith("p8-8188.proxy.runpod.net")
+    text = "jtok\n--link--\nlkey\n--apps--\n8189|v|V App\n"
+    assert podctl.parse_tunnel_facts(text) == ("jtok", [(8189, "v", "V App")]) and podctl.parse_link_fact(text) == "lkey"
+    assert podctl.parse_link_fact("jtok\n--apps--\n") is None and "BASE_LINK_TOKEN" in podctl.tunnel_facts_cmd()
+    assert "BASE_LINK_TOKEN" in podctl.pod_facts(pod) and "envkey" not in podctl.pod_facts(pod)
+    src = _pod(env={"BASE_LINK_TOKEN": "old", "JUPYTER_TOKEN": "j"}, networkVolume={"id": "v", "dataCenterId": "EU-RO-1"},
+               machine={"gpuTypeId": "NVIDIA B200", "secureCloud": True})
+    b = podctl.deploy_body(src)
+    assert re.fullmatch(r"[0-9a-f]{48}", b["env"]["BASE_LINK_TOKEN"])

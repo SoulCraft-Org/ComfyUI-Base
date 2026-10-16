@@ -70,7 +70,8 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "BOOT_GUARD", "image_config", "wrap_entry", "sshd_bootstrap_text", "wait_for", "ensure", "stop", "start", "restart", "deploy_body",
            "deploy", "volume_size_gb", "record_volume", "POD_READ", "pod_volume", "volume_line", "stock", "cuda_floor", "create_floor", "DEFAULT_GPUS", "DEFAULT_MIN_CUDA", "allowed_cuda",
            "create_body", "create",
-           "save_port_names", "names_template", "template_state", "http_ports", "jupyter_token", "proxy_url"):   # 3.9.0
+           "save_port_names", "names_template", "template_state", "http_ports", "jupyter_token", "proxy_url",   # 3.9.0
+           "link_token", "named_volumes", "DEFAULT_VOLUME_NAME"):                                              # 3.14.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -459,8 +460,9 @@ def apps_from_listing(text):
     return out
 
 
-def links_lines(names, url_for, token=None, prefix="links"):
-    """One line per named port: `<prefix>  <name padded>  <url>`, the terminal's with its token when there is one."""
+def links_lines(names, url_for, token=None, prefix="links", link=None):
+    """One line per named port: `<prefix>  <name padded>  <url>`, the terminal's with its token when there is one, and
+    (3.14.0) every other one with the pod's key, `/?token=<link>`: the first click trades it for a cookie."""
     w = max([len(n) for _, n in names] + [0])
     lines = []
     for port, name in names:
@@ -469,6 +471,8 @@ def links_lines(names, url_for, token=None, prefix="links"):
             continue
         if port == 8888:
             url = url.rstrip("/") + ("/lab?token=%s" % token if token else "/lab   (token: podctl jupyter <pod>)")
+        elif link:
+            url = url.rstrip("/") + "/?token=%s" % link
         lines.append("%-8s %-*s  %s" % (prefix, w, name, url))
     return lines
 
@@ -1486,16 +1490,28 @@ def tunnel_key(pubkey_arg, env=None):
 
 def tunnel_facts_cmd():
     """What the tunnel reads from the machine before it forwards (3.9.0): the JupyterLab token alone (never the rest of
-    tokens.env) and the app ports the machine serves, one `port|slug|name` per line."""
-    return ("sed -n 's/^JUPYTER_TOKEN=//p' %s/state/tokens.env 2>/dev/null | tail -1; echo '--apps--'; "
-            "cat %s/state/apps.d/*.list 2>/dev/null; true" % (REMOTE_HOME, REMOTE_HOME))
+    tokens.env) and the app ports the machine serves, one `port|slug|name` per line. 3.14.0: and the key to its links
+    (status prints them; a tunnel needs none, since a connection from the machine itself is already inside)."""
+    return ("sed -n 's/^JUPYTER_TOKEN=//p' %s/state/tokens.env 2>/dev/null | tail -1; echo '--link--'; "
+            "sed -n 's/^BASE_LINK_TOKEN=//p' %s/state/tokens.env 2>/dev/null | tail -1; echo '--apps--'; "
+            "cat %s/state/apps.d/*.list 2>/dev/null; true" % (REMOTE_HOME, REMOTE_HOME, REMOTE_HOME))
+
+
+def _last_line(text):
+    t = (text or "").strip()
+    return (t.splitlines()[-1].strip() if t else "") or None
 
 
 def parse_tunnel_facts(text):
     """tunnel_facts_cmd's answer -> (token or None, [(port, slug, name)])."""
     head, _, apps = (text or "").partition("--apps--")
-    tok = head.strip().splitlines()[-1].strip() if head.strip() else ""
-    return (tok or None), apps_from_listing(apps)
+    return _last_line(head.partition("--link--")[0]), apps_from_listing(apps)
+
+
+def parse_link_fact(text):
+    """3.14.0: tunnel_facts_cmd's answer -> the machine's saved key to its links, or None."""
+    head = (text or "").partition("--apps--")[0]
+    return _last_line(head.partition("--link--")[2])
 
 
 def tunnel_plan(ports, given, machine_apps, declared, token, names=None):
@@ -1703,19 +1719,21 @@ def gpu_line_over_ssh():
     return "\n".join(lines)
 
 
-def status_links(prov, pod, declared, machine=None):
+def status_links(prov, pod, declared, machine=None, link=None):
     """3.9.0: the named links a status prints for a pod its host proxies: [lines]. machine is (token, apps) read over
-    ssh, or None. The pod's own JUPYTER_TOKEN wins over the machine's saved one."""
+    ssh, or None. The pod's own JUPYTER_TOKEN wins over the machine's saved one. 3.14.0 link: the machine's saved key;
+    the pod's own BASE_LINK_TOKEN wins over it, and every link but the terminal's carries it."""
     if not hasattr(prov, "http_url"):
         return []
     tok_m, apps_m = machine or (None, [])
     token = (prov.pod_token(pod) if hasattr(prov, "pod_token") else None) or tok_m
+    link = (prov.pod_link_token(pod) if hasattr(prov, "pod_link_token") else None) or link
     names = dict(port_names(declared))
     for a in apps_m:
         names[int(a[0])] = a[2]
     exposed = sorted(int(p.split("/")[0]) for p in (pod.get("ports") or []) if p.endswith("/http"))
     order = [p for p, _ in BASE_PORT_NAMES if p in exposed] + [p for p in exposed if p not in dict(BASE_PORT_NAMES)]
-    lines = links_lines([(p, names.get(p, "HTTP Service (port %d)" % p)) for p in order], lambda p: prov.http_url(pod, p), token)
+    lines = links_lines([(p, names.get(p, "HTTP Service (port %d)" % p)) for p in order], lambda p: prov.http_url(pod, p), token, link=link)
     if not lines:
         return ["links    none through the proxy (no http port): podctl tunnel %s prints the localhost links" % pod.get("id")]
     return lines
@@ -1724,18 +1742,18 @@ def status_links(prov, pod, declared, machine=None):
 def cmd_status(prov, args):
     pod = prov.pod(args.pod)
     print(prov.status_text(pod))
-    machine = None
+    machine = link = None
     try:
         r = ssh_run(tunnel_facts_cmd(), timeout=30)
         if r.returncode == 0:
-            machine = parse_tunnel_facts(r.stdout)
+            machine, link = parse_tunnel_facts(r.stdout), parse_link_fact(r.stdout)
     except Exception:                          # a dead pod still gets its facts; the links fall back to the env token
         machine = None
     try:
         declared = declared_apps()
     except PodctlError as e:
         print("links    (this tree's APP_PORTS are unreadable: %s)" % e); declared = []
-    for line in status_links(prov, pod, declared, machine):
+    for line in status_links(prov, pod, declared, machine, link=link):
         print(line)
     print(gpu_line_over_ssh())
 
@@ -1804,27 +1822,41 @@ def cmd_create(prov, args):
     the user named (or the existing volume's) that has none stops here, before anything is created or billed."""
     _offered(prov, "create_machine", "availability")
     loc, volume, spot = args.location, getattr(args, "volume", None), " (spot)" if args.spot else ""
-    # 3.8.1 (Paul, 2026-10-16: as simple, then as secure, then as private as possible): a new pod is PRIVATE unless --public
-    # says otherwise, on every host whose create offers it (RunPod); a host without a private mode keeps its own create, and
-    # only an explicit --private there is refused. --private is still accepted, and means what it always meant.
+    # 3.14.0 (Paul, 2026-10-16: delight first, then secure, then private): a new pod is PUBLIC, with its named links in the
+    # host's console and every one of them locked by the pod's own key (the link podctl prints carries it once). --private
+    # is the opt-in it was before 3.8.1 made it the default; --public is still accepted and is what happens anyway.
     import inspect
-    offers_private = "private" in inspect.signature(prov.create_machine).parameters
     public = bool(getattr(args, "public", False))
     if public and getattr(args, "private", False):
-        raise PodctlError("--public and --private contradict each other: a pod is private unless --public")
-    private = not public and (offers_private or bool(getattr(args, "private", False)))
+        raise PodctlError("--public and --private contradict each other: a pod is public unless --private")
+    private = bool(getattr(args, "private", False))
     if private and volume:
-        raise PodctlError("--volume is a network volume, and a private pod (the default since base 3.8.1) keeps its data on its "
-                          "own pod volume instead: drop --volume for a pod volume of --data-gb, or pass --public to put this pod "
-                          "on the network volume with proxy URLs")
+        raise PodctlError("--volume is a network volume, and a private pod keeps its data on its own pod volume instead: drop "
+                          "--volume for a pod volume of --data-gb, or drop --private to put this pod on the network volume")
+    # 3.14.0: models download once. With no --volume a public pod goes onto the network volume called --volume-name
+    # (comfy-base-data) in a data centre that has one and has the GPU free; only where none exists is a new one made there.
+    reuse = {}
+    vname = getattr(args, "volume_name", None) or DEFAULT_VOLUME_NAME
+    if not private and not volume and hasattr(prov, "named_volumes"):
+        try:
+            reuse = prov.named_volumes(vname)
+        except PodctlError as e:                         # the listing is a convenience; a pod is never refused for it
+            print("volume  the network volumes could not be listed (%s): none is reused" % e); reuse = {}
+        if reuse:
+            print("volume  %s exists in: %s (reused where the GPU is free, so the models are already there)" % (
+                vname, ", ".join("%s (%s)" % (dc, vid) for dc, vid in sorted(reuse.items()))))
     if volume:
         _offered(prov, "volume_location")                # 3.7.3: reuse an existing volume (RunPod); its data centre is fixed
         vloc = prov.volume_location(volume)
         if loc and loc != vloc:
             raise PodctlError("volume %s is in %s, not %s: a pod can only mount a volume in its own data centre" % (volume, vloc, loc))
         loc = vloc
-    elif not args.data_gb:
-        raise PodctlError("--data-gb N (a new volume) or --volume <id> (an existing one)")
+    elif not args.data_gb and not reuse:
+        raise PodctlError("--data-gb N (a new volume) or --volume <id> (an existing one)%s" % (
+            "" if private else "; no network volume called %s exists yet to reuse" % vname))
+    elif not args.data_gb and loc and loc not in reuse:
+        raise PodctlError("no network volume called %s in %s (it is in: %s): pass --data-gb N for a new one there, or drop "
+                          "--location" % (vname, loc, ", ".join(sorted(reuse))))
     # 3.8.0: --gpu names one type; without it the host's default order (RunPod: B200, then B300) is tried, and the first
     # with stock where the pod must go (the --location, the volume's data centre, else anywhere) is the one created
     defaulted = not args.gpu
@@ -1840,20 +1872,33 @@ def cmd_create(prov, args):
         for dc, why in getattr(prov, "skipped", None) or []:
             print("stock   %s%s also free in %s, left out: %s" % (gpu, spot, dc, why))
         seen.append((gpu, locs))
-        if locs and (not loc or loc in locs):
+        here = [l for l in locs if l in reuse and (not loc or l == loc)]
+        if here:                                         # 3.14.0: the reusable volume's data centre first
+            args.gpu, loc, volume = gpu, here[0], reuse[here[0]]
+            break
+        if locs and (not loc or loc in locs) and (args.data_gb or volume):
             args.gpu, loc = gpu, loc or locs[0]
             break
     else:
         if not any(locs for _, locs in seen):
             print("STOP: %s sold out in every location right now%s" % (" and ".join(g for g, _ in seen) + (" is" if len(seen) == 1 else " are"), spot)); return 1
+        free = "; ".join("%s is free in: %s" % (g, ", ".join(l)) for g, l in seen if l)
+        if reuse and not loc and not args.data_gb:       # 3.14.0: the named volume is only where the GPU is not
+            print("STOP: %s is only in %s, which has no %s free right now%s; %s (wait, or pass --data-gb N for a new %s "
+                  "where the GPU is: its models download again)" % (vname, ", ".join(sorted(reuse)), " or ".join(g for g, _ in seen), spot, free, vname))
+            return 1
         print("STOP: %s has no %s free right now%s; %s%s" % (
-            loc, " or ".join(g for g, _ in seen), spot, "; ".join("%s is free in: %s" % (g, ", ".join(l)) for g, l in seen if l),
+            loc, " or ".join(g for g, _ in seen), spot, free,
             " (the volume pins the data centre: wait, or create a new volume there)" if volume else ""))
         return 1
+    if volume and volume in reuse.values():
+        print("volume  %s (%s) in %s: reused" % (volume, vname, loc))
     if defaulted:
         print("gpu     %s, in %s (no --gpu: the host's order is %s)" % (args.gpu, loc, ", ".join(gpus)))
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
     extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private)) if v}
+    if not private and not volume and "volume_name" in inspect.signature(prov.create_machine).parameters:
+        extra["volume_name"] = vname                    # 3.14.0: the new volume gets the name the next create reuses
     takes = inspect.signature(prov.create_machine).parameters
     for k in extra:
         if k not in takes:
@@ -1977,14 +2022,17 @@ def build_parser():
     p.add_argument("--location", help="Verda: a location; RunPod: a data centre id (default: the first with the GPU free now)")
     p.add_argument("--data-gb", dest="data_gb", type=int, help="the size of a NEW data volume (RunPod: a network volume in that data centre)")
     p.add_argument("--volume", help="RunPod: an EXISTING network volume id to put the pod on (its data centre is the pod's)")
+    p.add_argument("--volume-name", dest="volume_name", help="RunPod: the network volume a public pod reuses, by name, in a data "
+                   "centre with the GPU free, so models download once; made there (of --data-gb) when none exists (default comfy-base-data)")
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
-    p.add_argument("--private", action="store_true", help="the default since 3.8.1 (RunPod): a pod volume of --data-gb, NOT "
-                   "encrypted (RunPod's API cannot ask for that; only the console's Encrypt volume box can), ports 22/tcp only "
-                   "(no proxy URL), ComfyUI, JupyterLab and the apps on loopback: podctl tunnel names them")
-    p.add_argument("--public", action="store_true", help="RunPod: NOT private: a network volume (new, or --volume), ComfyUI, "
-                   "the Jupyter Terminal and each app on RunPod's proxy URLs, named in the Connect tab")
+    p.add_argument("--private", action="store_true", help="RunPod, opt-in: a pod volume of --data-gb, NOT encrypted (RunPod's API "
+                   "cannot ask for that; only the console's Encrypt volume box can), ports 22/tcp only (no proxy URL), ComfyUI, "
+                   "JupyterLab and the apps on loopback: podctl tunnel names them")
+    p.add_argument("--public", action="store_true", help="the default since 3.14.0 (RunPod): the network volume (reused by "
+                   "--volume-name, or --volume), ComfyUI, the Jupyter Terminal and each app named in the Connect tab, every "
+                   "link locked by the pod's own key; the links printed carry it once")
     p.add_argument("--no-names", dest="no_names", action="store_true", help="RunPod: no port-names template (the Connect tab "
                    "then says \"HTTP Service\"); the ports are the same")
     p.add_argument("--spot", action="store_true"); p.add_argument("--no-wait", dest="no_wait", action="store_true")

@@ -79,7 +79,8 @@ def test_unit_launch_line_binds_the_hosts_listen_address(tmp_path):
     r = _bash(snippet, env={**env, "BASE_HOST": "verda"})
     assert "--listen 127.0.0.1 --port 8188" in r.stdout, r.stdout + r.stderr
     r = _bash(snippet, env={**env, "BASE_FAKE_PID1_ENV": _pid1(tmp_path, "RUNPOD_POD_ID=abc\n")})
-    assert "--listen 0.0.0.0 --port 8188" in r.stdout, r.stdout + r.stderr
+    # 3.14.0: RunPod's bind is public, so ComfyUI itself takes loopback and py/app_proxy.py --front holds 8188 behind the key
+    assert "--listen 127.0.0.1 --port 8188" in r.stdout and "0.0.0.0" not in r.stdout, r.stdout + r.stderr
 
 
 # ---------------------------------------------------------------- the boot unit and the extension seam

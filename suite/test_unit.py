@@ -939,7 +939,7 @@ def test_unit_launch_line_defers_preview_flags_to_the_args_file(tmp_path):
     c = _pod(tmp_path); (tmp_path / "runpod-slim").mkdir(); (tmp_path / "runpod-slim" / "comfyui_args.txt").write_text("--preview-method taesd\n")
     r = _bash('base_env_setup; base_discover quiet; _base_start_cmd', env={"BASE_FAKE_ROOT": str(tmp_path)})
     assert r.stdout.count("--preview-method") == 1 and "taesd" in r.stdout and "--preview-size" in r.stdout, r.stdout
-    assert "--listen 0.0.0.0" in r.stdout and "--enable-cors-header" in r.stdout
+    assert "--listen 127.0.0.1" in r.stdout and "--enable-cors-header" in r.stdout      # 3.14.0: behind the key's front
 
 
 def test_unit_a_dead_server_is_not_a_smoke_failure_and_check_mode_skips(tmp_path):
@@ -2039,7 +2039,7 @@ def test_unit_boot_sh_starts_sshd_then_jupyter_then_comfyui_and_never_exits(tmp_
     launch = [ln for ln in calls.splitlines() if ln.startswith("python main.py")][0]
     want = _bash("base_env_setup; base_discover quiet; _base_start_cmd", env={"BASE_FAKE_ROOT": str(tmp_path)}).stdout.strip()
     assert launch == "python " + want.split(" ", 1)[1], (launch, want)                        # the SAME line the base's restart uses
-    assert "--preview-method auto" in launch and "--disable-api-nodes" in launch and "--listen 0.0.0.0" in launch
+    assert "--preview-method auto" in launch and "--disable-api-nodes" in launch and "--listen 127.0.0.1" in launch
     assert "boot: done" in blog and "sleeping" in blog
     # sleep infinity only when not BOOT_ONCE: the script's last statement
     src = (BASE / "lib" / "boot.sh").read_text()
@@ -2522,7 +2522,7 @@ def test_unit_the_launch_sets_hf_home_in_the_environment_and_still_runs_python(t
               % (vol, bin_ / "python", comfy, tmp_path / "comfyui.log"), env={"PATH": "%s:/usr/bin:/bin" % bin_})
     assert "RC=0" in r.stdout, r.stdout + r.stderr
     calls = log.read_text() if log.exists() else (tmp_path / "comfyui.log").read_text() if (tmp_path / "comfyui.log").exists() else ""
-    assert "python argv: main.py --listen 0.0.0.0 --port 8188" in calls, (calls, r.stdout, r.stderr)
+    assert "python argv: main.py --listen 127.0.0.1 --port 8188" in calls, (calls, r.stdout, r.stderr)   # 3.14.0: a raw caller is public, so loopback
     assert "python env HF_HOME=%s/huggingface cwd=%s" % (vol, comfy) in calls, calls
     assert "No such file" not in (tmp_path / "comfyui.log").read_text()
 
@@ -2564,7 +2564,7 @@ def test_unit_restart_opt_in_starts_a_server_when_none_runs(tmp_path):
                'MODEL_DL=(one); BASE_RESTART=1 base_restart; echo R=$BASE_RESTART_RESULT FAILED=${#BASE_FAILED[@]}') % (bin_ / "python", tmp_path / "comfyui.log")
     r = _bash(snippet, env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_})
     assert "R=started FAILED=0" in r.stdout, r.stdout + r.stderr
-    assert log.exists() and "python argv: main.py --listen 0.0.0.0 --port" in log.read_text(), r.stdout
+    assert log.exists() and "python argv: main.py --listen 127.0.0.1 --port" in log.read_text(), r.stdout
     # the import check's block still wins: nothing is started on top of a failed import check
     (tmp_path / "up").unlink(); log.unlink()
     r = _bash(snippet.replace("BASE_RESTART=1 base_restart", "BASE_BLOCK_RESTART=1 BASE_RESTART=1 base_restart"), env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_})
