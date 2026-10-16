@@ -54,7 +54,7 @@ concurrency:
 
 jobs:
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
       sha: ${{ steps.r.outputs.sha }}
@@ -91,7 +91,7 @@ jobs:
   build:
     needs: resolve
     if: needs.resolve.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -145,7 +145,7 @@ jobs:
   publish:
     needs: [resolve, build]
     if: always() && needs.resolve.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: write                  # create the sage-* release and upload its assets; nothing else
