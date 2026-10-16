@@ -1,6 +1,6 @@
 # ComfyUI Base
 
-[![verify](https://github.com/Soul-Craft/ComfyUI-Base/actions/workflows/verify.yml/badge.svg)](https://github.com/Soul-Craft/ComfyUI-Base/actions/workflows/verify.yml)
+[![verify](https://github.com/SoulCraft-Org/ComfyUI-Base/actions/workflows/verify.yml/badge.svg)](https://github.com/SoulCraft-Org/ComfyUI-Base/actions/workflows/verify.yml)
 
 A current ComfyUI on any NVIDIA GPU you can get hold of, rented or owned: one installer that finds the machine's
 ComfyUI, pins its node packs to commits, owns the launch line and the boot, and brings the machine up the same way
