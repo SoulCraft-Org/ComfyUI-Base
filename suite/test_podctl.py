@@ -1203,6 +1203,37 @@ def test_unit_podctl_install_resolves_pkg_against_the_repository_root_not_the_ba
     assert podctl.repo_root(root / "base" / "comfyui-base" / "_build" / "pod" / "podctl.py") == root
 
 
+def _workspace_tree(tmp_path, host="verda"):
+    """A workspace (3.7.0): one repository per package side by side, the brand's brand.toml at the root, the base
+    OUTSIDE it (read from $COMFY_BASE), a non-package repository beside the packages."""
+    ws = tmp_path / "workspace"
+    for n in ("image-creator-example", "other-package"):
+        d = ws / n; d.mkdir(parents=True); (d / ("%s-script.sh" % n)).write_text("# pkg\n")
+    (ws / "site").mkdir(); (ws / "site" / "README.md").write_text("not a package\n")
+    (ws / "brand.toml").write_text('name = "Example"\nhost = "%s"\n' % host)
+    return ws
+
+
+def test_unit_podctl_reads_the_workspace_shape_for_pkg_and_provider(tmp_path):
+    """3.6.0 found a workspace's packages for the pin scan only; --pkg and the default provider still read the submodule
+    shape, so `podctl install --pkg <name>` from a workspace said "not inside a brand repository" and the provider fell
+    back to runpod whatever brand.toml said. Now both ask py/pkgdirs.py for the consumer root ($BASE_WORKSPACE first):
+    --pkg <name> is <workspace>/<name>, the workspace's own brand.toml names the provider, and a $BASE_WORKSPACE that
+    does not exist is an error, never an empty workspace."""
+    podctl = _load(); ws = _workspace_tree(tmp_path)
+    env = {"BASE_WORKSPACE": str(ws)}
+    assert podctl.consumer_root(env=env) == ws.resolve()
+    assert podctl.resolve_pkg_dir(ws, "other-package") == ws / "other-package"
+    with pytest.raises(podctl.PodctlError, match="<name> in a workspace"):
+        podctl.resolve_pkg_dir(ws, "no-such-package")
+    assert [b["host"] for b in podctl.brands_at(ws)] == ["verda"]
+    assert podctl.provider_for(None, env=env).name == "verda"
+    assert [b["host"] for b in podctl.brands_at(_workspace_tree(tmp_path / "b", host="runpod"))] == ["runpod"]   # (RunPod's provider wants a key)
+    with pytest.raises(podctl.PodctlError, match="does not exist"):
+        podctl.consumer_root(env={"BASE_WORKSPACE": str(tmp_path / "missing")})
+    assert podctl.brands_at(None) == []
+
+
 def test_unit_podctl_prune_lists_only_old_layout_folders_and_removes_them_with_yes(tmp_path):
     """The rename left '<Display Name>/' folders (with '<Display Name> Script.sh') and 'ComfyUI Base/' on the volume beside the new
     '<name>/' folders, plus their workflow copies in ComfyUI's browser. prune names exactly those, touches nothing without --yes,

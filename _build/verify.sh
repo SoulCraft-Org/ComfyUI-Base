@@ -4,11 +4,11 @@
 #
 #   bash base/comfyui-base/_build/verify.sh                                        # the base and every package of the consumer root
 #   bash base/comfyui-base/_build/verify.sh <brand>/packages/<name>                  # just these (paths relative to that root)
-#   BASE_WORKSPACE=<ws> bash "$COMFY_BASE/_build/verify.sh"                         # the base and every <brand>-<name>/ of a workspace
+#   BASE_WORKSPACE=<ws> bash "$COMFY_BASE/_build/verify.sh"                         # the base and every <name>/ of a workspace
 #   bash _build/verify.sh                                                          # a standalone base checkout: the base alone
 #
 # The consumer root (3.6.0, py/pkgdirs.py): $BASE_WORKSPACE, else <root> when this base is
-# <root>/base/comfyui-base. Its packages are <brand>/packages/<name>/ and <brand>-<name>/, found by the same rule
+# <root>/base/comfyui-base. Its packages are <brand>/packages/<name>/ and <name>/, found by the same rule
 # every other walker uses.
 #
 # Three things per item, in the order that fails cheapest first:

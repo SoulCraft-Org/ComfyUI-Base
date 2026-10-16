@@ -79,7 +79,7 @@ EXTRA=(
 VENDORED=()
 
 # Where the packages are (3.6.0): py/pkgdirs.py, the rule every walker in the base shares. The consumer root is
-# $BASE_WORKSPACE when set (a workspace of one repository per package, <brand>-<name>/ side by
+# $BASE_WORKSPACE when set (a workspace of one repository per package, <name>/ side by
 # side, with the base read from $COMFY_BASE outside it), else <repo> when the base is <repo>/base/comfyui-base (a
 # brand repository's submodule, packages at <brand>/packages/<name>/). A standalone base has no root and no packages,
 # which is correct: list-packs still supplies the base's own rows.

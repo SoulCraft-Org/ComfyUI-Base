@@ -57,7 +57,7 @@ that project's repository and plugs in through the seams the base leaves for it 
 `LOADER_CATS`). Models come from Hugging Face or GitHub; a package needing a file from anywhere else declares it
 `LOCAL` and puts it on the volume itself.
 
-A consumer can instead keep one repository per package, cloned side by side under a workspace as `<brand>-<name>/`,
+A consumer can instead keep one repository per package, cloned side by side under a workspace as `<name>/` (the brand's `brand.toml` and `families.txt` at the workspace root),
 and read the base from a shared checkout named by `$COMFY_BASE`, outside the workspace. Set `$BASE_WORKSPACE` to the
 workspace (`package.py` also takes `--root <dir>`) and the same tools, `verify.sh` and `testbed.sh` included,
 walk it. Both shapes are one rule, in `py/pkgdirs.py`: a package is a directory holding `<its name>-script.sh`.
