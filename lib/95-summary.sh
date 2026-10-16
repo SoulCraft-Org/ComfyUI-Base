@@ -182,6 +182,10 @@ _base_use_testbed(){ # only from `test`: the shared ComfyUI testbed. Since 2.6.0
   done
   return 0
 }
+# 3.16.0: the tiers `test quick` leaves out, by the names suites use for them: each needs a live machine (the testbed or its
+# server, a browser, a fake install tree, a pod, a GPU, local models). Everything else a suite declares is pure code and runs.
+BASE_HEAVY_TIERS="${BASE_HEAVY_TIERS:-install comfyui server snapshot runpod gpu bare e2e app applive face insightface ollama}"
+
 base_test(){ # [tier] — the package's suite.py beside the script (the base's own suite/ when PKG_ID=base); sets BASE_TEST_RESULT / BASE_TEST_RC
   local tier="${1:-}" suite ini runner=() out rc=0 on_pod=0 tiers cargs=()
   hdr "TEST SUITE${tier:+ · tier $tier}"
@@ -194,9 +198,18 @@ base_test(){ # [tier] — the package's suite.py beside the script (the base's o
     miss "no suite at $suite — the suite did NOT run"; BASE_TEST_RESULT="NOT RUN (no suite.py)"; BASE_WARN+=("suite not run: no suite.py beside the script"); BASE_TEST_RC=1; return 0
   fi
   [ -f "$ini" ] && cargs=(-c "$ini")
+  local mexpr="$tier"
   if [ -n "$tier" ]; then
     tiers="$( [ -f "$ini" ] && awk '/^markers/{f=1;next} f&&/^[^[:space:]]/{f=0} f{sub(/:.*/,""); print $1}' "$ini" || true)"
-    if [ -n "$tiers" ] && ! _base_in_list "$tier" $tiers; then err "unknown tier '$tier' — this suite has: $(echo $tiers)"; BASE_TEST_RESULT="unknown tier"; BASE_TEST_RC=2; return 0; fi
+    if [ "$tier" = "quick" ] && ! _base_in_list quick $tiers; then
+      # 3.16.0, tier 0 (_build/quick.sh): every tier this suite declares except those that need a live machine
+      # (BASE_HEAVY_TIERS). A suite that declares no tiers cannot be cut, so it runs whole.
+      local light=() t
+      for t in $tiers; do _base_in_list "$t" $BASE_HEAVY_TIERS || light+=("$t"); done
+      if [ -z "$tiers" ]; then mexpr=""; note "quick: this suite declares no tiers, so it runs whole"
+      elif [ "${#light[@]}" -eq 0 ]; then note "quick: every tier of this suite needs a live machine: nothing to run here"; BASE_TEST_RESULT="none (no light tiers)"; return 0
+      else mexpr="$(printf '%s or ' "${light[@]}")"; mexpr="${mexpr% or }"; note "quick: $(echo "${light[@]}") (not: $(for t in $tiers; do _base_in_list "$t" "${light[@]}" || printf '%s ' "$t"; done))"; fi
+    elif [ -n "$tiers" ] && ! _base_in_list "$tier" $tiers; then err "unknown tier '$tier' — this suite has: $(echo $tiers) (or quick)"; BASE_TEST_RESULT="unknown tier"; BASE_TEST_RC=2; return 0; fi
   fi
   # the venv's pytest, else uv with its own; never pip-installed into an interpreter that is not our venv;
   # and never "skipped" with exit 0 when nothing ran
@@ -221,7 +234,7 @@ base_test(){ # [tier] — the package's suite.py beside the script (the base's o
   PYTHONPATH="$BASE_DIR/py${PYTHONPATH:+:$PYTHONPATH}" BASE_WF="${PKG_DIR:-}/${WF_NAME:-}" BASE_SCRIPT="${PKG_SCRIPT:-}" BASE_PKG_DIR="${PKG_DIR:-}" BASE_LIB="$BASE_DIR" \
      BASE_COMFY="${COMFY:-}" BASE_VENV="${VENV:-}" BASE_STATE="${BASE_STATE:-}" BASE_MODELS_DIR="${M:-}" BASE_NODE_SRC="${BASE_NODE_SRC:-}" BASE_SERVER="${BASE_SERVER:-}" BASE_ON_POD="$on_pod" \
      env ${_scrub[@]+"${_scrub[@]}"} -u HF_TOKEN -u HF_HUB_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HUGGINGFACE_API_KEY \
-     "${runner[@]}" -q -rs -p no:cacheprovider -p basetest ${cargs[@]+"${cargs[@]}"} "$suite" ${tier:+-m "$tier"} 2>&1 | tee "$out"; rc="${PIPESTATUS[0]}"
+     "${runner[@]}" -q -rs -p no:cacheprovider -p basetest ${cargs[@]+"${cargs[@]}"} "$suite" ${mexpr:+-m "$mexpr"} 2>&1 | tee "$out"; rc="${PIPESTATUS[0]}"
   [ "$_errexit" = 1 ] && set -e; true
   BASE_TEST_TABLE="$(awk '/= test tiers =/{f=1;next} f&&/^=+/{exit} f' "$out" || true)"
   BASE_TEST_RESULT="$(grep -E '^[0-9]+ (passed|failed)|no tests ran|error' "$out" | tail -1 || true)"; BASE_TEST_RESULT="${BASE_TEST_RESULT:-exit $rc}"

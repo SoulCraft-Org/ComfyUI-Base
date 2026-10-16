@@ -2422,6 +2422,23 @@ def test_unit_the_test_command_runs_the_suite_with_the_base_s_own_uv_when_none_i
     assert "RESULT=1 failed, 3 passed RC=1" in r.stdout and "✖ suite" in r.stdout and "✔ suite" not in r.stdout, r.stdout + r.stderr
 
 
+
+def test_unit_the_test_command_takes_quick_as_every_tier_that_needs_no_live_machine(tmp_path):
+    """3.16.0, tier 0 (_build/quick.sh): `test quick` runs the suite's declared tiers minus BASE_HEAVY_TIERS, as one -m
+    expression; a suite with a tier really named quick keeps its own meaning."""
+    _pod(tmp_path)
+    tools = tmp_path / "comfy-base" / "bin"; tools.mkdir(parents=True)
+    uv = tools / "uv"; uv.write_text('#!/bin/bash\necho "uv $*" >> "$(dirname "$0")/calls.log"\necho "1 passed"\n'); uv.chmod(0o755)
+    r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; base_test quick; echo "RESULT=$BASE_TEST_RESULT RC=$BASE_TEST_RC"',
+              env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
+    assert "RESULT=1 passed RC=0" in r.stdout and "unknown tier" not in r.stdout, r.stdout + r.stderr
+    call = (tools / "calls.log").read_text()
+    assert "-m unit" in call and "install" not in call.split("-m unit", 1)[1].split()[:2], call      # the base's own: unit only
+    assert "quick: unit (not: install comfyui runpod gpu bare" in r.stdout, r.stdout
+    r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; base_test quack; echo "RC=$BASE_TEST_RC"',
+              env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
+    assert "unknown tier 'quack'" in r.stdout + r.stderr and "(or quick)" in r.stdout + r.stderr and "RC=2" in r.stdout
+
 def test_unit_boot_sh_records_its_pid_so_the_pod_tier_can_tell_a_base_boot_from_the_images(tmp_path):
     """On the pod both runpod tests took PID 1 for boot.sh because podctl's wrapper text mentions boot.sh (2.0.6)."""
     from basetest import fake_pod, run_script
