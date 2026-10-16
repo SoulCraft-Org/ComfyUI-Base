@@ -70,7 +70,8 @@ around it, and is what CI runs on every push.
 
 The `comfyui` tier needs a local ComfyUI to test against. `bash testbed.sh --server` provisions one — upstream at its
 newest release, plus the base's own packs at their HEAD (or the branch a row names, 3.6.1) and every requirement at its newest, on the newest Python torch ships for (3.7.1): and starts it on CPU, so a clone of this repository can run
-that tier on its own. It is several GB and gitignored. Tiers that need a GPU or a pod skip by name.
+that tier on its own. It is several GB and gitignored. Tiers that need a GPU or a pod skip by name. The suites only ever
+talk to a server this checkout started (`testbed.sh --owned`), and `verify.sh` starts one of each run's own.
 
 ## Comfy MCP
 

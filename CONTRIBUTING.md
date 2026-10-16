@@ -38,6 +38,10 @@ testbed skips itself by name, so `unit` and `install` run anywhere. `comfyui` ne
 bash testbed.sh --server   # provisions a CPU ComfyUI beside the base and starts it
 ```
 
+`bash _build/verify.sh` starts a server of its own run beside that tree (and stops it at the end), so it never talks
+to another checkout's; `VERIFY_SERVER=reuse` uses the one `--server` started instead, once `testbed.sh --owned` proves it is this
+checkout's.
+
 `pytest.ini` sets `filterwarnings = error`. Warnings get fixed, never filtered. That line is not negotiable.
 
 ## What goes where

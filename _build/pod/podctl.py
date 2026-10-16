@@ -274,6 +274,18 @@ def tunnel_port(v):
     return "%d:%d" % (int(local), int(remote))
 
 
+def owned_testbed_server(base_dir):
+    """127.0.0.1:<port> of the server this checkout's testbed started, or None (3.16.0). Asked of testbed.sh --owned, in
+    the base or beside it, which answers only when its pid file names the process on the port it recorded."""
+    import subprocess
+    base_dir = pathlib.Path(base_dir)
+    for root in (base_dir, base_dir.parent):
+        if (root / "testbed.sh").exists():
+            r = subprocess.run(["bash", str(root / "testbed.sh"), "--owned"], capture_output=True, text=True, timeout=60)
+            return (r.stdout.strip() or None) if r.returncode == 0 else None
+    return None
+
+
 def ssh_run(remote_cmd, env=None, timeout=None, input=None):
     """One command on the pod, no forwards, no TTY. Returns the CompletedProcess.
 
@@ -743,7 +755,10 @@ class PodIO:
             _tb = next((d for d in (base_dir / "testbed", base_dir.parent / "testbed") if (d / "main.py").exists()),
                        base_dir.parent / "testbed")
             env.setdefault("BASE_NODE_SRC", str(_tb))
-            env.setdefault("BASE_SERVER", env.get("BASE_SERVER", "127.0.0.1:8199"))
+            # 3.16.0: the gate's server is the one this checkout's testbed started (testbed.sh --owned), else none
+            # (127.0.0.1:0). 8199 was whoever listened there, on a shared Mac another checkout's (error log row 84).
+            if not env.get("BASE_SERVER"):
+                env["BASE_SERVER"] = owned_testbed_server(base_dir) or "127.0.0.1:0"
             if it["kind"] != "base":
                 env["COMFY_BASE"] = str(base_dir)
             for name in ("COMFY_BASE", "BASE_NODE_SRC"):     # a path that is not there makes the gate lie

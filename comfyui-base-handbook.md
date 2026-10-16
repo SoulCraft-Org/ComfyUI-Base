@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.15.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.16.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -518,9 +518,15 @@ Suites ship as `suite.py` + `pytest.ini` beside the script and load the base's p
 `community`, `bare`, `volume`), `run_script`, `boot_stubs`, `boot_fake_pod`, `tree_hash`, `code_only`, `zip_extra` and the
 per-tier table. `fake_pod` puts in `<root>/pkg` what the package's zip unpacks to: its top-level files, its vendored
 packs and every path its script's `ZIP_EXTRA` lists, read as `package.py` reads it (3.9.2: a shipped directory that is
-not a node pack, such as an app's `app/`, was missing; a listed file that is not there is an error). `bash "<name>-script.sh" test` auto-detects the testbed and its server on 8199, or on the port a running testbed
-recorded in `.testbed-server.port` beside `testbed.sh` (2.2.0: `_base_use_testbed` and `verify.sh` both read it, so a
-brand whose testbed runs elsewhere needs no env var). `--server` and `--stop` end only the server this checkout started,
+not a node pack, such as an app's `app/`, was missing; a listed file that is not there is an error). `bash "<name>-script.sh" test` auto-detects the testbed and the server it started: `testbed.sh --owned` answers with
+the address only when the pid in `.testbed-server.pid` is what listens on the port in `.testbed-server.port`, and
+anything else (nothing recorded, a stale pair, a port another checkout's server holds) gives the suite `127.0.0.1:0`,
+"no server", so no suite falls back to a default port a stranger holds (3.16.0; the port file alone, else 8199, used to
+be enough). `_build/verify.sh` starts a server of each run's own by default (`testbed.sh --start` with a free
+`TESTBED_PORT` and a `TESTBED_STATE` folder of the run's own, which also gives it its own `--temp-directory`; stopped and
+removed when the run ends), so two runs at once never share one; `VERIFY_SERVER=reuse` takes the checkout's `--server`
+only when `--owned` proves it and stops the gate otherwise, `VERIFY_SERVER=none` runs without one, and a testbed with
+no venv means none. podctl's gate asks `--owned` the same way. `--server` and `--stop` end only the server this checkout started,
 the pid in `.testbed-server.pid` while it is still a ComfyUI `main.py` (3.9.2); a port another process holds is never
 killed: `--server` stops, naming the holder's pid and a free `TESTBED_PORT`, and `--stop` says it left it running. `BASE_NODE_SRC` / `BASE_SERVER` override; the runner hands the
 suite `BASE_COMFY` and `BASE_VENV`, and `BASE_WORKSPACE` when set (3.6.0: the consumer root `py/pkgdirs.py` walks in the
@@ -690,6 +696,7 @@ over), `bare` (the shell sources without a machine).
 cd base/comfyui-base && bash base.sh test                                                        # every tier
 uv run --no-project --with pytest python base/comfyui-base/_build/rehearse.py <brand>/packages/<name> --layout official|community|bare|volume
 bash base/comfyui-base/_build/verify.sh [<brand>/packages/<name>...]                            # zip current, suite from the repo, suite from the zip
+VERIFY_SERVER=reuse bash base/comfyui-base/_build/verify.sh                                    # this checkout's testbed --server, proven by --owned (default: a server of the run's own)
 ```
 
 The rehearsal unpacks the shipped zips, runs the two steps on a fake pod of that layout, then boots it through
@@ -778,6 +785,23 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.16.0: the gate talks only to a server it started (2026-10-16, error log row 84). `_build/verify.sh` used whatever
+  answered on the port in `.testbed-server.port`, else 8199, and so did the runner's `_base_use_testbed`, podctl's gate
+  and a bare `pytest suite/`. On a Mac where several sessions each run a testbed, the Video Replacer's local gate met
+  another session's server: the snapshot tier measured that frontend (other LoadImage sizes), a server test lost it
+  mid-run when its session stopped it, and a clean PR went red. Now `testbed.sh --owned` is the one answer: the address
+  only when the recorded pid is what listens on the recorded port, else the reason (a foreign holder named by pid).
+  `verify.sh` starts a ComfyUI of each run's own by default (new `testbed.sh --start`: the server alone from the venv as
+  it is; a free port, `TESTBED_STATE` keeps its pid, port and log in a folder of the run's own and gives it its own
+  temp folder, since ComfyUI empties its temp folder when it starts), hands that address to both suites and stops it on
+  every way out. `VERIFY_SERVER=reuse` takes the checkout's `--server` only when `--owned` proves it and refuses
+  otherwise before any suite runs; `VERIFY_SERVER=none` runs without one; no venv means none; a server that will not
+  come up is a red gate. The runner, podctl's gate and `test_comfyui` ask `--owned`, and "none" is `127.0.0.1:0`, said out
+  loud, because an empty `BASE_SERVER` let a suite fall back to 8199 or 8188 (Comfy Desktop). `--server` now waits for
+  its own pid to answer, not for any answer on the port. CI (`testbed.sh --server`, then `verify.sh`) still works: the
+  run starts its own beside it; `VERIFY_SERVER=reuse` there saves that start. Tests: a real `--start`/`--owned`/`--stop`
+  round with two run folders and a foreign `main.py` on the recorded port; `verify.sh`'s modes against a stand-in base;
+  the runner refusing a foreign server.
 - 3.15.3: a failing suite's report keeps each failing test whole (2026-10-16). `_build/verify.sh` printed only 12 to 24
   lines of a failure, so a long assertion lost its cause in CI (it hid a Video Replacer failure's reason). It now prints
   pytest's ERRORS and FAILURES sections (each test's header, its `>` lines and its whole E block), capped at 200 lines,

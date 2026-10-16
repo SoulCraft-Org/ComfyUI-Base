@@ -164,17 +164,18 @@ _base_use_testbed(){ # only from `test`: the shared ComfyUI testbed. Since 2.6.0
                      # base/comfyui-base. Both are checked, in that order, and each root is taken whole — the port file is
                      # read from the SAME root that supplied the tree, never from the other one. Anchored on the base either
                      # way, so a package three levels down and the base itself find the same tree.
-  local root tb port
+  local root tb out
   if [ -n "${BASE_NODE_SRC:-}" ]; then return 0; fi
   for root in "$BASE_DIR" "$BASE_DIR/.."; do
     tb="$root/testbed"
     if [ -f "$root/testbed.sh" ] && [ -f "$tb/main.py" ]; then
       BASE_NODE_SRC="$(cd "$tb" && pwd -P)"; note "testbed: BASE_NODE_SRC=$BASE_NODE_SRC"
-      port="${TESTBED_PORT:-}"
-      [ -z "$port" ] && [ -f "$root/.testbed-server.port" ] && port="$(tr -d '[:space:]' < "$root/.testbed-server.port")"   # 2.2.0: the running testbed says which port it took
-      port="${port:-8199}"
-      if [ -z "${BASE_SERVER:-}" ] && curl -sf --max-time 2 "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then
-        BASE_SERVER="127.0.0.1:$port"; note "testbed: BASE_SERVER=$BASE_SERVER"
+      # 3.16.0: only a server this testbed started (testbed.sh --owned: its pid file names the process listening on the
+      # port it recorded). The port file alone, or 8199, reached another checkout's server on a shared Mac (error log
+      # row 84). Without one, 127.0.0.1:0 says "none", so no suite falls back to a default port a stranger may hold.
+      if [ -z "${BASE_SERVER:-}" ]; then
+        if out="$(bash "$root/testbed.sh" --owned 2>&1)"; then BASE_SERVER="$out"; note "testbed: BASE_SERVER=$BASE_SERVER (this testbed's own server)"
+        else BASE_SERVER="127.0.0.1:0"; note "testbed: no server of its own ($(printf '%s' "$out" | head -1)): the live checks skip"; fi
       fi
       break
     fi

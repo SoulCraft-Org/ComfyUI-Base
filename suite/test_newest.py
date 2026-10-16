@@ -497,6 +497,65 @@ def test_unit_testbed_stops_only_the_server_it_started_and_refuses_a_foreign_por
             _end(own)
 
 
+_HTTP_MAIN = """import http.server, sys
+port = int(sys.argv[sys.argv.index("--port") + 1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+"""
+
+
+def test_unit_testbed_owned_names_only_its_own_server_and_each_run_folder_gets_its_own(tmp_path):
+    """3.16.0 (error log row 84): --owned names a server only when the pid this testbed recorded is what listens on the port
+    it recorded. A port file whose port another checkout's ComfyUI holds is refused, naming the holder; that is the shape
+    in which verify.sh measured a stranger's frontend. --start with a TESTBED_STATE folder (what verify.sh does for each
+    run) gives two runs two servers: each folder's --owned names its own, the checkout's own files name neither, stopping
+    one leaves the other up, and each runs with a temp folder of its own (ComfyUI empties its temp folder at start)."""
+    if not (BASE / "testbed.sh").exists() or not (BASE / "_build").exists():
+        pytest.skip("testbed.sh is repo tooling, not in the shipped base")
+    here = _testbed_beside(tmp_path, [])
+    comfy = here / "testbed"; venv = comfy / ".venv-testbed" / "bin"; venv.mkdir(parents=True)
+    (venv / "python").symlink_to(sys.executable); (comfy / "main.py").write_text(_HTTP_MAIN)
+    e = {k: v for k, v in os.environ.items() if not k.startswith(("BASE_", "TESTBED_"))}
+    tb = lambda *a, **kw: subprocess.run(["bash", str(here / "testbed.sh"), *a], capture_output=True, text=True, env={**e, **kw}, timeout=300)
+    r = tb("--owned")
+    assert r.returncode == 1 and not r.stdout and "no server recorded" in r.stderr, r.stdout + r.stderr
+    port = _free_port(); foreign = _listen(tmp_path, "main.py", port)        # another checkout's ComfyUI, on our recorded port
+    try:
+        (here / ".testbed-server.port").write_text("%d\n" % port); (here / ".testbed-server.pid").write_text("999999\n")
+        r = tb("--owned")
+        assert r.returncode == 1 and not r.stdout and ("held by pid %d" % foreign.pid) in r.stderr, r.stdout + r.stderr
+        assert foreign.poll() is None
+    finally:
+        _end(foreign)
+    (here / ".testbed-server.port").unlink(); (here / ".testbed-server.pid").unlink()
+    a, b = tmp_path / "run-a", tmp_path / "run-b"; a.mkdir(); b.mkdir()
+    pa = _free_port(); pb = _free_port()
+    while pb == pa: pb = _free_port()
+    try:
+        for d, pt in ((a, pa), (b, pb)):
+            r = tb("--start", TESTBED_STATE=str(d), TESTBED_PORT=str(pt))
+            assert r.returncode == 0 and ("server up at http://127.0.0.1:%d" % pt) in r.stdout, r.stdout + r.stderr
+        assert tb("--owned", TESTBED_STATE=str(a)).stdout.strip() == "127.0.0.1:%d" % pa
+        assert tb("--owned", TESTBED_STATE=str(b)).stdout.strip() == "127.0.0.1:%d" % pb
+        assert tb("--owned").returncode == 1                                    # neither is the checkout's own --server
+        pid = (a / ".testbed-server.pid").read_text().strip()
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout
+        assert ("--temp-directory %s" % a) in cmd, cmd
+        r = tb("--stop", TESTBED_STATE=str(a))
+        assert r.returncode == 0 and "stopped pid" in r.stdout and not (a / ".testbed-server.port").exists(), r.stdout + r.stderr
+        assert tb("--owned", TESTBED_STATE=str(a)).returncode == 1
+        assert tb("--owned", TESTBED_STATE=str(b)).stdout.strip() == "127.0.0.1:%d" % pb
+    finally:
+        tb("--stop", TESTBED_STATE=str(a)); tb("--stop", TESTBED_STATE=str(b))
+    shutil.rmtree(comfy / ".venv-testbed")
+    r = tb("--start", TESTBED_STATE=str(a), TESTBED_PORT=str(pa))
+    assert r.returncode == 3 and "no venv" in r.stdout, r.stdout + r.stderr       # verify.sh reads 3 as "no server"
+
+
 # ---------------------------------------------------------------- C: the lift, the override loop, the import check
 
 def _lift_env(tmp_path, outdated_rounds, override_fails=()):
