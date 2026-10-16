@@ -87,9 +87,9 @@ def test_unit_the_largest_download_starts_first_and_the_report_keeps_row_order(t
     sizes = {"small": 1024, "big": 8192, "mid": 4096}
     (bin_ / "hf").write_text(
         '#!/bin/bash\nf="$3"; d=""; while [ $# -gt 0 ]; do case "$1" in --local-dir) d="$2"; shift;; esac; shift; done\n'
-        'echo "start $f $(python3 -c "import time; print(time.time())")" >> "%s"; sleep 0.5\n'
-        'mkdir -p "$d"; python3 -c "import sys; open(sys.argv[1],\'wb\').truncate(int(sys.argv[2]))" "$d/$f" '
-        '"$(case "$f" in small*) echo 1024;; big*) echo 8192;; *) echo 4096;; esac)"\n' % log)
+        'echo "start $f $(python3 -c "import time; print(time.time())")" >> "%s"; sleep 0.5\nmkdir -p "$d"\n'
+        'python3 - "$d/$f" <<"PY"\nimport sys\nn = sys.argv[1].rsplit("/", 1)[-1].split(".")[0]\n'
+        'open(sys.argv[1], "wb").truncate({"small": 1024, "big": 8192}.get(n, 4096))\nPY\n' % log)
     (bin_ / "hf").chmod(0o755)
     rows = ['vae|Example|Real|%s.safetensors|https://huggingface.co/x/y/resolve/main/%s.safetensors|%d|n|' % (n, n, b) for n, b in sizes.items()]
     r = _bash('MODELS=(%s); base_env_setup; base_discover quiet; base_models; echo DL=${#MODEL_DL[@]}' % " ".join('"%s"' % x for x in rows),
@@ -168,7 +168,7 @@ def test_unit_the_tools_venv_builds_in_the_background_and_its_results_reach_the_
               ' _base_tools_start; echo "STARTED=$?"; echo "BEFORE=${BASE_TOOLS_RESULT:-}"; _base_tools_join; echo "JOINED=$?";'
               ' echo "RESULT=$BASE_TOOLS_RESULT"; printf "C %s\\n" "${BASE_CHANGED[@]}"; printf "T %s\\n" "${BASE_STAGE_TIMES[@]}"', env={"BASE_NO_NET": "1"})
     out = r.stdout
-    assert "STARTED=0" in out and "BEFORE=\n" in out and "JOINED=0" in out, out + r.stderr
+    assert "STARTED=0" in out and "BEFORE=not run\n" in out and "JOINED=0" in out, out + r.stderr
     assert "jupyter built" in out and "RESULT=built (Python 3.15)" in out and "C tools venv: JupyterLab" in out
     assert re.search(r"T \d+\|TOOLS VENV \(in the background\)", out), out
     assert out.index("BEFORE=") < out.index("jupyter built")                   # its output is shown at the join
@@ -205,7 +205,9 @@ def test_unit_a_first_install_pays_no_dry_run_and_no_second_resolve():
 # ---------------------------------------------------------------- the heartbeat and the Xet settings
 
 def test_unit_the_heartbeat_never_walks_the_venv():
-    assert "du " not in _code("lib/00-env.sh", "_base_watch(){", "\n}\n")
+    body = _code("lib/00-env.sh", "_base_watch(){", "\n}\n")
+    code = "\n".join(l.split("#", 1)[0] for l in body.splitlines()[1:])
+    assert not re.search(r"\bdu\b", code), code
 
 
 def test_unit_the_xet_settings_that_do_nothing_are_gone():

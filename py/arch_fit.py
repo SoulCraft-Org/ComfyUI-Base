@@ -4,7 +4,7 @@
 torch lists its kernels as `sm_XY` (SASS for one compute capability) and `compute_XY` (PTX). The CUDA rule, from
 NVIDIA's compatibility guide: SASS built for X.Y runs on a device of the SAME major X with a minor of Y or more, except
 the arch-specific `sm_XYa` builds, which run on X.Y only; PTX built for X.Y is compiled by the driver for any device of
-X.Y or newer. So torch 2.14.1+cu130's `sm_100` runs on a B300 (`sm_103`) and `sm_120` on an `sm_121`, and only a GPU
+X.Y or newer. So torch 2.14.1 (CUDA 13.0)'s `sm_100` runs on a B300 (`sm_103`) and `sm_120` on an `sm_121`, and only a GPU
 outside every family the build carries is missing. Comparing strings had a B300 rebuild the venv on every install.
 
     covering(want, archs) -> the listed arch that runs on `want` ("sm_103" -> "sm_100"), or "" when none does.
