@@ -3,6 +3,9 @@
 
 Run as: VENV=... BASE_PERSIST_ROOT=/workspace BASE_WANT_PY=3.14 BASE_WANT_BACKEND=cu132 BASE_WANT_SM=sm_120 BASE_EXTRA_IMPORTS="a b" $PY venv_verify.py
 
+BASE_NO_GPU=1 (3.9.1, set by the install for BASE_SEED=1): an image build has no GPU, so "torch sees a CUDA device" is
+not asked; the CUDA build, the archs and the closure still are. The machine the image serves asks it at its first install.
+
 A non-zero exit fires the automatic rollback, and that rollback is what leaves the pod BOOTABLE instead
 of bricked. So the persistence closure is fatal here, not a warning: the base interpreter, the pyvenv.cfg
 home, every existing sys.path root and every absolute .pth target must live on the volume.
@@ -34,7 +37,8 @@ elif not want_backend and cu == "none":
     probs.append("torch has no CUDA build")
 if want_sm and want_sm not in archs:
     probs.append("%s not in torch arch list" % want_sm)
-if not torch.cuda.is_available():
+no_gpu = os.environ.get("BASE_NO_GPU") == "1"
+if not no_gpu and not torch.cuda.is_available():
     probs.append("torch.cuda.is_available() is False")
 if not os.path.realpath(torch.__file__).startswith(os.path.realpath(venv)):
     probs.append("torch imported from outside the venv: %s" % torch.__file__)
@@ -80,8 +84,9 @@ for m in extra:
         importlib.import_module(m)
     except Exception as e:  # noqa: BLE001
         probs.append("import %s: %r" % (m, e))
-print("python %s · torch %s · CUDA %s · %s · import torch %.1fs" % (
-    sys.version.split()[0], torch.__version__, cu, (want_sm if want_sm in archs else "NO " + want_sm) if want_sm else ",".join(archs[-2:]), t_import))
+print("python %s · torch %s · CUDA %s · %s · import torch %.1fs%s" % (
+    sys.version.split()[0], torch.__version__, cu, (want_sm if want_sm in archs else "NO " + want_sm) if want_sm else ",".join(archs[-2:]), t_import,
+    " · no GPU asked (seed build)" if no_gpu else ""))
 for p in probs:
     print("  ‼ " + p)
 sys.exit(1 if probs else 0)

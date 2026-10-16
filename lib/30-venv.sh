@@ -212,8 +212,11 @@ _base_venv_swap_aside(){ # <ts> — move $VENV out of the way and arm the rollba
   else BASE_VENV_BACKUP=""; miss "no bootable venv to roll back to — if this build fails the path is left empty, which start.sh rebuilds on the next boot"; fi
 }
 _base_venv_verify(){ # [python-mm] — prints the facts, non-zero on any miss (py/venv_verify.py)
+  # 3.9.1: a seed build (BASE_SEED=1, the template image) has no GPU; "torch sees a device" was its one fatal line, so no
+  # image could be built. BASE_NO_GPU drops that question alone.
+  local nogpu=0; [ "${BASE_SEED:-0}" = "1" ] && nogpu=1
   BASE_TORCH_INFO="$(VENV="$VENV" BASE_PERSIST_ROOT="$BASE_PERSIST_ROOT" BASE_WANT_PY="${1:-}" BASE_WANT_BACKEND="${BASE_TORCH_BACKEND:-}" BASE_WANT_SM="${BASE_GPU_SM:-}" \
-    BASE_EXTRA_IMPORTS="${PKG_IMPORT_CHECK:-}" "$PY" "$BASE_DIR/py/venv_verify.py" 2>&1)"; local rc=$?
+    BASE_NO_GPU="$nogpu" BASE_EXTRA_IMPORTS="${PKG_IMPORT_CHECK:-}" "$PY" "$BASE_DIR/py/venv_verify.py" 2>&1)"; local rc=$?
   echo "$BASE_TORCH_INFO" | sed 's/^/  /'
   return $rc
 }

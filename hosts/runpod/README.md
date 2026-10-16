@@ -99,7 +99,7 @@ e.g. **Video Replacer App** (8189). How, from first-party sources (read 2026-10-
 - **The terminal's token, one click (Paul's order: simple, then secure, then private).** `create --public` puts a fresh
   `JUPYTER_TOKEN` in the pod's env and prints the ready links at once: `ComfyUI`, `Jupyter Terminal`
   (`…-8888.proxy.runpod.net/lab?token=<token>`, the one line that carries it) and each app. The private default keeps
-  the token out of RunPod's env (stored in the clear): once ssh answers, `create` hands it to the encrypted volume through
+  the token out of RunPod's env (stored in the clear): once ssh answers, `create` hands it to the pod volume through
   ssh's stdin and prints the same names as the localhost links `podctl tunnel` opens. Never tokenless: the URL is public
   and the terminal is root.
   `status <pod>` prints every link, the Jupyter Terminal's as `…-8888.proxy.runpod.net/lab?token=<token>` (the env's, else
@@ -111,7 +111,7 @@ e.g. **Video Replacer App** (8189). How, from first-party sources (read 2026-10-
 
     uv run "_build/pod/podctl.py" pods                          # every pod: id, name, image, status, public ip, port 22
     uv run "_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location <dc>] [--public [--volume <id>]]
-                                                                # stock check (B200, then B300 unless --gpu); a PRIVATE Secure Cloud pod (encrypted pod volume,
+                                                                # stock check (B200, then B300 unless --gpu); a PRIVATE Secure Cloud pod (pod volume, not encrypted,
                                                                 # ssh only, ComfyUI through podctl tunnel) unless --public (network volume, proxy URLs)
     uv run "_build/pod/podctl.py" status <pod>                  # facts; env NAMES, never values; the named links (the terminal's with its token); the GPU verdict
     uv run "_build/pod/podctl.py" ensure <pod>                  # 22/tcp, PUBLIC_KEY, the boot guard, Host runpod
@@ -141,17 +141,23 @@ installs the boot guard as for every pod. A refused pod (sold out between the ch
 the same call made, so nothing is left billing. `create` is a billable verb: a consumer's guard hook prompts for it.
 
 `create --private` (3.7.4) is the shape for work that must not be reachable from a URL, and since 3.8.1 the default:
-`--public` asks for the network-volume pod with proxy URLs instead, and `--volume` needs it. RunPod's storage docs: "Encryption
-applies only to volume disk. Container disk and network volumes cannot be encrypted." So it makes an encrypted POD volume
-(`volumeInGb` = `--data-gb`, `volumeEncrypted: true`) instead of a network volume and refuses `--volume`; exposes `22/tcp`
+`--public` asks for the network-volume pod with proxy URLs instead, and `--volume` needs it. It makes a POD volume
+(`volumeInGb` = `--data-gb`) instead of a network volume and refuses `--volume`; exposes `22/tcp`
 only; sets `BASE_LISTEN=127.0.0.1` in the pod's env (boot reads it; `install` passes it to its runs) so ComfyUI listens on
 loopback, and with it JupyterLab and the app ports; sets no Jupyter token in the env (RunPod stores env in the clear), so
-the boot generates one on the encrypted volume. No http port, so no port names and no template: `podctl tunnel <pod>`
-forwards 8188, 8888 and the app ports and prints them as named localhost links, the terminal's with its token. `volumeEncrypted` appears on REST v1's Pod ("can only be set when creating a Pod") but in
-neither documented create input (REST `PodCreateInput`, GraphQL `podFindAndDeployOnDemand`; runpodctl v3 has no flag
-for it), so `create` reads the pod back: `false` deletes the seconds-old pod and fails, an answer without the field is
-kept, named, and fails. The trade: the data lives on that machine (stop/start keeps it, terminate deletes it, and a
-start can wait for that machine's GPU).
+the boot generates one on the pod volume. No http port, so no port names and no template: `podctl tunnel <pod>`
+forwards 8188, 8888 and the app ports and prints them as named localhost links, the terminal's with its token.
+The volume is NOT encrypted, and `create` says so before the pod exists (3.9.1).
+RunPod's storage docs: "Encryption applies only to volume disk. Container disk and network volumes cannot be encrypted",
+and the one way they name is the console's "Encrypt volume" box at create time. `volumeEncrypted` is on REST v1's Pod
+read-back ("can only be set when creating a Pod") but REST v1 `POST /pods` refuses it ("Extra input keys"; it is not in
+`PodCreateInput`), REST v2 has no encryption field, runpodctl 3.0.1 no flag, and GraphQL's `podFindAndDeployOnDemand`
+input has only an undocumented `volumeKey` string (not sent: unverified, and RunPod says bring-your-own-key is not
+supported). The summary prints what the read-back says. A pod that must be encrypted is made in the console. The trade:
+the data lives on that machine (stop/start keeps it, terminate deletes it, and a start can wait for that machine's GPU).
+And money: RunPod's billing docs say that when the balance reaches $0 "those with a network volume are preserved, while
+those without one are terminated and their data cannot be recovered", so `create` says that up front too; keep the
+balance topped up (auto-pay or a low-balance alert) while a private pod holds work.
 
 ## The two shapes of a pod's volume
 
