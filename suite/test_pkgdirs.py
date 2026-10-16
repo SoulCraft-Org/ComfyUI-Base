@@ -204,3 +204,21 @@ def test_unit_testbed_sh_dies_when_pkgdirs_fails(tmp_path):
     (b / "py" / "pkgdirs.py").unlink()
     r = subprocess.run(["bash", str(b / "testbed.sh"), "--status"], capture_output=True, text=True, env=_env())
     assert r.returncode == 1 and "predates 3.6.0" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_verify_prints_a_failing_tests_whole_error_block(tmp_path):
+    """3.15.3: verify.sh's failure report keeps each failing test's whole E block (it used to keep 12-24 lines, and a long
+    assertion lost its cause in CI), capped, then pytest's short summary."""
+    _repo_only("_build/verify.sh")
+    src = (BASE / "_build" / "verify.sh").read_text(encoding="utf-8")
+    fn = src[src.index("_verify_failures(){"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    e_lines = "\n".join("E       line %d of a long assertion" % i for i in range(40))
+    log = ("x\n=================== FAILURES ===================\n____ test_long ____\n>       assert a == b\n%s\n"
+           "=========== short test summary info ===========\nFAILED suite/x.py::test_long - assert\n" % e_lines)
+    f = tmp_path / "suite.log"; f.write_text(log)
+    r = subprocess.run(["bash", "-c", fn + '\n_verify_failures "$1"', "_", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "line 39 of a long assertion" in r.stdout and ">       assert a == b" in r.stdout, r.stdout
+    assert "FAILED suite/x.py::test_long" in r.stdout, r.stdout
+    assert "head -16" not in src and "head -24" not in src, "the old 16/24-line caps are back"
