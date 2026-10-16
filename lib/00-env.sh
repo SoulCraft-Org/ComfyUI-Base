@@ -67,7 +67,13 @@
 # BASE_STAGED=1          3.1.0: act on the package's MODELS_LATER: those rows get 0-byte stand-ins, the server starts
 #                        on the first flow's files, and a detached `base.sh fetch-later` brings the rest
 #                        (state/later.queue, state/standins.list, state/progress.json). Every other run ignores it.
-# BASE_FETCH_JOBS=<n>    3.1.0: how many model files download at once (default 1, which is exactly the 3.0 behaviour).
+# BASE_FETCH_JOBS=<n>    3.1.0: how many model files download at once. 3.11.0: default 6 (3 under 32 GiB of memory),
+#                        largest first; 1 is the one-at-a-time behaviour of 3.0 to 3.10.
+# BASE_MODELS_FOREGROUND=1  3.11.0: the model downloads wait for the venv build, as before (lib/52-models-early.sh)
+# BASE_TOOLS_FOREGROUND=1   3.11.0: JupyterLab's tools venv builds in the BOOT stage, as before (lib/75-boot.sh)
+# BASE_PACK_JOBS=<n>     3.11.0: how many packs clone or fetch at once (default 8)
+# BASE_FULL=1            3.11.0: the whole pipeline even when this store already holds this exact install green
+#                        (lib/92-onepass.sh: same package files, same base, same GPU arch, every file in place)
 BASE_DRY="${BASE_DRY:-0}"                 # --check
 BASE_FAKE_ROOT="${BASE_FAKE_ROOT:-}"
 BASE_FAKE_IMAGE_ROOT="${BASE_FAKE_IMAGE_ROOT:-}"   # fake: the container disk — a code tree the base must never adopt or scan
@@ -222,12 +228,14 @@ _base_confirm_yes(){ # failure-path question whose safe answer is yes: [Y/n] on 
 
 # ---------------------------------------------------------------- long steps: heartbeat, output only on failure
 _base_watch(){ # -q plus `| tail` emits nothing for minutes — a run that is working looks hung
-  local label="$1" pid="$2" t0 el sz
+  # 3.11.0: elapsed time only. The venv's size came from `du -sh` every minute, and on a network volume one du of a
+  # 45,000-file venv took 60 to 80 s (1.72 ms a stat, measured): it ran almost without pause beside uv, on the same mount.
+  local label="$1" pid="$2" t0 el
   t0=$(date +%s)
   while sleep 60; do
     kill -0 "$pid" 2>/dev/null || break
-    el=$(( $(date +%s) - t0 )); sz="$(du -sh "${VENV:-/nonexistent}" 2>/dev/null | cut -f1)"
-    printf '    … %s — %dm%02ds%s\n' "$label" "$((el/60))" "$((el%60))" "${sz:+, venv $sz}"
+    el=$(( $(date +%s) - t0 ))
+    printf '    … %s, %dm%02ds\n' "$label" "$((el/60))" "$((el%60))"
   done
 }
 _base_run_watched(){ # _base_run_watched <label> <cmd...> → the command's status; its output only when it fails
@@ -252,6 +260,8 @@ _base_on_err(){ # ERR trap: set -e is about to end the run — say where, and wh
 _base_on_exit(){
   local rc=$? d
   _base_install_unlock                               # 2.5.0: never leave a shared volume locked by a dead run
+  ! declare -F _base_models_early_stop >/dev/null || _base_models_early_stop || true   # 3.11.0: early downloads end with the run that started them (they resume)
+  ! declare -F _base_tools_stop >/dev/null || _base_tools_stop || true                 # 3.11.0: and so does the background tools venv
   for d in ${BASE_TMPDIRS[@]+"${BASE_TMPDIRS[@]}"}; do if [ -n "$d" ] && [ -d "$d" ]; then rm -rf "$d"; fi; done
   if [ "$rc" -ne 0 ] && [ "$BASE_SUMMARY_DONE" = "0" ] && [ -n "$BASE_LOG" ]; then echo "  aborted (exit $rc) — log: $BASE_LOG"; fi
   [ "$BASE_LOGGING" = "1" ] && sleep 0.3   # let tee flush the last lines
@@ -364,8 +374,9 @@ base_env_setup(){
   # fast path. HF_HUB_DISABLE_XET is cleared too in case an image sets it.
   unset HF_HUB_ENABLE_HF_TRANSFER HF_HUB_DISABLE_XET
   export HF_XET_HIGH_PERFORMANCE=1                                   # saturate the link, use every core
-  export HF_XET_NUM_CONCURRENT_RANGE_GETS="${BASE_XET_CONCURRENCY:-32}"   # upstream default 16; 32 saturates a pod link
-  export HF_XET_CHUNK_CACHE_SIZE_BYTES=0                             # one-shot pulls: a chunk cache can only cost a second write
+  # 3.11.0: HF_XET_NUM_CONCURRENT_RANGE_GETS ("no longer used: since hf_xet 1.3.0, download concurrency is controlled
+  # adaptively") and HF_XET_CHUNK_CACHE_SIZE_BYTES ("no longer has any effect") are gone (Hugging Face's environment
+  # variable reference). High performance mode is the setting that matters: up to 124 adaptive streams.
   export HF_HUB_DOWNLOAD_TIMEOUT=60 HF_HUB_DISABLE_UPDATE_CHECK=1 HF_HUB_DISABLE_TELEMETRY=1
   # Where the base lives and keeps its state. On a machine: <BASE_VOLUME>/comfy-base (the volume; /workspace unless told
   # otherwise). In fake mode: inside the fake root. Off-pod with neither: beside the library (a repo checkout running its own suite).

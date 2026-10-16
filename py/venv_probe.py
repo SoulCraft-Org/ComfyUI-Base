@@ -29,8 +29,9 @@ if want_backend and have_backend != want_backend:
     hard.append("torch is built for %s, the pick is %s" % (have_backend, want_backend))
 if want_sm:
     try:
-        if want_sm not in torch.cuda.get_arch_list():
-            hard.append("torch has no %s kernels for this GPU" % want_sm)
+        from arch_fit import covering                    # 3.11.0: a listed arch of the same family (or PTX) runs here too
+        if not covering(want_sm, torch.cuda.get_arch_list()):
+            hard.append("torch has no kernels that run on %s (this GPU)" % want_sm)
     except Exception as e:  # noqa: BLE001
         hard.append("arch list unavailable: %s" % e)
 have_t = torch.__version__.split("+")[0]

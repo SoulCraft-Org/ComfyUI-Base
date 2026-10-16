@@ -74,6 +74,8 @@ base_require_workflow(){ # the workflow beside the script must carry this script
 
 base_install(){ # the install, in the order the spec fixes; hooks run where a package declares them
   base_init
+  if _base_already_green; then _base_green_run; fi      # 3.11.0: this exact install is already on this store (lib/92-onepass.sh)
+  [ -z "$BASE_GREEN_WHY" ] || note "full install: $BASE_GREEN_WHY"
   # 3.0.0: the OS and the NVIDIA driver at their newest FIRST: they are the machine's, not the store's, so this runs
   # before the store's lock, and before the driver gate so an upgrade can lift a driver below DRIVER_MIN. A new driver
   # stops the run here, before anything touches the GPU: the machine must restart first (a person approves it).
@@ -111,6 +113,8 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     if [ "$src" = 10 ]; then base_summary; fi
     if ! _base_driver_gate; then base_summary; fi
   fi
+  _base_models_early_start || true     # 3.11.0: the model downloads run beside everything from here to the model stage
+  _base_tools_start || true            # 3.11.0: and JupyterLab's tools venv, joined at the BOOT stage
   base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)
   _base_hook pkg_pre_venv
   if ! base_venv; then err "the venv step failed — stopping before anything else changes"; base_summary; fi
@@ -120,6 +124,7 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
   base_packs pip || true
   base_mcp || true                     # the venv and the packs exist; models do not yet, and MCP needs none
   base_venv_latest || true             # 3.0.0: everything still behind is forced to its newest; the import check judges it
+  ! declare -F _base_run_prewarm >/dev/null || _base_run_prewarm || true   # 3.11.0: the local-runtime copy starts here (lib/84-run-local.sh, when present)
   fi
   if [ "${BASE_SEED:-0}" = "1" ]; then
     # 2.1.0: the template image's seed build (dockerize.py): the toolchain and the packs, never a model, a server or a suite
@@ -133,6 +138,7 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     base_summary
   fi
   _base_hook pkg_pre_models
+  _base_models_early_join || true      # 3.11.0: the early downloads, waited for and folded in; the model stage still judges every row
   base_models || true
   base_prune || true
   base_sync || true
@@ -317,7 +323,8 @@ base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Alw
   BASE_SUMMARY_DONE=1
   # 3.1.0: the verdict, kept, so `runtime-capture` can refuse a machine whose last install was not green
   if [ "$BASE_DRY" != "1" ] && [ -n "${BASE_STATE:-}" ] && [ -n "${PKG_ID:-}" ]; then
-    mkdir -p "$BASE_STATE/last-run" 2>/dev/null && { if [ "${#BASE_FAILED[@]}" -eq 0 ]; then echo "green $(_base_ts) $PKG_VERSION"; else echo "red $(_base_ts) $PKG_VERSION"; fi > "$BASE_STATE/last-run/$PKG_ID"; } 2>/dev/null || true
+    # 3.11.0: the base version and the GPU's arch follow, so a later run can tell this exact install is already in place
+    mkdir -p "$BASE_STATE/last-run" 2>/dev/null && { if [ "${#BASE_FAILED[@]}" -eq 0 ]; then echo "green $(_base_ts) $PKG_VERSION base=$BASE_VERSION sm=${BASE_GPU_SM:-} $(_base_green_fp)"; else echo "red $(_base_ts) $PKG_VERSION base=$BASE_VERSION sm=${BASE_GPU_SM:-}"; fi > "$BASE_STATE/last-run/$PKG_ID"; } 2>/dev/null || true
   fi
   # exit here, explicitly: a failing last command would trip the ERR trap and turn the contractual exit 1 into 4
   if [ "${#BASE_FAILED[@]}" -eq 0 ]; then exit 0; fi

@@ -43,6 +43,32 @@ repo and from the extracted zip; the counts are in the release commit's PR, Soul
 - runpod-template's image test reports `Dockerfile, seed-script.sh` stale against any base newer than its last
   regeneration; it moves with the `repos.txt` pin, not with this change.
 
+## 2. Model downloads beside the venv build (3.11.0)   (2026-10-16, two RunPod pods, both deleted)
+
+**Proven.** On RunPod, two fresh pods side by side (H100 80GB HBM3, EU-FR-1, bare `runpod/base` CUDA 13 image, network
+volume, MiniMax H3 Video Continuer 1.0.5, 41.1 GB of models, `podctl install --base --pkg … --no-gate --no-suite`):
+create to the workflow served through the public proxy, 3.9.2 1610 s, this branch 1471 s. The early pass downloaded all
+six files beside the venv (605 s at 70 MB/s; 304 MB/s alone), counted them once, and the join waited under a second.
+On this Mac and in CI: `suite/test_models_early.py` (the overlap really happens, what goes early, the count, an early
+failure fails by name with three attempts not six, the disk gate, the downloader's order, kill on exit, the pipeline's
+order, the fake-pod install both ways); the full suite green in CI.
+
+**How.** `podctl create` twice at once, `podctl install <pod> --base --pkg <dir> --no-gate --no-suite`, then the
+summary's clock (`state/logs/<pkg>_<ts>.timings.tsv`); `BASE_MODELS_FOREGROUND=1` for the old order on one machine.
+
+**Owed.** A package with more models than its venv takes to build (Krea 2, 124 GB; Video Replacer, 112 GB): the join
+then waits, and the gain is what downloaded during the venv. A B200 run. The early pass with the Hub session's
+parallel downloads (3.12.0) once both are in.
+
+**Found on the way** (sent to the platform orchestrator).
+- `podctl create --public` takes a data centre from the stock check that REST `POST /pods` refuses (its
+  `dataCenterIds` enum lacks US-NE-1, US-NC-2, US-PA-1), and one that takes no network volume (US-NC-1, US-MO-2,
+  EUR-IS-2). Both stop before billing.
+- The combo check's `cp -p` into `/tmp` printed "preserving permissions … Operation not supported" on the bare image.
+- Other serial steps that could overlap: the tools venv (JupyterLab, 45 s of BOOT) could build beside the main venv;
+  apt could overlap the downloads if the downloader did not need uv's bootstrap (python3-venv comes from apt); the
+  model index walk runs twice (early pass, model stage).
+
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port

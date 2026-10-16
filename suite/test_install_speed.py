@@ -76,7 +76,7 @@ def test_install_own_packs_are_mirrored_recorded_and_left_alone_when_unchanged(t
     assert "time " in r.stdout and "slowest first" in r.stdout
     # the same zip again: nothing on the store moves
     h = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
-    r = run_script(src / "stub-script.sh", fake_root=tmp_path)
+    r = run_script(src / "stub-script.sh", fake_root=tmp_path, env={"BASE_FULL": "1"})   # 3.11.0: the full pipeline again (without it the run is ALREADY INSTALLED)
     assert r.returncode == 0 and "ComfyUI-Stub-Own 1.0.0 unchanged" in r.stdout, r.stdout[-3000:]
     assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == h
     # a new release of the pack: mirrored, and the file it no longer ships is gone

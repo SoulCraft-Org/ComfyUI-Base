@@ -150,6 +150,44 @@ RestartSec=10
 WantedBy=multi-user.target
 "
 }
+# 3.11.0: the tools venv (JupyterLab) shares nothing with ComfyUI's venv, so it builds in the background from the same point
+# the model downloads start, and the BOOT stage joins it (145 s of a B200 pod's BOOT stage, measured 2026-10-16). Off in a
+# dry run and on a buyer's machine (both run base_boot_tools inline, as before), and with BASE_TOOLS_FOREGROUND=1.
+_BASE_TOOLS_PID=""; _BASE_TOOLS_DIR=""
+_base_tools_start(){ # → 0 when the tools venv now builds in the background
+  if [ "$BASE_DRY" = "1" ] || _base_runtime_on || [ "${BASE_TOOLS_FOREGROUND:-0}" = "1" ] || [ "${BASE_SEED:-0}" = "1" ]; then return 1; fi
+  if [ "$BASE_NO_NET" != "1" ] && ! _base_ensure_uv; then return 1; fi    # refreshed here, once: never a second refresh racing the venv's
+  _base_tmp; _BASE_TOOLS_DIR="$BASE_TMPD/tools-bg"; mkdir -p "$_BASE_TOOLS_DIR"
+  local dir="$_BASE_TOOLS_DIR" nc="${#BASE_CHANGED[@]}" nw="${#BASE_WARN[@]}"
+  (
+    trap - ERR EXIT; set +e
+    export TMPDIR="$dir"
+    t0="$SECONDS"; base_boot_tools
+    {
+      printf 'BASE_TOOLS_RESULT=%q\n' "${BASE_TOOLS_RESULT:-}"
+      printf '_t_changed=('; for x in ${BASE_CHANGED[@]+"${BASE_CHANGED[@]:$nc}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_t_warn=('; for x in ${BASE_WARN[@]+"${BASE_WARN[@]:$nw}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_t_secs=%q\n' "$(( SECONDS - t0 ))"
+    } > "$dir/vars.sh"
+  ) > "$dir/out" 2>&1 &
+  _BASE_TOOLS_PID=$!
+  return 0
+}
+_base_tools_join(){ # → 0 when a background build was joined (its output shown, its results in this run); 1 when there was none
+  [ -n "$_BASE_TOOLS_PID" ] || return 1
+  local _t_changed=() _t_warn=() _t_secs=0 x
+  wait "$_BASE_TOOLS_PID" 2>/dev/null || true
+  _BASE_TOOLS_PID=""
+  cat "$_BASE_TOOLS_DIR/out" 2>/dev/null || true
+  if [ ! -f "$_BASE_TOOLS_DIR/vars.sh" ]; then warn "tools venv: the background build ended without a result (output above)"; BASE_TOOLS_RESULT="failed (background)"; return 0; fi
+  . "$_BASE_TOOLS_DIR/vars.sh"
+  for x in ${_t_changed[@]+"${_t_changed[@]}"}; do BASE_CHANGED+=("$x"); done
+  for x in ${_t_warn[@]+"${_t_warn[@]}"}; do BASE_WARN+=("$x"); done
+  BASE_STAGE_TIMES+=("$_t_secs|TOOLS VENV (in the background)")
+  return 0
+}
+_base_tools_stop(){ [ -n "${_BASE_TOOLS_PID:-}" ] || return 0; _base_kill_tree "$_BASE_TOOLS_PID"; _BASE_TOOLS_PID=""; }
+
 base_boot_unit(){ # 2.2.0: the unit's text always lands beside boot.sh (what a person or a startup script installs); on a live
   # systemd host that is not RunPod it is installed and enabled too. RunPod (a container, no systemd) keeps its start command.
   local text unit="$BASE_HOME/comfy-base-boot.service" sys="/etc/systemd/system/comfy-base-boot.service" changed=0
@@ -187,7 +225,7 @@ base_boot_install(){ # boot.sh + lib/85-launch.sh on the volume (current copies)
   if [ "$psrc" != "$pdst" ] && ! { [ -f "$pdst" ] && cmp -s "$psrc" "$pdst"; }; then mkdir -p "$BASE_HOME/py" && cp "$psrc" "$pdst" && changed=1; fi
   if [ "$changed" = "1" ]; then ok "installed $dst (+ lib/85-launch.sh)"; BASE_CHANGED+=("boot: installed $dst"); else ok "boot.sh current at $dst"; fi
   base_boot_unit
-  base_boot_tools
+  _base_tools_join || base_boot_tools       # 3.11.0: built in the background since the venv stage, else here
   base_boot_env_write
   base_boot_apps
   base_launch_env_write
