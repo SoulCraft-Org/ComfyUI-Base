@@ -100,8 +100,13 @@ def test_unit_the_largest_download_starts_first_and_the_report_keeps_row_order(t
     r = _bash('MODELS=(%s); base_env_setup; base_discover quiet; base_models; echo DL=${#MODEL_DL[@]}' % " ".join('"%s"' % x for x in rows),
               env=_fake(tmp_path, BASE_FAKE_DL="real", BASE_FETCH_JOBS="2", PATH="%s:%s" % (bin_, os.environ["PATH"])))
     assert "DL=3" in r.stdout and "largest first" in r.stdout, r.stdout + r.stderr
-    starts = [l.split()[1] for l in log.read_text().splitlines()]
-    assert starts[0] == "big.safetensors", starts                            # the longest transfer never waits for a slot
+    # two slots: big and mid start together (their log lines can land in either order, error log row 77), and the
+    # smallest is the one that waits for a slot. By time, never by line order.
+    # only the downloads: since 3.12.0 the stub also logs the `hf cache verify --help` probe that follows each one
+    starts = sorted((float(l.split()[2]), l.split()[1]) for l in log.read_text().splitlines()
+                    if l.startswith("start") and l.split()[1].endswith(".safetensors"))
+    assert {n for _, n in starts[:2]} == {"big.safetensors", "mid.safetensors"} and starts[2][1] == "small.safetensors", starts
+    assert starts[2][0] - starts[1][0] >= 0.4, starts                       # it really waited for one of them to end
     out = r.stdout
     assert out.index("small.safetensors downloaded") < out.index("big.safetensors downloaded") < out.index("mid.safetensors downloaded")
 
