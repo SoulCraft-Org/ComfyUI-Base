@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.7.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.7.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -584,6 +584,12 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.7.1: `testbed.sh --server` picks the newest CPython minor the torch family resolves on, the follow-up 3.6.1 left
+  open. It still took the newest minor `uv python list` showed, 3.15, before torch had a cp315 wheel, so every fresh
+  testbed failed at "installing torch", and with it every consumer CI that provisions one (SoulCraft's package CI,
+  2026-10-16). Each candidate, newest first, is tried with `uv pip compile` of torch, torchvision and torchaudio
+  against the index the install uses; the first that resolves is the venv's Python (the newest as before when none
+  does, e.g. offline). Exercised in the session sandbox (picked 3.14) and by the consumer's CI.
 - 3.7.0: `podctl` reads the workspace shape too. 3.6.0 taught every package walker the workspace and left two readers
   on the submodule shape, as its record said: `podctl install --pkg <name>` from a workspace stopped with "not inside a
   brand repository", and the default provider ignored the workspace's `brand.toml` and fell back to runpod. Both now ask

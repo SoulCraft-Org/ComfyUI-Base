@@ -197,10 +197,18 @@ provision_source() {
 provision_server() {
   hdr "VENV + SERVER (CPU)"
   command -v uv >/dev/null || { warn "uv is not installed — needed to build the venv"; return 1; }
-  local mm have
-  mm="$(uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV | head -1)"
+  local mm have cands c
+  # 3.7.1: the newest CPython minor the torch family resolves on, the rule _base_python_pick follows since 3.6.1. "The
+  # newest uv lists" handed 3.15 to the venv before torch shipped a cp315 wheel, and every fresh testbed (and every
+  # package's CI, which provisions one) failed at "installing torch". The same index the install below uses (PyPI).
+  cands="$(uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV)"
+  mm=""
+  for c in $cands; do
+    if printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$c" - >/dev/null 2>&1; then mm="$c"; break; fi
+  done
+  [ -n "$mm" ] || mm="$(printf '%s\n' $cands | head -1)"      # nothing resolved (offline?): the newest, as before
   have="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
-  if [ -x "$VENV/bin/python" ] && [ -n "$mm" ] && [ "$have" != "$mm" ]; then note "the venv is Python $have, the newest is $mm: rebuilding it"; rm -rf "$VENV"; fi
+  if [ -x "$VENV/bin/python" ] && [ -n "$mm" ] && [ "$have" != "$mm" ]; then note "the venv is Python $have, the newest torch resolves on is $mm: rebuilding it"; rm -rf "$VENV"; fi
   if [ ! -x "$VENV/bin/python" ]; then
     note "creating a Python ${mm:-3} venv …"
     uv venv --python "${mm:-3}" "$VENV" >/dev/null
