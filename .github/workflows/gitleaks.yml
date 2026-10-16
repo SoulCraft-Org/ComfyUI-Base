@@ -1,0 +1,16 @@
+# Secrets anywhere in this repository's history: the organization's shared gitleaks job
+# (SoulCraft-Org/.github/.github/workflows/gitleaks.yml). A false positive goes in .gitleaksignore.
+name: gitleaks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    uses: SoulCraft-Org/.github/.github/workflows/gitleaks.yml@main

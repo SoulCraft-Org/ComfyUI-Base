@@ -1,0 +1,4 @@
+# gitleaks findings that are not secrets, by fingerprint (commit:file:rule:line).
+# suite/test_crusoe.py: the signing test's fixed fake key ("not a real credential").
+267242ec66d84cb263471ebefcc49b418ede74c7:suite/test_crusoe.py:generic-api-key:29
+267242ec66d84cb263471ebefcc49b418ede74c7:suite/test_crusoe.py:generic-api-key:267
