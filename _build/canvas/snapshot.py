@@ -19,6 +19,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "py"))
 from canvas import structure_sha, CHROME_LEFT, CHROME_TOP, FRONTEND_ONLY_TYPES, load_spec, package_files              # noqa: E402
+from comfy_settings import SEED                                                                                      # noqa: E402
 
 
 def ensure_browser():
@@ -33,6 +34,7 @@ SETTINGS = {                                                        # what the p
     "Comfy.TutorialCompleted": True, "Comfy.RightSidePanel.IsOpen": False, "Comfy.Minimap.Visible": False,
     "Comfy.Graph.CanvasInfo": False, "Comfy.EnableWorkflowViewRestore": True, "Comfy.UseNewMenu": "Top",
     "Comfy.ColorPalette": "dark", "Comfy.Workflow.WorkflowTabsPosition": "Topbar", "Comfy.Sidebar.Location": "left",
+    **SEED,                                                         # 3.17.1: what the base seeds on every machine (row 81)
 }
 
 JS_LOAD = """async (wf) => {
@@ -192,6 +194,38 @@ def console_summary(lines):
 
 
 def slug(s): return "".join(ch if ch.isalnum() else "-" for ch in s.lower()).strip("-")[:40]
+
+# 3.17.1 (error log row 81): ComfyUI_frontend v1.55.17's onboarding tour, by its own test ids. CoachmarkLanding.vue:
+# coach-landing-overlay (the full-screen scrim) around coach-landing (the "Welcome to Apps" card, "Start tutorial" / "Skip");
+# TourSpotlight.vue: coach-spotlight and coach-card (role=dialog, "Skip" / "Next" / "Done") for the later steps. Its own
+# browser_tests/tests/tour.spec.ts: the landing's "Skip" ends it and marks it seen, and so does Escape.
+COACH_IDS = ("coach-landing-overlay", "coach-landing", "coach-spotlight", "coach-card")
+JS_COACH_SHOWN = """(ids) => { for (const id of ids) { const el = document.querySelector(`[data-testid="${id}"]`);
+  if (el && el.getClientRects().length) return id; } return null; }"""
+JS_COACH_SKIP = """() => { for (const id of ['coach-landing', 'coach-card']) {
+  const box = document.querySelector(`[data-testid="${id}"]`); if (!box) continue;
+  const b = [...box.querySelectorAll('button')].find(x => x.textContent.trim() === 'Skip');
+  if (b) { b.click(); return id; } } return null; }"""
+
+
+def coach_tour(page, wait_ms=1500):
+    """None when no onboarding tour is on screen; else {"shown": <test id>, "dismissed": bool}, after clicking its exact
+    "Skip" (the landing's, else the step card's) or, failing that, pressing Escape. The packages' App-view drivers call
+    it instead of their own dismiss loops, and REPORT a result: on a server the base installed, or on the testbed, the
+    base seeds "Comfy.OnboardingCoachmarks.Seen", so a tour there means the seed missed (a renamed key, a new tour).
+    Only page.evaluate, page.wait_for_timeout and page.keyboard.press are used, so a fake page tests it."""
+    shown = None; waited = 0
+    while waited <= wait_ms:
+        shown = page.evaluate(JS_COACH_SHOWN, list(COACH_IDS))
+        if shown: break
+        page.wait_for_timeout(250); waited += 250
+    if not shown:
+        return None
+    if not page.evaluate(JS_COACH_SKIP):
+        page.keyboard.press("Escape")
+    page.wait_for_timeout(300)
+    return {"shown": shown, "dismissed": not page.evaluate(JS_COACH_SHOWN, list(COACH_IDS))}
+
 
 def route_settings(page):
     def handler(route):

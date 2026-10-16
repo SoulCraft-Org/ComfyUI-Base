@@ -340,6 +340,9 @@ start_server() {
   # a server with its own state folder gets its own temp folder too: ComfyUI empties its temp directory when it starts,
   # and two servers on one tree would empty each other's
   local tmpd=(); [ "$STATE" = "$HERE" ] || tmpd=(--temp-directory "$STATE")
+  # 3.17.1: the settings a customer machine has (the App Mode tour marked seen), so the stand-in serves the same form
+  local seed; seed="$(dirname "$BASE_SH")/py/comfy_settings.py"
+  if [ -f "$seed" ]; then note "$(python3 "$seed" "$COMFY/user/default/comfy.settings.json" 2>&1 || true) (comfy.settings.json)"; fi
   note "starting ComfyUI --cpu on port $PORT …"
   # nohup alone in the background, so $! is the pid python runs as (nohup execs it): the pid file names the server
   ( cd "$COMFY" || exit 1; nohup "$VENV/bin/python" main.py --cpu --port "$PORT" --disable-auto-launch ${tmpd[@]+"${tmpd[@]}"} \

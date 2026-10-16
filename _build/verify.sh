@@ -30,6 +30,13 @@
 #                        its pid file names the process on that port; anything else stops the gate with the reason
 #   VERIFY_SERVER=none   no server: the live checks skip
 #   BASE_SERVER=<h:p>    set by the caller: the caller's own choice, used as given
+#
+# Which suite runs (3.17.1):
+#   VERIFY_SUITE=both    (the default) steps 2 and 3: the full gate a maintainer runs before a commit
+#   VERIFY_SUITE=zip     CI's mode: step 3 first (the suite from the extracted zip, what ships), then from the repo
+#                        ONLY the tests that run skipped (they need the repo's own files: _build/, the testbed).
+#                        Every test runs once, none twice; the zip check still runs first.
+#   VERIFY_SUITE=repo    step 2 alone, the suite from the working tree
 set -uo pipefail
 BASE="$(cd "$(dirname "$0")/.." && pwd)"; UP="$(cd "$BASE/../.." && pwd)"
 # Fail closed: an empty answer is "no consumer root" (documented, printed below); a helper that is missing, crashes, or
@@ -40,6 +47,9 @@ ROOT="${CROOT:-$UP}"
 # One root is chosen and used whole, so the port file always comes from the same place as the tree.
 if [ -f "$BASE/testbed.sh" ]; then TB_ROOT="$BASE"; else TB_ROOT="$UP/base"; fi
 export BASE_NODE_SRC="${BASE_NODE_SRC:-$TB_ROOT/testbed}"
+SUITE_MODE="${VERIFY_SUITE:-both}"
+case "$SUITE_MODE" in both|zip|repo) ;; *) echo "── VERIFY_SUITE=$SUITE_MODE: it is both, zip or repo. NOT green"; exit 1;; esac
+[ "$SUITE_MODE" = both ] || echo "── suite: from the ${SUITE_MODE/zip/extracted zip} only (VERIFY_SUITE=$SUITE_MODE)"
 items=(); rc=0
 if [ "$#" -gt 0 ]; then for a in "$@"; do items+=("$ROOT/$a"); done
 else
@@ -105,6 +115,14 @@ _verify_failures(){ # <log>
   awk '/= (ERRORS|FAILURES) =/{p=1} /= short test summary info =/{p=0} p' "$1" | head -200 | sed 's/^/    /'
   awk '/= short test summary info =/{p=1} p' "$1" | head -40 | sed 's/^/    /'
 }
+# Step 2: the suite from the repository. BASE_ONLY_IDS (exported by the caller, or not) narrows it to those tests.
+_verify_repo_pass(){ # <dir> <name> [label]
+  local d="$1" name="$2" s
+  if [ "$d" = "$BASE" ]; then ( cd "$BASE" && bash base.sh test ) > /tmp/verify-$$.log 2>&1
+  else ( cd "$d" && COMFY_BASE="$BASE" bash "$name-script.sh" test ) > /tmp/verify-$$.log 2>&1; fi
+  s=$?; echo "  suite ${3:-}$(grep -E 'passed|failed' /tmp/verify-$$.log | tail -1 | sed 's/^ *//')"
+  [ $s -eq 0 ] || { echo "  FROM THE REPO: FAILED, the failing test(s):"; _verify_failures /tmp/verify-$$.log; rc=1; }   # every failing or errored test, whole
+}
 for d in "${items[@]}"; do
   name="$(basename "$d")"; echo "══ $name"
   if [ "$d" = "$BASE" ]; then zp="$BASE/comfyui-base.zip"
@@ -120,29 +138,30 @@ for d in "${items[@]}"; do
     python3 "$BASE/_build/package.py" "$d" --check 2>&1 | grep -E "stale|current|no zip" | sed 's/^/  zip   /'
     python3 "$BASE/_build/package.py" "$d" --check >/dev/null 2>&1 || { echo "  ZIP STALE: rebuild with package.py ${d#"$ROOT/"}"; rc=1; continue; }
   fi
-  # 2. from the repo
+  # 2. from the repo, and 3. from the zip, which is exactly what the pod and podctl's gate run. VERIFY_SUITE=zip (3.17.1)
+  # runs 3 first and then, from the repo, only the tests the zip run SKIPPED (py/basetest.py records them in
+  # BASE_SKIPPED_OUT and keeps only them under BASE_ONLY_IDS): a test that needs the repo's own files (_build/, the
+  # testbed) still runs, and nothing runs twice.
   if [ "$nosuite" = 1 ]; then
-    echo "  suite no suite, declared (PKG_NO_SUITE=1)"
-  else
-    if [ "$d" = "$BASE" ]; then ( cd "$BASE" && bash base.sh test ) > /tmp/verify-$$.log 2>&1
-    else ( cd "$d" && COMFY_BASE="$BASE" bash "$name-script.sh" test ) > /tmp/verify-$$.log 2>&1; fi
-    s=$?; echo "  suite $(grep -E 'passed|failed' /tmp/verify-$$.log | tail -1 | sed 's/^ *//')"
-    [ $s -eq 0 ] || { echo "  FROM THE REPO: FAILED, the failing test(s):"; _verify_failures /tmp/verify-$$.log; rc=1; }   # every failing or errored test, whole
+    echo "  suite no suite, declared (PKG_NO_SUITE=1)"; echo "  zip   no suite, declared (PKG_NO_SUITE=1)"; continue
   fi
-  # 3. from the zip — exactly what the pod and podctl's gate run
-  if [ "$nosuite" = 1 ]; then
-    echo "  zip   no suite, declared (PKG_NO_SUITE=1)"
+  [ "$SUITE_MODE" = zip ] || _verify_repo_pass "$d" "$name"
+  if [ "$SUITE_MODE" = repo ]; then echo "  zip   suite not run from the zip (VERIFY_SUITE=repo)"; continue; fi
+  t="$(mktemp -d)"; skipped=""
+  [ "$SUITE_MODE" = zip ] && { skipped="$t.skipped"; : > "$skipped"; }
+  if [ "$d" = "$BASE" ]; then
+    unzip -q "$zp" -d "$t" && ( cd "$t/comfyui-base" && BASE_SKIPPED_OUT="$skipped" bash base.sh test ) > /tmp/verifyz-$$.log 2>&1
   else
-    t="$(mktemp -d)"
-    if [ "$d" = "$BASE" ]; then
-      unzip -q "$zp" -d "$t" && ( cd "$t/comfyui-base" && bash base.sh test ) > /tmp/verifyz-$$.log 2>&1
-    else
-      mkdir -p "$t/$name" && unzip -q "$zp" -d "$t/$name" \
-        && ( cd "$t/$name" && COMFY_BASE="$BASE" bash "$name-script.sh" test ) > /tmp/verifyz-$$.log 2>&1
-    fi
-    z=$?; echo "  zip   $(grep -E 'passed|failed' /tmp/verifyz-$$.log | tail -1 | sed 's/^ *//')"
-    [ $z -eq 0 ] || { echo "  FROM THE ZIP: FAILED, this is what the pod would have said"; _verify_failures /tmp/verifyz-$$.log; rc=1; }   # every failing or errored test, whole
-    rm -rf "$t"
+    mkdir -p "$t/$name" && unzip -q "$zp" -d "$t/$name" \
+      && ( cd "$t/$name" && BASE_SKIPPED_OUT="$skipped" COMFY_BASE="$BASE" bash "$name-script.sh" test ) > /tmp/verifyz-$$.log 2>&1
+  fi
+  z=$?; echo "  zip   $(grep -E 'passed|failed' /tmp/verifyz-$$.log | tail -1 | sed 's/^ *//')"
+  [ $z -eq 0 ] || { echo "  FROM THE ZIP: FAILED, this is what the pod would have said"; _verify_failures /tmp/verifyz-$$.log; rc=1; }   # every failing or errored test, whole
+  rm -rf "$t"
+  if [ -n "$skipped" ]; then
+    if [ -s "$skipped" ]; then BASE_ONLY_IDS="$skipped" _verify_repo_pass "$d" "$name" "the $(sort -u "$skipped" | grep -c .) the zip skipped: "
+    else echo "  suite nothing to run from the repo: the zip run skipped no test"; fi
+    rm -f "$skipped"
   fi
 done
 rm -f /tmp/verify-$$.log /tmp/verifyz-$$.log

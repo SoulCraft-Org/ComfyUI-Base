@@ -226,9 +226,10 @@ base_test(){ # [tier] — the package's suite.py beside the script (the base's o
   # The suite gets the documented hand-over (BASE_WF … BASE_ON_POD, set below) and NO other BASE_* the run exported: the
   # rehearsal's fake step one leaked BASE_NO_NET / BASE_FAKE_ROOT into tests that build their own fake pods (2.0.16).
   # 3.6.0: BASE_WORKSPACE passes through when set: it is the consumer root py/pkgdirs.py walks in the workspace shape.
+  # 3.17.1: BASE_SKIPPED_OUT / BASE_ONLY_IDS pass through too: verify.sh's VERIFY_SUITE=zip (py/basetest.py).
   local _scrub=() _v
   for _v in $(env | sed -n 's/^\(BASE_[A-Za-z0-9_]*\)=.*/\1/p' | sort -u); do
-    case "$_v" in BASE_WF|BASE_SCRIPT|BASE_PKG_DIR|BASE_LIB|BASE_COMFY|BASE_VENV|BASE_STATE|BASE_MODELS_DIR|BASE_NODE_SRC|BASE_SERVER|BASE_ON_POD|BASE_WORKSPACE) ;; *) _scrub+=(-u "$_v");; esac
+    case "$_v" in BASE_WF|BASE_SCRIPT|BASE_PKG_DIR|BASE_LIB|BASE_COMFY|BASE_VENV|BASE_STATE|BASE_MODELS_DIR|BASE_NODE_SRC|BASE_SERVER|BASE_ON_POD|BASE_WORKSPACE|BASE_SKIPPED_OUT|BASE_ONLY_IDS) ;; *) _scrub+=(-u "$_v");; esac
   done
   local _errexit=0; case $- in *e*) _errexit=1;; esac; set +e      # pytest's OWN status, whatever the shell's options (2.0.14: tee's 0 once read as green)
   PYTHONPATH="$BASE_DIR/py${PYTHONPATH:+:$PYTHONPATH}" BASE_WF="${PKG_DIR:-}/${WF_NAME:-}" BASE_SCRIPT="${PKG_SCRIPT:-}" BASE_PKG_DIR="${PKG_DIR:-}" BASE_LIB="$BASE_DIR" \

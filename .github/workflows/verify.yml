@@ -1,7 +1,7 @@
 # The gate, on every push and pull request. Same command a maintainer runs before committing:
 #   1. comfyui-base.zip matches the working tree   (package.py --check)
-#   2. the suite, from the repository
-#   3. the suite, from the EXTRACTED ZIP           — what a pod actually runs
+#   2. the suite, from the EXTRACTED ZIP           (what a pod actually runs)
+#   3. from the repository, only the tests step 2 skipped (they need the repo's own files)
 #
 # No GPU here, and no provisioned testbed, so the gpu/runpod/comfyui tiers skip themselves by name.
 # What remains is every check that does not need hardware, which is the point: a fork gets the real
@@ -36,5 +36,9 @@ jobs:
         with:
           enable-cache: true
 
+      # 3.17.1: every test once. The zip's run first (what a pod runs), then from the repository only what it skipped (the
+      # repo-tooling tests). The base's suite skips every repo-only check, so this loses nothing (handbook §10, 3.17.1).
       - name: verify
+        env:
+          VERIFY_SUITE: zip
         run: bash _build/verify.sh
