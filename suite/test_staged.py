@@ -176,7 +176,7 @@ def test_unit_the_launch_is_detached_and_the_run_goes_on(tmp_path):
 def _stub_hf(tmp_path, delay="1"):
     bin_ = tmp_path / "bin"; bin_.mkdir(exist_ok=True); log = tmp_path / "times.log"
     (bin_ / "hf").write_text(
-        '#!/bin/bash\nf="$3"; d=""; while [ $# -gt 0 ]; do case "$1" in --local-dir) d="$2"; shift;; esac; shift; done\n'
+        '#!/bin/bash\n[ "$1" = cache ] && exit 0\nf="$3"; d=""; while [ $# -gt 0 ]; do case "$1" in --local-dir) d="$2"; shift;; esac; shift; done\n'
         'echo "start $f $(python3 -c "import time; print(time.time())")" >> "%s"; sleep %s\n'
         'mkdir -p "$d/$(dirname "$f")"; python3 - "$d/$f" <<"PY"\nimport sys\nsz={"a.safetensors":4096,"b.safetensors":4096,"c.safetensors":4096}\nopen(sys.argv[1],"wb").truncate(sz.get(sys.argv[1].rsplit("/",1)[-1],4096))\nPY\n'
         'echo "end $f $(python3 -c "import time; print(time.time())")" >> "%s"\n' % (log, delay, log))

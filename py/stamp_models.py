@@ -6,7 +6,7 @@
 The frontend's Missing Models dialog reads the top-level `models` array of a workflow (name, url, directory, optional
 hash + hash_type) and offers to download what the graph names, from the hosts it allows (huggingface.co among them).
 So every row with a URL becomes an entry: `name` is the file (a snapshot row's directory, with its trailing slash
-dropped), `url` the row's URL (hf://owner/repo → https://huggingface.co/owner/repo), `directory` the row's
+dropped), `url` the row's URL (hf://owner/repo → https://huggingface.co/owner/repo, @<commit> → …/tree/<commit>), `directory` the row's
 category/Family[/Purpose] path. LOCAL rows have no URL and are left out. 3.4.0: when the package carries
 models.sha256 (`base.sh gen-hashes`, from the Hub), each file it names gets hash + hash_type "SHA256"; without it no
 hash is written, exactly as before. Entries are sorted by name and the rest of the file is kept as it is:
@@ -67,7 +67,8 @@ def entries(script_text, sums=None):
         if url == "LOCAL" or not url:
             continue
         if url.startswith("hf://"):
-            url = "https://huggingface.co/" + url[len("hf://"):]
+            repo, _, rev = url[len("hf://"):].partition("@")        # 3.11.0: hf://owner/repo@<commit> is a pinned snapshot
+            url = "https://huggingface.co/" + repo + ("/tree/" + rev if rev else "")
         directory = "/".join(x for x in (cat, fam, purp) if x)
         name = file.rstrip("/")
         e = {"name": name, "url": url, "directory": directory}
