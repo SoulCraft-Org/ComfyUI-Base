@@ -802,6 +802,10 @@ for any invocation that somehow arrives without the environment. The suite asser
   run starts its own beside it; `VERIFY_SERVER=reuse` there saves that start. Tests: a real `--start`/`--owned`/`--stop`
   round with two run folders and a foreign `main.py` on the recorded port; `verify.sh`'s modes against a stand-in base;
   the runner refusing a foreign server.
+  Also in 3.16.0: a re-install that takes the "already installed" shortcut (3.11.0) prints the models line every run prints
+  (`models ok N in place · moved 0 · downloaded 0 · failed 0`). It printed only "install skipped", and every package's
+  install test, which reads "downloaded 0" from a second run, failed on the free CI runner (image-creator-flux-3-klein#6,
+  video-creator#6, photo-auditor#6). The second-run test now asserts the line.
 - 3.15.3: a failing suite's report keeps each failing test whole (2026-10-16). `_build/verify.sh` printed only 12 to 24
   lines of a failure, so a long assertion lost its cause in CI (it hid a Video Replacer failure's reason). It now prints
   pytest's ERRORS and FAILURES sections (each test's header, its `>` lines and its whole E block), capped at 200 lines,
