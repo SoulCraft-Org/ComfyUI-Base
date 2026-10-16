@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: The handbook
-    url: https://github.com/Soul-Craft/ComfyUI-Base/blob/main/comfyui-base-handbook.md
+    url: https://github.com/SoulCraft-Org/ComfyUI-Base/blob/main/comfyui-base-handbook.md
     about: Design rules, the per-host recipes, the package contract and the test tiers.
