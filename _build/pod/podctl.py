@@ -1294,10 +1294,15 @@ def env_pair(text):
     return (name, value)
 
 
-def install_run_env(args):
+def install_run_env(args, pod=None):
     """3.7.3: what `install` prefixes to every remote run: --env pairs in order (a later one wins), then --no-suite's
-    BASE_NO_SUITE=1, which also stops the base's own suite step (install() reads it from run_env)."""
+    BASE_NO_SUITE=1, which also stops the base's own suite step (install() reads it from run_env).
+    3.7.4: the machine's own BASE_LISTEN (a `create --private` pod sets 127.0.0.1) rides along unless --env names one:
+    an install restarts ComfyUI from an ssh shell, which does not see the pod's env, and would bind 0.0.0.0 there."""
     run_env = dict(getattr(args, "env", None) or [])
+    listen = ((pod or {}).get("env") or {}).get("BASE_LISTEN") if isinstance(pod, dict) else None
+    if listen and "BASE_LISTEN" not in run_env:
+        run_env["BASE_LISTEN"] = listen
     if getattr(args, "no_suite", False):
         run_env["BASE_NO_SUITE"] = "1"
     return run_env
@@ -1336,7 +1341,7 @@ def cmd_install(prov, args):
         print(write_host_env(prov))
         if getattr(args, "comfy_ref", None):
             print("comfyui ref %s (from --comfy-ref; this install only: the next one without it returns the store to the newest release)" % args.comfy_ref)
-        run_env = install_run_env(args)
+        run_env = install_run_env(args, pod)
         if run_env:
             print("env     every run on the machine gets: %s" % ", ".join(sorted(run_env)))
         env = dict(os.environ); env.setdefault("PODCTL_GATE_CACHE", str(pathlib.Path.home() / ".cache" / "podctl" / "gate"))
@@ -1573,6 +1578,9 @@ def cmd_create(prov, args):
     the user named (or the existing volume's) that has none stops here, before anything is created or billed."""
     _offered(prov, "create_machine", "availability")
     loc, volume, spot = args.location, getattr(args, "volume", None), " (spot)" if args.spot else ""
+    private = bool(getattr(args, "private", False))
+    if private and volume:
+        raise PodctlError("--private cannot use --volume: RunPod cannot encrypt a network volume; --private makes an encrypted pod volume of --data-gb")
     if volume:
         _offered(prov, "volume_location")                # 3.7.3: reuse an existing volume (RunPod); its data centre is fixed
         vloc = prov.volume_location(volume)
@@ -1591,7 +1599,7 @@ def cmd_create(prov, args):
         return 1
     loc = loc or locs[0]
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
-    extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None))) if v}
+    extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private)) if v}
     import inspect
     takes = inspect.signature(prov.create_machine).parameters
     for k in extra:
@@ -1599,7 +1607,8 @@ def cmd_create(prov, args):
             raise PodctlError("--%s: not offered by host %s" % (k.replace("_", "-"), getattr(prov, "name", "?")))
     pod_id = prov.create_machine(args.name, args.gpu, loc, args.data_gb, os_gb=args.os_gb, pubkey=pub, spot=args.spot,
                                  wait=not args.no_wait, ssh_config=args.ssh_config, **extra)
-    print("next: podctl ensure %s · podctl install %s --base --pkg <dir> (or buyer-install with --runtime and the zips)" % (pod_id, pod_id))
+    print("next: podctl ensure %s · podctl install %s --base --pkg <dir> (or buyer-install with --runtime and the zips)%s" % (
+        pod_id, pod_id, (" · podctl tunnel %s, then ComfyUI is http://localhost:8188" % pod_id) if private else ""))
 
 
 def cmd_pause(prov, args):
@@ -1712,6 +1721,8 @@ def build_parser():
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: read from the image tag)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
+    p.add_argument("--private", action="store_true", help="RunPod: an ENCRYPTED pod volume of --data-gb (network volumes cannot be "
+                   "encrypted), ports 22/tcp only (no proxy URL, no JupyterLab), ComfyUI on loopback: reach it with podctl tunnel")
     p.add_argument("--spot", action="store_true"); p.add_argument("--no-wait", dest="no_wait", action="store_true")
     p = sub.add_parser("pause", help="delete the instance and keep its disks (the same as stop --wait): only storage bills"); p.add_argument("pod")
     p = sub.add_parser("put-away", help="copy output/ and input/ to this Mac; with --yes, then delete the machine and its disks (to the trash)")

@@ -52,6 +52,15 @@ ones that have it, before anything is created. Then a network volume of `--data-
 `--wait` is the default (until sshd answers, then `Host runpod` → the new pod); then `podctl ensure <pod>`. `create` bills:
 a consumer's guard hook prompts for it like `deploy`.
 
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 --private
+
+`--private` (3.7.4): an **encrypted pod volume** of `--data-gb` at `/workspace` (`volumeInGb` + `volumeEncrypted`; RunPod
+cannot encrypt a network volume or a container disk, so `--volume` is refused), `22/tcp` the only port (no proxy URL, no
+JupyterLab), and `BASE_LISTEN=127.0.0.1` in the pod's env so ComfyUI binds loopback; `podctl tunnel <pod>` is the way in
+(http://localhost:8188), and `install` carries that `BASE_LISTEN` into its runs. `volumeEncrypted` is in no documented
+create input, so the pod is read back: one that came back unencrypted is deleted at once and the run fails; one whose
+answer does not say is kept and named. The volume is the machine's: kept across stop/start, deleted with the pod.
+
 ## tunnel
 
     uv run "base/comfyui-base/_build/pod/podctl.py" tunnel <pod> [--port 8188] [--port 8888]

@@ -51,6 +51,8 @@ class FakeRunPod:
         self.on_patch = None
         self.gql = gql or {}                              # 3.7.3: what POST /graphql answers under "data"
         self.refuse_pods = False                          # 3.7.3: POST /pods answers 400 (sold out between check and create)
+        self.pod_override = {}                            # 3.7.4: what RunPod changes on the created pod (volumeEncrypted false)
+        self.pod_drop = ()                                # 3.7.4: keys the created pod's answer leaves out
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -107,6 +109,9 @@ class FakeRunPod:
                     if srv.refuse_pods:
                         return self._send(400, {"error": "There are no longer any instances available with the requested specifications."})
                     srv.pod = dict(body, id="newpod0000001", desiredStatus="RUNNING", publicIp="127.0.0.1", portMappings={"22": 15270})
+                    srv.pod.update(srv.pod_override)
+                    for k in srv.pod_drop:
+                        srv.pod.pop(k, None)
                     return self._send(201, srv.pod)
                 if self.path.endswith("/stop"):
                     srv.pod["desiredStatus"] = "EXITED"
@@ -1781,3 +1786,57 @@ def test_unit_podctl_install_no_suite_and_env_reach_every_run_on_the_machine(tmp
     assert len(selfs) == 1 and len(pre) == 1 and len(runs) == 1, io.cmds
     for c in selfs + pre + runs:
         assert "BASE_NO_SUITE=" in c and "FOO=" in c and "bar baz" in c, c
+
+
+
+# ---------------------------------------------------------------- 3.7.4: create --private
+
+def test_unit_runpod_create_private_is_an_encrypted_pod_volume_behind_ssh_only(tmp_path, capsys):
+    """--private: RunPod cannot encrypt a network volume ("Encryption applies only to volume disk"), so the volume is an
+    encrypted POD volume; 22/tcp is the only port (no proxy URL, no JupyterLab) and ComfyUI binds loopback, reached
+    through `podctl tunnel`. volumeEncrypted is in no documented create input, so the pod is read back and believed."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    try:
+        # a network volume cannot be encrypted: refused before any call
+        with pytest.raises(podctl.PodctlError) as e:
+            _create(podctl, srv, pub, "--private", "--volume", "oldvol")
+        assert "cannot encrypt a network volume" in str(e.value) and srv.posts == [] and srv.gets == []
+        assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
+        out = capsys.readouterr().out
+        assert srv.posts == ["/graphql", "/pods"], srv.posts                   # no network volume is made
+        body = srv.bodies[-1][1]
+        assert "networkVolumeId" not in body and body["volumeInGb"] == 200 and body["volumeEncrypted"] is True
+        assert body["ports"] == ["22/tcp"] and body["cloudType"] == "SECURE" and body["volumeMountPath"] == "/workspace"
+        assert body["env"] == {"PUBLIC_KEY": "ssh-ed25519 AAAAMAC mac@key", "BASE_LISTEN": "127.0.0.1"}
+        assert not any(k.startswith("JUPYTER") for k in body["env"])
+        assert any("includeNetworkVolume=true" in g for g in srv.gets if g.startswith("/pods/newpod0000001")), srv.gets
+        assert "ENCRYPTED pod volume 200 GB" in out and "podctl tunnel newpod0000001" in out and "localhost:8188" in out, out
+        # status names it, and says JupyterLab is not exposed rather than "anyone with the URL"
+        facts = podctl.pod_facts(srv.pod)
+        assert "encrypted pod volume 200 GB at /workspace" in facts and "jupyter    not exposed" in facts and "auth: NONE" not in facts, facts
+        # RunPod ignored the flag: the seconds-old pod is deleted, and the run fails loudly
+        srv.pod_override = {"volumeEncrypted": False}; srv.deletes.clear()
+        with pytest.raises(podctl.PodctlError) as e:
+            _create(podctl, srv, pub, "--private", "--data-gb", "200")
+        assert "NOT encrypted" in str(e.value) and srv.deletes == ["/pods/newpod0000001"], (str(e.value), srv.deletes)
+        # the answer does not say: kept (nothing to judge by), named, and the run stops
+        srv.pod_override = {}; srv.pod_drop = ("volumeEncrypted",); srv.deletes.clear()
+        with pytest.raises(podctl.PodctlError) as e:
+            _create(podctl, srv, pub, "--private", "--data-gb", "200")
+        assert "does not say" in str(e.value) and srv.deletes == []
+    finally:
+        srv.close()
+
+
+def test_unit_install_keeps_a_private_pods_loopback_listen():
+    """An install restarts ComfyUI from an ssh shell, which does not see the pod's env: without this a --private pod's
+    ComfyUI would come back on 0.0.0.0 after every install. An explicit --env still wins."""
+    podctl = _load()
+    pod = {"env": {"PUBLIC_KEY": "k", "BASE_LISTEN": "127.0.0.1"}}
+    a = podctl.build_parser().parse_args(["install", "pod1", "--pkg", "x"])
+    assert podctl.install_run_env(a, pod) == {"BASE_LISTEN": "127.0.0.1"}
+    assert podctl.install_run_env(a, {"env": {}}) == {} and podctl.install_run_env(a, None) == {}
+    a = podctl.build_parser().parse_args(["install", "pod1", "--pkg", "x", "--env", "BASE_LISTEN=0.0.0.0"])
+    assert podctl.install_run_env(a, pod) == {"BASE_LISTEN": "0.0.0.0"}

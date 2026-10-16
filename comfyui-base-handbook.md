@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.7.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.7.4.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -201,6 +201,7 @@ it rides a bearer header and is never printed.
 uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>     # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
 uv run "base/comfyui-base/_build/pod/podctl.py" deploy --like <pod> --wait   # a NEW pod cloned onto the same volume (rule 11's redeploy rung)
 uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500   # a first pod: stock check, network volume, Secure Cloud pod
+uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 --private   # encrypted pod volume, 22/tcp only, ComfyUI via podctl tunnel
 uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg <dir> --no-suite --env KEY=VALUE   # BASE_NO_SUITE=1 and KEY on every run on the machine
 uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>     # 22/tcp · PUBLIC_KEY = the Mac key · the start command · Host runpod · state/host.env
 uv run "base/comfyui-base/_build/pod/podctl.py" upload <zip>...  # to /workspace/packages, size + sha256 checked both sides
@@ -590,6 +591,14 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.7.4: `podctl create --private` (RunPod), for work that must not be reachable from a URL: an encrypted pod volume of
+  `--data-gb` (RunPod encrypts only a pod's volume disk, never a network volume, so `--volume` is refused), `22/tcp` the
+  only port (no proxy URL, no JupyterLab), and `BASE_LISTEN=127.0.0.1` in the pod's env so ComfyUI binds loopback;
+  `podctl tunnel` is the way in, and `install` carries the pod's `BASE_LISTEN` into its runs (an ssh shell does not see
+  the pod's env, so an install's restart would have bound 0.0.0.0). `volumeEncrypted` is in no documented create input,
+  so the pod is read back: unencrypted is deleted at once and fails, an answer without the field is kept and fails.
+  `status` says "encrypted pod volume", and "jupyter not exposed" for a pod without 8888/http. Exercised on this Mac
+  against the suite's fake RunPod; the encryption field has not yet been sent to the live API.
 - 3.7.3: `podctl create` on RunPod, the volume a pod really has, and `install --no-suite` / `--env`. A first pod on a
   fresh account needed the console or runpodctl, because RunPod had only `deploy --like <pod>`; `create` now checks
   stock first (GraphQL `dataCenters`, the only stock view RunPod has) and names every data centre where the GPU is free,

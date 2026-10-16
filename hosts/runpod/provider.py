@@ -178,8 +178,8 @@ def volume_line(pod):
         extra = ", ".join(x for x in (("%d GB" % v["size"]) if v["size"] is not None else "", v["dc"]) if x)
         return "network volume %s%s at %s" % (v["id"], (" (%s)" % extra) if extra else "", at)
     if v["kind"] == "pod":
-        return ("pod volume %d GB at %s (this machine's disk: kept across stop/start, deleted with the pod, "
-                "not shareable by deploy --like)" % (v["size"], at))
+        return ("%spod volume %d GB at %s (this machine's disk: kept across stop/start, deleted with the pod, "
+                "not shareable by deploy --like)" % ("encrypted " if pod.get("volumeEncrypted") else "", v["size"], at))
     return "NONE at %s" % at
 
 
@@ -212,7 +212,9 @@ def pod_facts(pod):
     ]
     for name, verdict in env_verdicts(env).items():
         lines.append("env        %-22s %s" % (name, verdict))
-    if not (env.get("JUPYTER_TOKEN") or env.get("JUPYTER_PASSWORD")):
+    if "8888/http" not in (pod.get("ports") or []):
+        lines.append("jupyter    not exposed (no 8888/http port): podctl tunnel reaches the machine's own ports")
+    elif not (env.get("JUPYTER_TOKEN") or env.get("JUPYTER_PASSWORD")):
         lines.append("jupyter    auth: NONE: anyone with the URL gets a terminal; set JUPYTER_TOKEN (or JUPYTER_PASSWORD)")
     return "\n".join(lines)
 
@@ -512,6 +514,7 @@ def record_volume(api, pod, env=None):
 
 STOCK_QUERY = "query { dataCenters { id name location gpuAvailability { gpuTypeId stockStatus available } } }"
 CREATE_PORTS = ["8188/http", "8888/http", "22/tcp"]      # ComfyUI and JupyterLab through the proxy, sshd on a public port
+PRIVATE_PORTS = ["22/tcp"]                               # 3.7.4 --private: sshd only; ComfyUI is reached through `podctl tunnel`
 CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
 
 
@@ -545,20 +548,29 @@ def allowed_cuda(floor):
     return [v for v in CUDA_VERSIONS if key(v) >= key(floor)]
 
 
-def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False):
+def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
     data centre, the three ports, PUBLIC_KEY, the CUDA floor. No templateId and no start command: `ensure` installs the
-    base's boot guard from the image's own entry, as for every other pod."""
+    base's boot guard from the image's own entry, as for every other pod.
+    3.7.4 private_gb: an ENCRYPTED POD VOLUME of that size instead (RunPod: "Encryption applies only to volume disk.
+    Container disk and network volumes cannot be encrypted."), 22/tcp the only port (no proxied HTTP), and
+    BASE_LISTEN=127.0.0.1 so ComfyUI binds loopback and is reached through `podctl tunnel` alone."""
     body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
             "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
+    if private_gb:
+        # volumeEncrypted is on REST v1's Pod ("can only be set when creating a Pod") but in neither documented create
+        # input, so create() reads the pod back and believes only what comes back
+        del body["networkVolumeId"]
+        body.update({"volumeInGb": int(private_gb), "volumeEncrypted": True, "ports": list(PRIVATE_PORTS),
+                     "env": {"PUBLIC_KEY": pubkey.strip(), "BASE_LISTEN": "127.0.0.1"}})
     if cuda:
         body["allowedCudaVersions"] = list(cuda)
     return body
 
 
 def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_gb=100, pubkey=None, min_cuda=None, spot=False,
-           wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print):
+           wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print, private=False):
     """A pod from nothing: a network volume of `data_gb` in `dc` (or the existing `volume`), then the pod on it. A refused
     pod (sold out between the stock check and the create) takes a volume THIS call made with it, so nothing is left
     billing; an existing volume is never deleted. With wait: until sshd answers, then `Host runpod` -> the new pod.
@@ -570,6 +582,9 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     if not pubkey:
         raise PodctlError("no public key for PUBLIC_KEY: pass --pubkey <file.pub>")
     cuda = allowed_cuda(cuda_floor(image, min_cuda))
+    if private:
+        return _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep,
+                               banner, ssh_config, say)
     made = None
     if volume:
         vid = volume
@@ -592,6 +607,55 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · network volume %s at %s · ports %s · CUDA %s%s" % (
         pod_id, name, image, gpu, dc, int(container_gb), vid, VOLUME_ROOT, " ".join(CREATE_PORTS),
         (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
+    if not wait:
+        return pod_id
+    pod = wait_for(api, pod_id, lambda p: p.get("desiredStatus") == "RUNNING" and p.get("publicIp") and (p.get("portMappings") or {}).get("22"),
+                   "RUNNING with port 22 mapped", sleep, tries=120)
+    host, port = pod["publicIp"], int(pod["portMappings"]["22"])
+    for _ in range(120):
+        if banner(host, port):
+            break
+        sleep(5)
+    else:
+        raise PodctlError("created %s, but sshd never answered on %s:%d: does the image run sshd from PUBLIC_KEY? "
+                          "podctl ensure %s wraps its start command" % (pod_id, host, port, pod_id))
+    write_ssh_config(ssh_config or pathlib.Path.home() / ".ssh" / "config", host, port)
+    say("  ssh answers on %s:%d (Host %s -> %s)" % (host, port, _c().SSH_ALIAS, pod_id))
+    return pod_id
+
+
+def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep, banner, ssh_config, say):
+    """3.7.4 `create --private`: an encrypted pod volume, sshd only, ComfyUI on loopback. Read back after the create: a pod
+    that came back UNENCRYPTED is deleted at once (seconds old, nothing written), so the flag can never silently mean less
+    than it says; a pod whose answer does not say is kept and named, and the run stops."""
+    if volume:
+        raise PodctlError("--private cannot use --volume: RunPod cannot encrypt a network volume (only a pod's volume "
+                          "disk); --private makes an encrypted pod volume of --data-gb")
+    if not data_gb:
+        raise PodctlError("--private needs --data-gb N: the size of the encrypted pod volume at %s" % VOLUME_ROOT)
+    body = create_body(name, gpu, dc, None, image, container_gb, pubkey, cuda=cuda, spot=spot, private_gb=data_gb)
+    pod_id = api.post("/pods", body)["id"]
+    back = api.get("/pods/%s%s" % (pod_id, POD_READ))
+    enc = back.get("volumeEncrypted")
+    if enc is False:
+        try:
+            api.delete("/pods/%s" % pod_id)
+            gone = "deleted again (nothing written, nothing left billing)"
+        except Exception as e:
+            gone = "COULD NOT be deleted (%s): terminate it in the console" % e
+        raise PodctlError("RunPod created %s with its volume NOT encrypted (volumeEncrypted false on the read-back): %s. "
+                          "Encryption could not be requested through this API; use the console's Encrypt volume box" % (pod_id, gone))
+    if enc is not True:
+        raise PodctlError("created %s, but the API's answer does not say whether its volume is encrypted (no volumeEncrypted): "
+                          "it is kept; check it in the console before putting anything on it" % pod_id)
+    ports = back.get("ports") or body["ports"]
+    if sorted(ports) != sorted(PRIVATE_PORTS):
+        say("  !! %s came back with ports %s, not %s" % (pod_id, " ".join(ports), " ".join(PRIVATE_PORTS)))
+    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · ENCRYPTED pod volume %d GB at %s · ports %s only · "
+        "ComfyUI on loopback · CUDA %s%s" % (pod_id, name, image, gpu, dc, int(container_gb), int(data_gb), VOLUME_ROOT,
+                                              " ".join(PRIVATE_PORTS), (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
+    say("  private: no proxy URL and no JupyterLab; ComfyUI is http://localhost:8188 through podctl tunnel %s. The volume is "
+        "this machine's (kept across stop/start, deleted with the pod)." % pod_id)
     if not wait:
         return pod_id
     pod = wait_for(api, pod_id, lambda p: p.get("desiredStatus") == "RUNNING" and p.get("publicIp") and (p.get("portMappings") or {}).get("22"),
@@ -691,8 +755,8 @@ class RunPodProvider(Provider):
         return v["dataCenterId"]
 
     def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True,
-                       ssh_config=None, say=print, volume=None, min_cuda=None):
+                       ssh_config=None, say=print, volume=None, min_cuda=None, private=False):
         if not pubkey:
             pubkey = _c().mac_public_key(None)
         return create(self.api, name, gpu, location, data_gb=data_gb, volume=volume, image=image, container_gb=os_gb, pubkey=pubkey,
-                      min_cuda=min_cuda, spot=spot, wait=wait, ssh_config=ssh_config, say=say)
+                      min_cuda=min_cuda, spot=spot, wait=wait, ssh_config=ssh_config, say=say, private=private)

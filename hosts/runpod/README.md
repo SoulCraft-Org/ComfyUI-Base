@@ -80,6 +80,17 @@ one; `POST /pods` with `cloudType SECURE`, `dataCenterIds` [that one], the netwo
 installs the boot guard as for every pod. A refused pod (sold out between the check and the create) deletes the volume
 the same call made, so nothing is left billing. `create` is a billable verb: a consumer's guard hook prompts for it.
 
+`create --private` (3.7.4) is the shape for work that must not be reachable from a URL. RunPod's storage docs: "Encryption
+applies only to volume disk. Container disk and network volumes cannot be encrypted." So it makes an encrypted POD volume
+(`volumeInGb` = `--data-gb`, `volumeEncrypted: true`) instead of a network volume and refuses `--volume`; exposes `22/tcp`
+only; sets `BASE_LISTEN=127.0.0.1` in the pod's env (boot reads it; `install` passes it to its runs) so ComfyUI listens on
+loopback; sets no Jupyter token, so the base starts no JupyterLab. `podctl tunnel <pod>` forwards 8188 to
+`127.0.0.1:8188` on the pod. `volumeEncrypted` appears on REST v1's Pod ("can only be set when creating a Pod") but in
+neither documented create input (REST `PodCreateInput`, GraphQL `podFindAndDeployOnDemand`; runpodctl v3 has no flag
+for it), so `create` reads the pod back: `false` deletes the seconds-old pod and fails, an answer without the field is
+kept, named, and fails. The trade: the data lives on that machine (stop/start keeps it, terminate deletes it, and a
+start can wait for that machine's GPU).
+
 ## The two shapes of a pod's volume
 
 REST v1 has answered with a top-level `networkVolumeId` (pods read on 2026-09-05) and, in its current openapi, names
