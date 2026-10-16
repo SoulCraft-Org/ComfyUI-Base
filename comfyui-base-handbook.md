@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.15.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.15.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -63,7 +63,9 @@ run once per machine as **step one**; then each workflow package is **step two**
    empty is copied again. Anything short of a good copy (no room for it plus 4 GiB, an unreadable file, the check
    failing) says why on one line and runs from the volume, as before. `BASE_LOCAL_RUN=auto` is on for RunPod when the
    volume's filesystem is a network one (`fuse`, `nfs`, …; `/proc/self/mountinfo`); `1` forces it on any host, `0`
-   turns it off. The boot starts the copy first thing, in the background beside sshd, JupyterLab and the extensions
+   turns it off. `BASE_RUN_TWIN=<twin>=<source>` (3.15.1, off by default; a template pod sets `/opt/comfy-seed=/workspace`)
+   names a local twin of what the volume holds: a file whose twin has its size and an mtime within one second is copied
+   from the twin on the container disk instead of read back over the network. The boot starts the copy first thing, in the background beside sshd, JupyterLab and the extensions
    (`boot_prewarm`), and `_base_run_prewarm` gives an install the same head start; the start that follows waits on the
    copy's lock. A start that runs from the volume after all has the volume's code read 64 files at a time in the
    background beside it (`run_local.py warm`, network filesystems only). MEASURED before, on RunPod network volumes:
@@ -776,6 +778,17 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.15.1: the copy reads from a local twin where it has one (2026-10-16, runpod-template-prebuilt's review). On a
+  template pod's first boot every file crossed the network volume twice: the image's seed (`/opt/comfy-seed`) rsynced
+  onto the volume, then read back from it for the container-disk copy. `BASE_RUN_TWIN=/opt/comfy-seed=/workspace`
+  (the template sets it; the pod's env, or PID 1's for an install over ssh; comma-separated pairs) makes `run_local.py`
+  copy a file from its twin when the twin is a regular file of the same size with an mtime within one second (rsync -a
+  keeps both; a FUSE volume may keep a coarser clock), and from the volume otherwise. The walk still stats the volume,
+  so what an install changed since the seed is read from the volume; the copy keeps the volume's mtime, so the next sync
+  compares against the volume. Default off: nothing changes for a pod without a twin. The copy's line and
+  `.run-local.json` count what came from the twin. Proven on this Mac (a hit reads the twin's bytes, an older or resized
+  twin reads the volume, a missing twin copies as before, the shell passes it from its env or PID 1's); NOT YET RUN ON A
+  POD (no RunPod credit on 2026-10-16).
 - 3.15.0: ComfyUI runs from a copy of its code on the machine's own disk, and a first install starts ComfyUI once, not
   twice (2026-10-16). Why: on a RunPod network volume every file access is a FUSE round trip, and the install's import
   check MEASURED 5+ minutes at near-zero CPU (the Video Swapper; 262 of 265 threads on futexes, one in

@@ -2,7 +2,7 @@
 """ComfyUI's code on the machine's own disk (3.15.0): the volume stays the truth, the server runs from a local copy.
 
     run_local.py sync --root R --tree COMFY --venv VENV --state STATE [--python-root P] [--jobs N] [--big BYTES]
-                      [--headroom BYTES] [--auto] [--check-import MOD]
+                      [--headroom BYTES] [--auto] [--check-import MOD] [--twin TWIN=SOURCE[,TWIN=SOURCE]]
     run_local.py warm --tree COMFY --venv VENV [--python-root P] [--jobs N] [--big BYTES] [--auto]
                                       read every file the copy would hold, in parallel, so the volume's own page cache
                                       has it: what a start from the VOLUME (no copy) imports then reads from memory
@@ -25,6 +25,13 @@ incremental sync costs one parallel stat walk plus the bytes that changed, and n
 generation a server may be running from. The venv's own paths are rewritten in the copy (bin/ symlinks, pyvenv.cfg,
 shebangs, *.pth, editable finders), and the copy's python must import --check-import with sys.prefix inside the
 generation before `R/current` points at it.
+
+A LOCAL TWIN (3.15.1, --twin, BASE_RUN_TWIN in the shell). A template pod's image carries the seed on the container
+disk (/opt/comfy-seed) and its first boot rsyncs it onto the volume, so the very same files would then cross the network
+volume twice: written there, and read back for the copy. With `--twin /opt/comfy-seed=/workspace`, a file whose twin
+(the same path under /opt/comfy-seed) is a regular file of the same size and an mtime within one second (rsync -a keeps
+both; a FUSE volume may keep mtimes coarser than the container disk) is copied FROM THE TWIN; the volume is read only
+for what changed since. The walk still stats the volume, so a changed file is never served stale.
 
 FRESH WITHOUT A WALK. The fingerprint is state/run.gen (the install bumps it whenever the code may have changed) plus
 the mtimes of the tree, custom_nodes and each pack folder, extra_model_paths.yaml, the venv, its stamp, pyvenv.cfg and
@@ -352,13 +359,42 @@ class Relocator:
         return self.rx.sub(lambda m: self.local(m.group(1)) if self.plan.mapped(m.group(1).rstrip("/")) else m.group(1), s)
 
 
-def build(plan, entries, gdir, prev, prev_rows, jobs):
-    """Make the generation: dirs, then files and links in parallel. Returns (copied files, copied bytes, linked)."""
+class Twins:
+    """`TWIN=SOURCE[,TWIN=SOURCE]`: a source path's twin is the same path under TWIN. Only pairs whose TWIN is a directory."""
+
+    def __init__(self, spec):
+        self.pairs = []
+        for item in (spec or "").split(","):
+            t, sep, src = item.strip().partition("=")
+            t, src = t.rstrip("/"), src.rstrip("/")
+            if sep and t and src and os.path.isdir(t):
+                self.pairs.append((src, t))
+        self.pairs.sort(key=lambda x: -len(x[0]))
+
+    def find(self, p, size, mt):
+        """The twin to read p from, or '' (no pair covers p, no twin there, or it differs in size or mtime)."""
+        for src, t in self.pairs:
+            if p == src or p.startswith(src + "/"):
+                tp = t + p[len(src):]
+                try:
+                    st = os.lstat(tp)
+                except OSError:
+                    return ""
+                if stat.S_ISREG(st.st_mode) and st.st_size == size and abs(st.st_mtime_ns - mt) < 1_000_000_000:
+                    return tp
+                return ""
+        return ""
+
+
+def build(plan, entries, gdir, prev, prev_rows, jobs, twins=None):
+    """Make the generation: dirs, then files and links in parallel. Returns the counts (copied from the volume and bytes,
+    copied from a local twin and bytes, linked from the previous generation)."""
     rel = Relocator(plan, gdir)
     dirs = sorted((p for p, e in entries.items() if e[0] == "d"), key=lambda p: p.count("/"))
     for p in dirs:
         os.makedirs(rel.local(p), exist_ok=True)
-    counts = {"copied": 0, "bytes": 0, "linked": 0}
+    counts = {"copied": 0, "bytes": 0, "linked": 0, "twin": 0, "twin_bytes": 0}
+    twins = twins or Twins("")
 
     def one(p):
         kind, size, mt, mode, link = entries[p]
@@ -376,12 +412,13 @@ def build(plan, entries, gdir, prev, prev_rows, jobs):
                     return "linked", 0
                 except OSError:
                     pass                                             # gone or another device: copy it
-            shutil.copyfile(p, dst)
+            tw = twins.find(p, size, mt)
+            shutil.copyfile(tw or p, dst)
             os.chmod(dst, mode | stat.S_IRUSR | stat.S_IWUSR)
             if fix:
                 fixup_file(rel, dst)
-            os.utime(dst, ns=(mt, mt))
-            return "copied", size
+            os.utime(dst, ns=(mt, mt))                                # the VOLUME's mtime: the next sync compares against it
+            return ("twin" if tw else "copied"), size
         return "", 0
 
     # the largest files first, so the long reads (torch's libraries) start at once and the small ones fill the gaps
@@ -390,7 +427,7 @@ def build(plan, entries, gdir, prev, prev_rows, jobs):
         for what, n in ex.map(one, work):
             if what:
                 counts[what] += 1
-                counts["bytes"] += n
+                counts["twin_bytes" if what == "twin" else "bytes"] += n
     for p in reversed(dirs):                                         # the source's modes, once nothing more is written
         os.chmod(rel.local(p), entries[p][3] | stat.S_IRWXU)
     return counts
@@ -471,7 +508,7 @@ def sync(a):
         g = "g%s-%d" % (time.strftime("%Y%m%d-%H%M%S"), os.getpid())
         gdir = os.path.join(root, g)
         try:
-            n = build(plan, entries, gdir, cur if prev_rows else "", prev_rows, a.jobs)
+            n = build(plan, entries, gdir, cur if prev_rows else "", prev_rows, a.jobs, Twins(a.twin))
             vpy = gdir + plan.venv + "/bin/python"
             why = check_import(vpy, gdir + plan.venv, a.check_import)
             if why:
@@ -483,6 +520,7 @@ def sync(a):
             with open(os.path.join(gdir, META), "w") as fh:
                 json.dump({"format": FORMAT, "complete": True, "fingerprint": fp, "roots": plan.roots,
                            "files": len(entries), "copied": n["copied"], "copied_bytes": n["bytes"], "linked": n["linked"],
+                           "twin": n["twin"], "twin_bytes": n["twin_bytes"],
                            "walk_s": round(tw, 1), "seconds": round(secs, 1), "made": time.strftime("%Y-%m-%dT%H:%M:%S")}, fh)
             tmp = os.path.join(root, ".current.tmp")
             if os.path.lexists(tmp):
@@ -493,8 +531,10 @@ def sync(a):
             shutil.rmtree(gdir, ignore_errors=True)
             raise
         gone = prune(root, {g})
-        say("%d entries walked in %.1f s; %d files copied (%.2f GB), %d linked from the previous copy; %.1f s in all%s" % (
-            len(entries), tw, n["copied"], n["bytes"] / 1e9, n["linked"], secs, (", %d old copy(ies) removed" % gone) if gone else ""))
+        say("%d entries walked in %.1f s; %d files copied (%.2f GB), %d linked from the previous copy%s; %.1f s in all%s" % (
+            len(entries), tw, n["copied"], n["bytes"] / 1e9, n["linked"],
+            (", %d from the local twin (%.2f GB)" % (n["twin"], n["twin_bytes"] / 1e9)) if n["twin"] else "", secs,
+            (", %d old copy(ies) removed" % gone) if gone else ""))
         verdict("synced", gdir + plan.tree, vpy, secs)
         return 0
     except Exception as ex:                                          # never fatal: the caller runs from the volume
@@ -585,6 +625,7 @@ def _sync_args(s):
     s.add_argument("--headroom", type=int, default=4 << 30)
     s.add_argument("--auto", action="store_true")
     s.add_argument("--check-import", default="torch")
+    s.add_argument("--twin", default="")
 
 
 def main(argv):

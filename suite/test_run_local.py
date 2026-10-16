@@ -328,3 +328,79 @@ def test_unit_the_boot_starts_the_copy_before_sshd_and_jupyterlab():
     src = (BASE / "lib" / "boot.sh").read_text()
     seq = src[src.index("  boot_tcmalloc\n"):src.index("  boot_apps\n", src.index("  boot_tcmalloc\n"))]
     assert seq.index("boot_prewarm") < seq.index("boot_sshd") < seq.index("boot_jupyter") < seq.index("boot_comfy"), seq
+
+
+# ---------------------------------------------------------------------------------------------------- a local twin (3.15.1)
+
+def _twin(tmp_path, tree):
+    """A twin of the volume: the same paths under <tmp>/seed, as the template's rsync -a leaves them (size and mtime kept)."""
+    seed = pathlib.Path(os.path.realpath(tmp_path)) / "seed"
+    vol = tree.parent
+    for rel in ("ComfyUI/main.py", "ComfyUI/comfy/model.py", "ComfyUI/custom_nodes/PackA/__init__.py"):
+        src, dst = vol / rel, seed / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+        st = src.stat(); os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    return seed, vol
+
+
+def test_unit_a_file_the_twin_matches_is_read_from_the_twin_and_the_rest_from_the_volume(tmp_path):
+    vol, tree, venv, state = _volume(tmp_path)
+    seed, vol = _twin(tmp_path, tree)
+    # same size and mtime, different bytes: only a read FROM THE TWIN can put "TWIN" in the copy
+    for rel in ("ComfyUI/main.py",):
+        st = (vol / rel).stat(); (seed / rel).write_bytes(b"T" * st.st_size); os.utime(seed / rel, ns=(st.st_atime_ns, st.st_mtime_ns))
+    # a mismatch: the volume's file changed since the seed was copied (a later install), so the volume is read
+    mt = (tree / "comfy" / "model.py").stat().st_mtime_ns
+    (seed / "ComfyUI" / "comfy" / "model.py").write_text("X = 0\n")
+    os.utime(seed / "ComfyUI" / "comfy" / "model.py", ns=(mt - 5_000_000_000, mt - 5_000_000_000))
+    root = tmp_path / "run"
+    v, t, _, out = _sync(root, tree, venv, state, "--check-import", "json", "--twin", f"{seed}={vol}")
+    assert v == "synced", out
+    lt = pathlib.Path(t)
+    assert (lt / "main.py").read_bytes() == b"T" * len("print('main')\n")                  # the twin's bytes: read from it
+    assert (lt / "comfy" / "model.py").read_text() == "X = 1\n"                             # the twin is older: the volume's
+    assert (lt / "main.py").stat().st_mtime_ns == (tree / "main.py").stat().st_mtime_ns     # the volume's mtime is the record
+    assert "from the local twin" in out
+    meta = json.loads((root / os.readlink(root / "current") / ".run-local.json").read_text())
+    assert meta["twin"] == 2 and meta["copied"] > 0                                         # main.py and PackA's __init__.py
+
+
+def test_unit_a_twin_within_a_second_still_matches_and_a_size_change_does_not(tmp_path):
+    vol, tree, venv, state = _volume(tmp_path)
+    seed, vol = _twin(tmp_path, tree)
+    st = (tree / "main.py").stat()
+    os.utime(seed / "ComfyUI" / "main.py", ns=(st.st_atime_ns, st.st_mtime_ns - 400_000_000))   # a coarser clock: 0.4 s off
+    tw = run_local.Twins(f"{seed}={vol}")
+    assert tw.find(str(tree / "main.py"), st.st_size, st.st_mtime_ns) == str(seed / "ComfyUI" / "main.py")
+    assert tw.find(str(tree / "main.py"), st.st_size + 1, st.st_mtime_ns) == ""
+    assert tw.find(str(tree / "comfy" / "nothere.py"), 1, 1) == ""                           # no twin at that path
+    assert tw.find("/elsewhere/x", 1, 1) == ""                                               # no pair covers it
+    assert run_local.Twins(f"{tmp_path}/missing={vol}").pairs == []                          # a twin dir that is not there
+    assert run_local.Twins("").pairs == [] and run_local.Twins("junk").pairs == []
+
+
+def test_unit_a_missing_twin_copies_exactly_as_before(tmp_path):
+    vol, tree, venv, state = _volume(tmp_path)
+    root = tmp_path / "run"
+    v, t, _, out = _sync(root, tree, venv, state, "--check-import", "json", "--twin", f"{tmp_path}/no-seed={vol}")
+    assert v == "synced" and "from the local twin" not in out, out
+    assert (pathlib.Path(t) / "main.py").read_text() == "print('main')\n"
+    assert json.loads((root / os.readlink(root / "current") / ".run-local.json").read_text())["twin"] == 0
+
+
+def test_unit_the_shell_passes_the_twin_from_its_env_or_pid_1s(tmp_path):
+    vol, tree, venv, state = _volume(tmp_path)
+    seed, vol = _twin(tmp_path, tree)
+    st = (vol / "ComfyUI" / "main.py").stat()
+    (seed / "ComfyUI" / "main.py").write_bytes(b"T" * st.st_size); os.utime(seed / "ComfyUI" / "main.py", ns=(st.st_atime_ns, st.st_mtime_ns))
+    env = (f'COMFY="{tree}"; VENV="{venv}"; PY="{venv}/bin/python"; BASE_STATE="{state}"; BASE_HOME="{vol}/comfy-base";'
+           f' BASE_LOCAL_RUN=1; BASE_RUN_CHECK=json;')
+    r = _bash(env + f' BASE_RUN_ROOT="{tmp_path}/run1"; BASE_RUN_TWIN="{seed}={vol}"; _base_run_here; echo "DIR=$RUN_HERE_DIR"')
+    d = r.stdout.split("DIR=")[-1].strip()
+    assert (pathlib.Path(d) / "main.py").read_bytes().startswith(b"T"), r.stdout + r.stderr
+    pid1 = tmp_path / "environ"; pid1.write_bytes(f"PATH=/usr/bin\0BASE_RUN_TWIN={seed}={vol}\0".encode())
+    r = _bash(env + f' BASE_RUN_ROOT="{tmp_path}/run2"; BASE_PID1_ENVIRON="{pid1}"; echo "T=$(_base_run_twin)"; _base_run_here; echo "DIR=$RUN_HERE_DIR"')
+    assert f"T={seed}={vol}" in r.stdout and (pathlib.Path(r.stdout.split("DIR=")[-1].strip()) / "main.py").read_bytes().startswith(b"T")
+    r = _bash(env + f' BASE_RUN_ROOT="{tmp_path}/run3"; _base_run_here; echo "DIR=$RUN_HERE_DIR"')      # unset: off, as before
+    assert (pathlib.Path(r.stdout.split("DIR=")[-1].strip()) / "main.py").read_text() == "print('main')\n"
