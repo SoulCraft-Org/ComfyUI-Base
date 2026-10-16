@@ -1,4 +1,4 @@
-"""unit and install tiers, 3.13.0: the model downloads start beside the venv build (lib/52-models-early.sh).
+"""unit and install tiers, 3.11.0: the model downloads start beside the venv build (lib/52-models-early.sh).
 
 The promises: the downloads really run while the venv builds; the model stage still judges every row, counts an early
 file once (as downloaded), and fetches again whatever the early pass did not get, so a file nobody can fetch fails the

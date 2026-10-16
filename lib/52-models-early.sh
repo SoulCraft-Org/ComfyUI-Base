@@ -1,4 +1,4 @@
-# 52-models-early.sh: 3.13.0: the package's downloads start beside the venv build, not after it.
+# 52-models-early.sh: 3.11.0: the package's downloads start beside the venv build, not after it.
 #
 # A fresh install built the venv (uv, Python, torch, every pack's requirements, the newest pass, a package's
 # SageAttention build) and only THEN started on tens of GB of models, though neither needs the other. Now, once the
@@ -18,7 +18,7 @@
 #                    main venv's hf as the fallback. It is left as it is while a fetch-later still runs from it.
 #   stopping         an install that stops before the join (a failed venv, a restart required, an ERR) stops its early
 #                    downloads too; hf and curl resume from the staging folder on the next run.
-#   off              BASE_MODELS_FOREGROUND=1 (the 3.12 order), a dry run, a seed build (no models), a buyer's machine
+#   off              BASE_MODELS_FOREGROUND=1 (the 3.10 order), a dry run, a seed build (no models), a buyer's machine
 #                    (BASE_RUNTIME: no uv step may run there, and its venv is not built anyway).
 
 _BASE_EARLY_PID=""; _BASE_EARLY_DIR=""; _BASE_EARLY_DESTS=(); _BASE_EARLY_FAILED=()

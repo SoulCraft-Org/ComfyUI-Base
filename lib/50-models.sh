@@ -212,8 +212,8 @@ _base_move_into_place(){ # <src> <dest> — same device: mv; else copy + size ch
 }
 _base_rate(){ local b="$1" secs="$2"; if [ "${secs:-0}" -gt 0 ]; then awk -v b="$b" -v s="$secs" 'BEGIN{ printf "%.0f MB/s in %ds", b/1048576/s, s }'; else echo "<1s"; fi; }
 _base_xet_check(){ # a silent fallback to plain HTTPS is several times slower and says nothing anywhere
-  local hpy; hpy="$(dirname "$(_base_hf_bin)")/python"      # 3.13.0: the interpreter of the hf that downloads, not the main venv's
-  if [ -x "$hpy" ] && "$hpy" -c "import hf_xet" 2>/dev/null; then ok "hf_xet active (high performance, ${HF_XET_NUM_CONCURRENT_RANGE_GETS:-32} concurrent range gets)"
+  local hpy; hpy="$(dirname "$(_base_hf_bin)")/python"      # 3.11.0: the interpreter of the hf that downloads, not the main venv's
+  if [ -x "$hpy" ] && "$hpy" -c "import hf_xet" 2>/dev/null; then ok "hf_xet active (high performance; its concurrency is adaptive)"
   else warn "hf_xet is NOT importable — downloads fall back to plain HTTPS, several times slower"; fi
 }
 _base_curl_dl(){ # <staged file> <url> [curl args] — the GitHub leg: curl, resumable; silent on success, its last lines on failure
@@ -230,7 +230,7 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
   elif [[ "$url" == https://huggingface.co/*/resolve/* ]]; then
     local repo rfile hfbin _dlout
     repo="${url#https://huggingface.co/}"; repo="${repo%%/resolve/*}"; rfile="${url#*/resolve/}"; rfile="${rfile#*/}"
-    hfbin="$(_base_hf_bin)"                         # 3.13.0: the fetch venv's hf, else the main venv's, else PATH's
+    hfbin="$(_base_hf_bin)"                         # 3.11.0: the fetch venv's hf, else the main venv's, else PATH's
     if [ -z "$hfbin" ]; then err "hf CLI missing — the venv step installs huggingface_hub[hf-xet]"; return 1; fi
     for attempt in 1 2 3; do
       # silent on success (the caller reports file, size, verification and rate); the output is the diagnosis on failure
@@ -380,7 +380,16 @@ _base_progress(){ # [stage] → state/progress.json from the queue, the stand-in
 }
 
 # ---------------------------------------------------------------- fetching: one at a time, or BASE_FETCH_JOBS at once
-_base_fetch_jobs(){ local n="${BASE_FETCH_JOBS:-1}"; if [[ "$n" =~ ^[1-9][0-9]*$ ]]; then echo "$n"; else note "BASE_FETCH_JOBS='$n' is not a positive integer: fetching one file at a time" >&2; echo 1; fi; }
+_base_fetch_jobs(){ # 3.11.0: six at once by default (one Xet file does not fill a pod's link; about three to six do, measured
+  # 2026-10-16: six files 1.7 GB/s together, one 0.8 to 1 GB/s), three on a machine under 32 GiB of memory (each high
+  # performance transfer keeps its own buffers). BASE_FETCH_JOBS=1 is the one-at-a-time behaviour of 3.0 to 3.10.
+  local n="${BASE_FETCH_JOBS:-}" kb
+  if [ -z "$n" ]; then
+    kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || true)"
+    if [[ "$kb" =~ ^[0-9]+$ ]] && [ "$kb" -lt 33554432 ]; then n=3; else n=6; fi
+  fi
+  if [[ "$n" =~ ^[1-9][0-9]*$ ]]; then echo "$n"; else note "BASE_FETCH_JOBS='$n' is not a positive integer: fetching one file at a time" >&2; echo 1; fi
+}
 _base_fetch_one(){ # <spec KIND|rel|url|bytes|dest> → rc of the download
   local kind rel url bytes dest; IFS='|' read -r kind rel url bytes dest <<<"$1"
   if [ "$kind" = "SNAP" ]; then _base_snapshot "$url" "$dest" "$bytes"; else _base_download "$url" "$dest" "$bytes"; fi
@@ -394,8 +403,9 @@ _base_fetch_fold(){ # <rc> <secs> <spec> → the verdict line and the run's coun
     MODEL_DL+=("$rel"); DL_DESTS+=("$dest"); MODEL_DL_GB="$(_base_add_gb "$MODEL_DL_GB" "$(_base_bytes_to_gb "$bytes")")"
   else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); fi
 }
+_base_alive(){ local p c=0; for p in "$@"; do if kill -0 "$p" 2>/dev/null; then c=$((c + 1)); fi; done; echo "$c"; }   # <pid>... → how many still run
 _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE_FETCH_JOBS at a time, reported in queue order
-  local n spec i=0 rc t0 logd rel
+  local n spec i=0 rc t0 logd rel pids=()
   n="$(_base_fetch_jobs)"
   if [ "$n" = "1" ]; then                          # exactly the 3.0 behaviour: live output, one file after another
     for spec in "$@"; do
@@ -406,13 +416,16 @@ _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE
     return 0
   fi
   logd="$(_base_mktemp_d)"
-  note "fetching $# file(s), $n at a time (BASE_FETCH_JOBS)"
-  for spec in "$@"; do                             # job slots, bash 3.2-clean: no `wait -n`
-    i=$((i + 1))
-    while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$n" ]; do sleep 1; done
+  note "fetching $# file(s), $n at a time, largest first (BASE_FETCH_JOBS)"
+  # 3.11.0: started largest first, so the longest transfer is never the one that waits for a slot; reported in row order
+  for i in $(i=0; for spec in "$@"; do i=$((i + 1)); IFS='|' read -r _ _ _ b _ <<<"$spec"; echo "${b:-0} $i"; done | sort -k1,1nr -k2,2n | awk '{print $2}'); do
+    spec="${!i}"                                   # the i-th argument: queue order is kept for the report below
+    # 3.11.0: only this queue's own jobs fill a slot or are waited for; the run has other background work by now
+    while [ "$(_base_alive ${pids[@]+"${pids[@]}"})" -ge "$n" ]; do sleep 1; done
     ( t0=$SECONDS; rc=0; _base_fetch_one "$spec" > "$logd/$i.log" 2>&1 || rc=$?; echo "$rc|$(( SECONDS - t0 ))" > "$logd/$i.rc" ) &
+    pids+=("$!")
   done
-  wait
+  wait ${pids[@]+"${pids[@]}"} 2>/dev/null || true
   i=0
   for spec in "$@"; do
     i=$((i + 1)); IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
@@ -582,7 +595,7 @@ base_models(){
     TODO+=("FILE|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes))
   done <<< "$rows"
 
-  _base_early_settle                     # 3.13.0: what the early pass failed is failed here, by name, not fetched a second time
+  _base_early_settle                     # 3.11.0: what the early pass failed is failed here, by name, not fetched a second time
   # ---- downloads, behind the gate
   if [ "${#TODO[@]}" -gt 0 ]; then
     hdr "DOWNLOADS · ${#TODO[@]} item(s), $(_base_bytes_to_gb "$NEED") GB needed"

@@ -210,7 +210,7 @@ def test_unit_three_jobs_download_at_once_and_report_in_queue_order(tmp_path):
 def test_unit_one_job_is_the_serial_behaviour(tmp_path):
     _pod(tmp_path); bin_, log = _stub_hf(tmp_path, delay="0.3")
     r = _bash('%s; base_env_setup; base_discover quiet; base_models; echo DL=${#MODEL_DL[@]}' % _models(*_abc_rows()),
-              env=_fake(tmp_path, BASE_FAKE_DL="real", PATH="%s:%s" % (bin_, os.environ["PATH"])))
+              env=_fake(tmp_path, BASE_FAKE_DL="real", BASE_FETCH_JOBS="1", PATH="%s:%s" % (bin_, os.environ["PATH"])))   # 3.11.0: the default is 6
     assert "DL=3" in r.stdout, r.stdout + r.stderr
     starts, ends = _spans(log)
     order = sorted(starts, key=starts.get)

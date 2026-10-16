@@ -43,7 +43,7 @@ repo and from the extracted zip; the counts are in the release commit's PR, Soul
 - runpod-template's image test reports `Dockerfile, seed-script.sh` stale against any base newer than its last
   regeneration; it moves with the `repos.txt` pin, not with this change.
 
-## 2. Model downloads beside the venv build (3.13.0)   (2026-10-16, two RunPod pods, both deleted)
+## 2. Model downloads beside the venv build (3.11.0)   (2026-10-16, two RunPod pods, both deleted)
 
 **Proven.** On RunPod, two fresh pods side by side (H100 80GB HBM3, EU-FR-1, bare `runpod/base` CUDA 13 image, network
 volume, MiniMax H3 Video Continuer 1.0.5, 41.1 GB of models, `podctl install --base --pkg … --no-gate --no-suite`):
