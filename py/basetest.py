@@ -371,6 +371,25 @@ def boot_stubs(root, torch_ok=True):
     return bin_, log
 
 
+def stop_forwarders(state, timeout=10.0):
+    """Stop every py/app_proxy.py serving <state> (the boot starts it detached) and WAIT until each is gone: TERM, then
+    KILL after `timeout` s. A signal alone returned while the process was still listed, and the suite's teardown
+    counted it as a leak (CI, 2026-10-16, error log row 78). True when none is left."""
+    import time
+    pat = "app_proxy\\.py --state %s" % state
+    alive = lambda: subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True).stdout.split()
+    for sig, wait in (("-TERM", timeout), ("-KILL", 5.0)):
+        if not alive():
+            return True
+        subprocess.run(["pkill", sig, "-f", pat], capture_output=True)
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            if not alive():
+                return True
+            time.sleep(0.05)
+    return not alive()
+
+
 def boot_fake_pod(root, bin_, extra_env=None):
     """Run <root>/comfy-base/boot.sh once (BOOT_ONCE) with the stubs; returns (CompletedProcess, the boot log text)."""
     root = pathlib.Path(root)
@@ -382,7 +401,7 @@ def boot_fake_pod(root, bin_, extra_env=None):
     try:
         r = subprocess.run(["bash", str(root / "comfy-base" / "boot.sh")], capture_output=True, text=True, env=env, timeout=120)
     finally:                                     # 3.10.1: a forwarder the boot started outlives BOOT_ONCE; never leave it listening
-        subprocess.run(["pkill", "-f", "app_proxy\\.py --state %s/comfy-base/state" % root], capture_output=True)
+        stop_forwarders("%s/comfy-base/state" % root)
     logs = sorted((root / "comfy-base" / "state" / "logs").glob("boot_*.log"))
     return r, (logs[-1].read_text() if logs else "")
 
