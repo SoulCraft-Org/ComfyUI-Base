@@ -19,8 +19,14 @@ except Exception: print("")' "$cfg" 2>/dev/null || true)"; fi
   esac
 }
 
+_base_quick_cpu(){ # 3.10.0: "--cpu" for a seed build. The template image is built where no GPU is, and ComfyUI's startup
+  # died "Found no NVIDIA driver" before importing a single pack, so no image was ever built. --cpu changes only the
+  # device ComfyUI picks; every pack is still imported and judged. A real machine never sets BASE_SEED, so it still
+  # starts on its GPU here (as 3.9.1's BASE_NO_GPU drops the device question for venv_verify.py and nowhere else).
+  [ "${BASE_SEED:-0}" = "1" ] && echo "--cpu"; return 0
+}
 _base_quick_test(){ # <log> → main.py --quick-test-for-ci's exit status (ComfyUI loads, imports every pack, exits)
-  (cd "$COMFY" && _base_timeout 900 "$PY" main.py --quick-test-for-ci --disable-auto-launch >"$1" 2>&1)
+  (cd "$COMFY" && _base_timeout 900 "$PY" main.py --quick-test-for-ci --disable-auto-launch $(_base_quick_cpu) >"$1" 2>&1)
 }
 _base_core_failed(){ # <log> <rc> → 0 when ComfyUI ITSELF did not start (as opposed to a pack that failed to import)
   local log="$1" rc="$2"

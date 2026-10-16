@@ -158,6 +158,14 @@ KNOWN_CONSOLE = [
     (re.compile(r"Cannot read properties of undefined \(reading 'all_connected_inputs'\)\s+at LinkRenderController\.highlight_subgraph_node_connections"),
      "cg-use-everywhere draws a subgraph's highlights before its own link list exists (use_everywhere_ui.js:194, this.ue_list undefined) — "
      "a race in that extension while the canvas is inside a subgraph; seen 1 run in 3 on the same graph (2026-09-08)"),
+    (re.compile(r"Cannot read properties of undefined \(reading 'extra'\)\s+at app\.loadGraphData \(\S*/ComfyUI-Manager/components-manager\.js"),
+     "comfyui-obvpm 0.2.16's loadGraphData wrapper (web/obvpm_migrate.js) forwards `orig.call(this, graphData, ...rest)`, "
+     "so the frontend's no-argument startup call (resolveStartupOutcome: `loadGraphData()` once Comfy.TutorialCompleted) "
+     "reaches ComfyUI-Manager's wrapper (js/components-manager.js) with ONE argument, undefined; Manager guards only "
+     "`arguments.length == 0` and reads graphData.extra. Logged twice (initializeWorkflow's catch, then the same call retried inside it). Reproduced on "
+     "frontend 1.55.17, 2026-10-16: the startup default graph does not load (0 nodes, 10 with either wrapper fixed) and "
+     "the startup's later steps are skipped; this tool loads its workflow explicitly afterwards, so nothing it measures "
+     "changes. Upstream: Comfy-Org/ComfyUI-Manager#1742 (the null variant); drop this row when either wrapper is fixed"),
 ]
 
 
