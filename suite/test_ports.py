@@ -701,9 +701,14 @@ def test_unit_create_reuses_the_named_network_volume_where_the_gpu_is_free(tmp_p
         body = [b for p, b in srv.bodies if p == "/pods"][-1]
         assert body["networkVolumeId"] == "vmine" and body["dataCenterIds"] == ["US-CA-2"] and "/networkvolumes" not in srv.posts
         assert "vmine (comfy-base-data) in US-CA-2: reused" in capsys.readouterr().out
-        # the named volume only where the GPU is sold out, and no --data-gb: STOP, nothing billed
+        # the named volume only where the GPU is sold out, and no --data-gb: 3.18.0, a fresh pod where the GPU is (no
+        # network volume made); with --no-fresh, 3.14.0's STOP, nothing billed
         srv.volumes["vmine"]["dataCenterId"] = "US-NE-1"; srv.posts.clear()
-        assert run() == 1
+        assert run() in (None, 0)
+        body = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert "networkVolumeId" not in body and body["volumeInGb"] == 400 and body["dataCenterIds"] == ["EU-RO-1"] and "/networkvolumes" not in srv.posts
+        capsys.readouterr(); srv.posts.clear()
+        assert run("--no-fresh") == 1
         out = capsys.readouterr().out
         assert "STOP: comfy-base-data is only in US-NE-1, which has no NVIDIA B200 free" in out and "--data-gb N for a new comfy-base-data" in out and [p for p in srv.posts if p != "/graphql"] == [], out
         # ... with --data-gb: a new one where the GPU is, under the name the next create reuses
