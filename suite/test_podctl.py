@@ -100,6 +100,8 @@ class FakeRunPod:
                     return self._send(200, [srv.pod])
                 if path == "/pods/" + srv.pod["id"]:
                     return self._send(200, srv.pod)
+                if path == "/networkvolumes":                 # 3.14.0: the listing a public create reuses a volume from
+                    return self._send(200, list(srv.volumes.values()))
                 if path.startswith("/networkvolumes/") and path.split("/")[2] in srv.volumes:
                     return self._send(200, srv.volumes[path.split("/")[2]])
                 self._send(404, {"error": "no such pod"})
@@ -1745,16 +1747,18 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
         srv.close()
     assert srv.posts == ["/graphql", "/networkvolumes", "/pods"], srv.posts
     vol, body = srv.bodies[1][1], srv.bodies[2][1]
-    assert vol == {"name": "b2-data", "size": 500, "dataCenterId": "EU-RO-1"}
+    assert vol == {"name": "comfy-base-data", "size": 500, "dataCenterId": "EU-RO-1"}     # 3.14.0: the name the next create reuses
     assert body["cloudType"] == "SECURE" and body["dataCenterIds"] == ["EU-RO-1"] and body["networkVolumeId"] == "newvol1"
     assert body["volumeMountPath"] == "/workspace" and body["ports"] == ["8188/http", "8888/http", "22/tcp"]
-    # 3.9.0: and the pod's own JupyterLab token (test_ports has the port names and their template)
-    assert set(body["env"]) == {"PUBLIC_KEY", "JUPYTER_TOKEN"} and body["env"]["PUBLIC_KEY"] == "ssh-ed25519 AAAAMAC mac@key"
+    # 3.9.0: and the pod's own JupyterLab token; 3.14.0: and the key to its links (test_ports has the names and the key)
+    assert set(body["env"]) == {"PUBLIC_KEY", "JUPYTER_TOKEN", "BASE_LINK_TOKEN"} and body["env"]["PUBLIC_KEY"] == "ssh-ed25519 AAAAMAC mac@key"
     tok_lines = [l for l in out.splitlines() if body["env"]["JUPYTER_TOKEN"] in l]       # printed once: the ready terminal link
     assert len(tok_lines) == 1 and "Jupyter Terminal" in tok_lines[0] and "-8888.proxy.runpod.net/lab?token=" in tok_lines[0], out
     assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["gpuCount"] == 1
     assert body["allowedCudaVersions"] == ["13.0"] and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
-    assert "templateId" not in body and "dockerStartCmd" not in body and body["interruptible"] is False   # this fake has no templates
+    assert "templateId" not in body and body["interruptible"] is False   # this fake has no templates
+    # 3.14.0: a new pod starts on the base's boot guard and sshd, never its image's own start (error log row 71)
+    assert body["dockerStartCmd"] == [] and body["dockerEntrypoint"][2].startswith(podctl.BOOT_GUARD)
     assert "the port names could not be written" in out, out                     # and says so; never a reason to have no pod
     assert "created newpod0000001" in out and "next: podctl ensure newpod0000001" in out and "rp_key_create" not in out, out
 
@@ -1921,7 +1925,7 @@ def test_unit_runpod_create_private_is_an_unencrypted_pod_volume_behind_ssh_only
         # a network volume is not a private pod's: refused before any call
         with pytest.raises(podctl.PodctlError) as e:
             _create(podctl, srv, pub, "--private", "--volume", "oldvol")
-        assert "--public" in str(e.value) and srv.posts == [] and srv.gets == []
+        assert "drop --private" in str(e.value) and srv.posts == [] and srv.gets == []
         assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
         out = capsys.readouterr().out
         assert srv.posts == ["/graphql", "/pods"], srv.posts                   # no network volume is made
@@ -1954,33 +1958,36 @@ def test_unit_runpod_create_private_is_an_unencrypted_pod_volume_behind_ssh_only
         srv.close()
 
 
-def test_unit_runpod_create_is_private_unless_public(tmp_path, capsys):
-    """3.8.1, Paul's order (as simple, then as secure, then as private as possible): `podctl create` with no flag makes the
-    private pod (a pod volume, 22/tcp only, ComfyUI on loopback) on Secure Cloud, B200 first. --public is the
-    one way to a network volume and proxy URLs; --volume without it is refused with both ways out, never silently public.
-    A host whose create has no private mode (Verda) keeps working without a flag; asking it for --private is refused."""
+def test_unit_runpod_create_is_public_unless_private(tmp_path, capsys):
+    """3.14.0, Paul's order of 2026-10-16 (delight first, then secure, then private; security never costs a click):
+    `podctl create` with no flag makes the public pod (the network volume, the named proxy links, each locked by the pod's
+    own key) on Secure Cloud, B200 first, reversing 3.8.1. --private is the opt-in (a pod volume, 22/tcp only, ComfyUI on
+    loopback); --volume with it is refused with both ways out. A host whose create has no private mode (Verda) keeps
+    working without a flag; asking it for --private is refused."""
     podctl = _load()
     pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
     srv = FakeRunPod(_pod(), gql=B200_STOCK)
     def create(*argv):
         prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
-        args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "p", "--image", "x/comfy:cu130", "--no-wait", *argv])
+        args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "p", "--image", "x/comfy:cu130", "--no-wait", "--no-names", *argv])
         return podctl.cmd_create(prov, args)
     try:
         assert create("--data-gb", "300") in (None, 0)
         body = srv.bodies[-1][1]
-        assert srv.posts == ["/graphql", "/pods"] and "volumeEncrypted" not in body and body["ports"] == ["22/tcp"], (srv.posts, body)
-        assert body["cloudType"] == "SECURE" and body["gpuTypeIds"] == ["NVIDIA B200"] and body["env"]["BASE_LISTEN"] == "127.0.0.1"
-        assert "podctl tunnel" in capsys.readouterr().out
+        assert srv.posts == ["/graphql", "/networkvolumes", "/pods"] and "8188/http" in body["ports"], (srv.posts, body)
+        assert body["cloudType"] == "SECURE" and body["gpuTypeIds"] == ["NVIDIA B200"] and "BASE_LISTEN" not in body["env"]
+        assert body["env"]["BASE_LINK_TOKEN"] and "?token=%s" % body["env"]["BASE_LINK_TOKEN"] in capsys.readouterr().out
         with pytest.raises(podctl.PodctlError) as e:
-            create("--volume", "oldvol")
-        assert "network volume" in str(e.value) and "--public" in str(e.value) and "--data-gb" in str(e.value)
+            create("--private", "--volume", "oldvol")
+        assert "network volume" in str(e.value) and "drop --private" in str(e.value) and "--data-gb" in str(e.value)
         with pytest.raises(podctl.PodctlError) as e:
             create("--data-gb", "300", "--public", "--private")
         assert "contradict" in str(e.value)
         srv.posts.clear()
-        assert create("--data-gb", "300", "--public") in (None, 0)
-        assert srv.posts == ["/graphql", "/networkvolumes", "/pods"] and "8188/http" in srv.bodies[-1][1]["ports"]
+        assert create("--data-gb", "300", "--private") in (None, 0)
+        body = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert "/networkvolumes" not in srv.posts and body["ports"] == ["22/tcp"] and body["env"]["BASE_LISTEN"] == "127.0.0.1"
+        assert "BASE_LINK_TOKEN" not in body["env"] and "podctl tunnel" in capsys.readouterr().out
     finally:
         srv.close()
 
@@ -1991,7 +1998,7 @@ def test_unit_runpod_create_is_private_unless_public(tmp_path, capsys):
             self.made.append(name); return "i-1"
     v = Verda()
     podctl.cmd_create(v, podctl.build_parser().parse_args(["create", "--name", "n", "--gpu", "1B200.30V", "--data-gb", "100"]))
-    assert v.made == ["n"], "a host without a private mode is not refused for the default"
+    assert v.made == ["n"], "a host without a private mode works without a flag"
     with pytest.raises(podctl.PodctlError) as e:
         podctl.cmd_create(v, podctl.build_parser().parse_args(["create", "--name", "n2", "--gpu", "1B200.30V", "--data-gb", "100", "--private"]))
     assert "--private: not offered by host verda" in str(e.value)

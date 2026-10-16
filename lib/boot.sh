@@ -4,7 +4,7 @@
 # (the Mac runs these functions in the suite). Never `set -e`: a boot that dies takes the machine with it, and the whole
 # point of this file is that it always comes up reachable.
 #
-#     bash boot.sh                          the boot (sshd → JupyterLab → ComfyUI → app ports → sleep infinity); BOOT_HOME=<volume>/comfy-base
+#     bash boot.sh                          the boot (sshd → JupyterLab → ComfyUI → app ports and ComfyUI's locked front → sleep infinity); BOOT_HOME=<volume>/comfy-base
 #     bash boot.sh --print-sshd-bootstrap   the self-contained sshd snippet podctl puts in a RunPod start command
 #     bash boot.sh --apps                   (re)start the app ports only (3.9.0; the install runs it)
 #
@@ -95,6 +95,7 @@ boot_jupyter(){ # JupyterLab from the base's tools venv; the token rides the env
   # read the saved one FIRST, so this does not depend on boot_tokens having run: a second boot must reuse the
   # token, never append a new line. My own test caught it doing exactly that.
   local tf="$BOOT_HOME/state/tokens.env"
+  if [ -z "$tok" ]; then tok="$(boot_pid1_env JUPYTER_TOKEN)"; fi       # 3.14.0: `boot.sh --apps` from an install's ssh shell
   if [ -n "$tok" ]; then own=0; fi
   if [ -z "$tok" ] && [ -f "$tf" ]; then tok="$(sed -n 's/^JUPYTER_TOKEN=//p' "$tf" | tail -1)"; fi
   if [ -z "$tok" ]; then
@@ -177,6 +178,44 @@ boot_comfy(){ # ComfyUI from the base's venv with the base's launch line, only w
   if _base_start_comfy; then echo "boot: ComfyUI answers on $HOSTPORT"; else echo "boot: ComfyUI did not answer within the wait — see $COMFY_LOG"; fi
   return 0
 }
+boot_pid1_env(){ # <NAME> → the pod's own environment (PID 1's): `boot.sh --apps` runs from an install's ssh shell, which does not inherit it
+  local f="${BOOT_PID1_ENVIRON:-/proc/1/environ}"
+  [ -z "${BOOT_ROOT:-}" ] || [ -n "${BOOT_PID1_ENVIRON:-}" ] || return 0     # a fake pod never reads the host's PID 1
+  [ -r "$f" ] && tr '\0' '\n' < "$f" 2>/dev/null | sed -n "s/^$1=//p" | head -1
+  return 0
+}
+boot_public(){ # 0 when BASE_LISTEN reaches beyond the machine (the key is then required on every link)
+  case "${BASE_LISTEN:-127.0.0.1}" in 127.*|localhost|::1|'') return 1 ;; *) return 0 ;; esac
+}
+boot_link_token(){ # 3.14.0: the key that locks ComfyUI and every app link on a public bind (py/app_proxy.py checks it)
+  # The pod's own BASE_LINK_TOKEN (podctl create sets a fresh one per pod and prints the links with it) wins, read from
+  # PID 1 when this shell did not inherit it; else the one saved in state/tokens.env; else, on a public bind, one is
+  # GENERATED and saved (0600), exactly as JupyterLab's is. Exported for the forwarder alone; never echoed here (this log is
+  # a file on the volume). BOOT_LINK_MADE=1 when this call made it: boot_apps then names the links once on the CONTAINER log.
+  local tf="$BOOT_HOME/state/tokens.env" tok="${BASE_LINK_TOKEN:-}"
+  BOOT_LINK_MADE=0
+  [ -n "$tok" ] || tok="$(boot_pid1_env BASE_LINK_TOKEN)"
+  if [ -z "$tok" ] && [ -f "$tf" ]; then tok="$(sed -n 's/^BASE_LINK_TOKEN=//p' "$tf" | tail -1)"; fi
+  if [ -z "$tok" ] && boot_public; then
+    tok="$( (openssl rand -hex 32 2>/dev/null) || (head -c32 /dev/urandom | od -An -tx1 | tr -d " \n") )"
+    if [ -n "$tok" ]; then
+      mkdir -p "$BOOT_HOME/state"; ( umask 077; printf 'BASE_LINK_TOKEN=%s\n' "$tok" >> "$tf" ); chmod 600 "$tf" 2>/dev/null || true
+      BOOT_LINK_MADE=1
+    fi
+  fi
+  if [ -n "$tok" ]; then export BASE_LINK_TOKEN="$tok"; fi
+  return 0
+}
+boot_console_links(){ # <comfy port> <rows> → one line per locked link on the CONTAINER log (RunPod's Logs tab), only for a key the boot made
+  [ "${BOOT_LINK_MADE:-0}" = 1 ] && [ "${BASE_HOST:-}" = runpod ] && [ -n "${RUNPOD_POD_ID:-}" ] && [ -n "${BASE_LINK_TOKEN:-}" ] || return 0
+  { true >&3; } 2>/dev/null || return 0
+  local p s nm
+  echo "ComfyUI: https://${RUNPOD_POD_ID}-$1.proxy.runpod.net/?token=${BASE_LINK_TOKEN}" >&3
+  printf '%s\n' "$2" | while IFS='|' read -r p s nm; do
+    case "$p" in [0-9]*) echo "$nm: https://${RUNPOD_POD_ID}-$p.proxy.runpod.net/?token=${BASE_LINK_TOKEN}" >&3 ;; esac
+  done
+  return 0
+}
 boot_apps_py(){ # the Python the forwarder runs on: the tools venv's, else the machine's python3 (standard library only)
   if [ -x "$BOOT_HOME/tools/bin/python" ]; then echo "$BOOT_HOME/tools/bin/python"; return 0; fi
   command -v python3 2>/dev/null && return 0
@@ -198,20 +237,34 @@ boot_apps(){ # 3.9.0: each customer app at the root of its own port (state/apps.
   # A host whose console links PORTS, not paths (RunPod's Connect tab), can only name an app that has a port of its own;
   # ComfyUI serves the app at /apps/<slug>/ and py/app_proxy.py forwards <port>/ there. Restarted on every call, so an
   # install that adds or drops an app takes effect at once (boot.sh --apps). Not on the GPU: it only moves bytes.
-  local py proxy="$BOOT_HOME/py/app_proxy.py" port="${PORT:-}" rows n
+  # 3.14.0: on a public bind the same process is ComfyUI's front too (--front: ComfyUI's port on the machine's other
+  # addresses, ComfyUI itself on 127.0.0.1), and every link it serves needs the key (boot_link_token). So on a public
+  # bind it runs even when no package declares an app: without it ComfyUI would not be reachable from outside at all.
+  local py proxy="$BOOT_HOME/py/app_proxy.py" port="${PORT:-}" rows n front=()
   if [ -z "$port" ] && [ -f "$BOOT_HOME/state/boot.env" ]; then port="$(sed -n "s/^PORT='\{0,1\}\([0-9]*\).*/\1/p" "$BOOT_HOME/state/boot.env" | head -1)"; fi
   port="${port:-8188}"
   boot_apps_stop
-  if [ ! -f "$proxy" ]; then echo "boot: no $proxy, so no app ports (the base install puts it there)"; return 0; fi
+  if [ ! -f "$proxy" ]; then echo "boot: no $proxy, so no app ports and no front for ComfyUI (the base install puts it there)"; return 0; fi
   if ! py="$(boot_apps_py)"; then echo "boot: no python for the app ports: none started"; return 0; fi
   rows="$("$py" "$proxy" --state "$BOOT_HOME/state" --list 2>&1)" || { echo "boot: app ports unreadable: $rows"; return 0; }
   n="$(printf '%s\n' "$rows" | grep -c '^[0-9]' || true)"
-  if [ "${n:-0}" = 0 ]; then echo "boot: app ports: none declared (no package ships a customer app)"; return 0; fi
+  if boot_public; then
+    if [ -n "${BOOT_FRONT_LISTEN:-}" ]; then front=(--front "$port" --front-listen "$BOOT_FRONT_LISTEN")   # the suite's stand-in for the machine's addresses
+    elif [ -z "${BOOT_ROOT:-}" ]; then front=(--front "$port")
+    else echo "boot: a fake pod (BOOT_ROOT): ComfyUI's front is not started on this machine's own addresses"; fi
+    if [ "${#front[@]}" -gt 0 ]; then boot_link_token; fi
+  fi
+  if [ "${n:-0}" = 0 ] && [ "${#front[@]}" = 0 ]; then echo "boot: app ports: none declared (no package ships a customer app)"; return 0; fi
   mkdir -p "$BOOT_HOME/state/logs"
-  nohup "$py" "$proxy" --state "$BOOT_HOME/state" --upstream "127.0.0.1:$port" --listen "${BASE_LISTEN:-127.0.0.1}" >> "$BOOT_HOME/state/logs/app_proxy.log" 2>&1 &
+  nohup "$py" "$proxy" --state "$BOOT_HOME/state" --upstream "127.0.0.1:$port" --listen "${BASE_LISTEN:-127.0.0.1}" ${front[@]+"${front[@]}"} >> "$BOOT_HOME/state/logs/app_proxy.log" 2>&1 &
+  if [ "${#front[@]}" -gt 0 ]; then
+    echo "boot: ComfyUI's port $port: the key's front on this machine's addresses (ComfyUI itself on 127.0.0.1)$( [ "${BOOT_LINK_MADE:-0}" = 1 ] && echo ' · key generated, saved to state/tokens.env')"
+  fi
+  if [ "${n:-0}" = 0 ]; then echo "boot: app ports: none declared (no package ships a customer app)"; fi
   printf '%s\n' "$rows" | while IFS='|' read -r p s nm; do
     case "$p" in [0-9]*) echo "boot: app port $p: $nm (/apps/$s/ on ComfyUI's $port)";; *) echo "boot: $p";; esac
   done
+  boot_console_links "$port" "$rows"
   return 0
 }
 boot_main(){
@@ -219,7 +272,11 @@ boot_main(){
     --print-sshd-bootstrap) declare -f _boot_sshd_bin; declare -f boot_sshd; echo "boot_sshd"; return 0 ;;
     --apps)                                        # 3.9.0: the install restarts the app ports without a reboot
       BOOT_HOME="${BOOT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-      boot_host >/dev/null; boot_apps; return 0 ;;
+      boot_host >/dev/null; boot_apps
+      # 3.14.0: a pod podctl creates runs nothing of its image's own (provider.create_start), so until its first restart into
+      # this boot there is no JupyterLab either: the install starts it here, once its tools venv exists, with the pod's token
+      if [ -x "$BOOT_HOME/tools/bin/jupyter-lab" ] && ! pgrep -f "jupyter-lab .*--port 8888" >/dev/null 2>&1; then boot_jupyter; fi
+      return 0 ;;
   esac
   BOOT_HOME="${BOOT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"   # the image's ENV or the unit sets it; this file's own directory otherwise
   mkdir -p "$BOOT_HOME/state/logs"

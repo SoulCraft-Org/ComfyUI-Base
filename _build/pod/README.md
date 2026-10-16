@@ -1,7 +1,7 @@
 # podctl — the Claude-driven pod path (Mac side)
 
     uv run "base/comfyui-base/_build/pod/podctl.py" pods
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location EU-RO-1] [--public [--volume <id>]]   # RunPod: private, B200 then B300
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> [--data-gb 500] [--gpu <type>] [--location EU-RO-1] [--volume <id> | --private]   # RunPod: public, links locked by the pod's key; B200 then B300
     uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>        # facts; env NAMES and placeholder verdicts, never values
     uv run "base/comfyui-base/_build/pod/podctl.py" image <pod>         # the image's entrypoint/cmd and how ensure wraps them
     uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>        # TCP 22 · PUBLIC_KEY · the base's boot as start command · Host runpod
@@ -40,9 +40,10 @@ are printed, the values never.
 
 ## create — a pod from nothing (3.7.3, RunPod; Verda since 3.1.0)
 
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--location EU-RO-1]          # private (the default)
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 --public                       # a network volume and proxy URLs
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --public --volume <network volume id>
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--location EU-RO-1]          # public (the default): comfy-base-data reused, else made
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img>                                             # public, only where comfy-base-data already is
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --volume <network volume id>                # public, on that volume
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 --private                      # opt-in: ssh only, a pod volume
     uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA H200" --image <img> --data-gb 500   # one named type instead
 
 Without `--gpu` (3.8.0) RunPod asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, the order the video packages'
@@ -58,11 +59,25 @@ ones that have it, before anything is created. Then a network volume of `--data-
 `--wait` is the default (until sshd answers, then `Host runpod` → the new pod); then `podctl ensure <pod>`. `create` bills:
 a consumer's guard hook prompts for it like `deploy`.
 
-**Private is the default (3.8.1)**, on RunPod: Paul's order for everything a person touches is as simple, then as secure,
-then as private as possible, so a plain `create` makes the pod below, and `--public` is the one way to the network-volume
-pod above (`--volume` names a network volume, which a private pod does not use, so it needs `--public` and is refused
-without it, naming both ways out). `--private` is still accepted and means the default. A host whose create has no private mode
-(Verda) is unchanged; asking it for `--private` is refused by name.
+**Public is the default again (3.14.0)**, on RunPod. Paul's order (2026-10-16) for everything a person touches is
+delight first (easy, simple: named links in the Connect tab), then secure, then private, and security may not cost a
+click. So a plain `create` makes the network-volume pod above, with ComfyUI, the Jupyter Terminal and each app named in
+the Connect tab, and every one of those links locked:
+
+- **The key.** `create` puts a fresh per-pod `BASE_LINK_TOKEN` in the pod's env beside `JUPYTER_TOKEN`, and prints
+  every link ready to click: ComfyUI and each app as `https://<pod>-<port>.proxy.runpod.net/?token=<key>`, the terminal
+  as `…-8888…/lab?token=<jupyter token>`. On the machine `py/app_proxy.py` answers the key with a cookie (HttpOnly,
+  Secure, SameSite=Lax, that host only) and a redirect to the same URL without it, so after that one click the
+  Connect tab's own links open straight away in that browser. A request with neither gets a plain 401 page. ComfyUI
+  itself listens on 127.0.0.1 behind it; JupyterLab keeps its own token. `status <pod>` prints the links again.
+- **Models download once.** With no `--volume`, a public pod goes onto the network volume called `--volume-name`
+  (default `comfy-base-data`) in a data centre that has it AND has the GPU free; a data centre without one gets a new one
+  of `--data-gb` under that name, which the next `create` then reuses. With no `--data-gb` the pod is made only where
+  the volume already is, and `create` stops, naming both ways out, when none of those data centres has the GPU.
+
+`--private` is the opt-in it was before 3.8.1 made it the default; `--public` is still accepted and changes nothing;
+both together are refused. A host whose create has no private mode (Verda) is unchanged; `--private` there is refused
+by name.
 
 `--private` (3.7.4): a **pod volume** of `--data-gb` at `/workspace` (`volumeInGb`; `--volume` is refused), `22/tcp` the
 only port (no proxy URL, no JupyterLab), and `BASE_LISTEN=127.0.0.1` in the pod's env so ComfyUI binds loopback;
