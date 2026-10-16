@@ -164,6 +164,37 @@ def test_unit_torch_pick_asks_uv_and_never_moves_a_shared_venv_backwards(tmp_pat
     assert r.returncode == 0 and r.stdout.strip() == want and why in r.stderr, (r.stdout, r.stderr)
 
 
+
+def _uv_new_python(tmp_path):
+    """uv stand-in, 2026-10-15's shape: it lists CPython 3.15 before torch has a cp315 wheel. `pip compile` of anything
+    with torch fails for 3.15 and resolves for 3.14; torch_pick's `pip install --help` names the CUDA backends."""
+    d = tmp_path / "newpy"; d.mkdir(exist_ok=True)
+    _stub(d, "uv", """\
+        case "$1 $2" in
+          "python list") printf 'cpython-3.15.0-linux-x86_64-gnu    <download available>\\ncpython-3.14.8-linux-x86_64-gnu    <download available>\\n'; exit 0 ;;
+          "pip install") echo "possible values: auto, cpu, cu132, cu130"; exit 0 ;;
+          "pip compile")
+            v=""; o=""; prev=""; for a in "$@"; do [ "$prev" = --python-version ] && v="$a"; [ "$prev" = -o ] && o="$a"; prev="$a"; done
+            cat >/dev/null
+            [ "$v" = 3.15 ] && { echo "hint: You require CPython 3.15 (cp315), but we only found wheels for torch with cp314" >&2; exit 1; }
+            [ -n "$o" ] && : > "$o"; echo "torch==2.14.1+cu130"; exit 0 ;;
+          "--version"*) echo "uv 0.13.1"; exit 0 ;;
+        esac
+        exit 0
+        """)
+    return {"UV": str(d / "uv"), "PATH": f"{d}:/usr/bin:/bin"}
+
+
+def test_unit_the_python_pick_is_the_newest_minor_torch_has_a_build_for(tmp_path):
+    # with no requirement file to resolve against, the pick used to take the newest minor uv listed outright
+    env = _uv_new_python(tmp_path)
+    r = _bash('base_env_setup; base_discover quiet; PICK=$(_base_python_pick); echo PICK=$PICK', env={"BASE_FAKE_ROOT": str(tmp_path), **env})
+    assert "PICK=3.14" in r.stdout and "trying Python 3.15 ... no (the torch family does not resolve)" in r.stderr, r.stdout + r.stderr
+    r = _bash('base_env_setup; base_discover quiet; base_venv; echo RESULT=$BASE_VENV_RESULT BACKEND=$BASE_TORCH_BACKEND',
+              env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_DRY": "1", **env})
+    assert "failed-pick" not in r.stdout + r.stderr and "target: Python 3.14" in r.stdout and "BACKEND=cu130" in r.stdout, r.stdout + r.stderr
+
+
 def test_unit_no_cuda_or_index_literal_and_no_pin_remains_in_the_library():
     for p in [*(BASE / "lib").glob("*.sh"), *(BASE / "py").glob("*.py")]:
         code = "\n".join(l for l in p.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#"))
@@ -238,6 +269,144 @@ def test_unit_list_packs_notes_differing_records_and_fails_on_differing_urls():
     b = 'BASE_PACKS=("X|https://h/x|' + "1" * 40 + '||" "X|https://h/other|' + "1" * 40 + '||")'
     r2 = _bash(f"{b}; base_list_packs; echo RC=$?")
     assert "RC=1" in r2.stdout and "two URLs" in r2.stderr, r2.stdout + r2.stderr
+
+
+
+# ---------------------------------------------------------------- 3.6.1: a row names the branch to track (a stale remote HEAD)
+
+def _stale_head_origin(tmp_path, name):
+    """rgthree's shape: the remote publishes as HEAD a `dev` branch left at an old commit, while the work goes on `main`.
+    Returns (origin, main's tip, dev's commit)."""
+    origin = tmp_path / f"{name}.git"; seed = tmp_path / f"{name}-seed"
+    _git("init", "-q", "--bare", str(origin)); _git("clone", "-q", str(origin), str(seed))
+    cfg = ["-c", "user.email=t@t", "-c", "user.name=t"]
+    def commit(i):
+        (seed / "__init__.py").write_text(f"v = {i}\n"); _git("add", ".", cwd=seed); _git(*cfg, "commit", "-q", "-m", f"c{i}", cwd=seed)
+    commit(1); dev = _git("rev-parse", "HEAD", cwd=seed)
+    commit(2); commit(3); main = _git("rev-parse", "HEAD", cwd=seed)
+    _git("push", "-q", "origin", f"{dev}:refs/heads/dev", "HEAD:refs/heads/main", cwd=seed)
+    _git("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/dev")
+    return origin, main, dev
+
+
+def test_unit_a_row_without_a_branch_follows_the_remote_head_even_when_it_is_stale(tmp_path):
+    origin, main, dev = _stale_head_origin(tmp_path, "PackS")
+    env = _packs_env(tmp_path); cn = tmp_path / "ComfyUI" / "custom_nodes"
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_PACKS=(); PACKS=("PackS|{origin}|{"0" * 40}||t"); base_packs git', env=env)
+    assert _git("rev-parse", "HEAD", cwd=cn / "PackS") == dev, r.stdout + r.stderr       # the defect a sixth field exists for
+
+
+def test_unit_a_row_branch_is_cloned_instead_of_the_stale_head_and_its_record_keeps_it(tmp_path):
+    origin, main, dev = _stale_head_origin(tmp_path, "PackT")
+    env = _packs_env(tmp_path); cn = tmp_path / "ComfyUI" / "custom_nodes"
+    row = f"PackT|file://{origin}|{'0' * 40}||test pack|main"
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_PACKS=(); PACKS=("{row}"); base_packs git; echo FAILED=${{#BASE_FAILED[@]}}', env=env)
+    assert "FAILED=0" in r.stdout and "the tip of main" in r.stdout, r.stdout + r.stderr
+    assert _git("rev-parse", "HEAD", cwd=cn / "PackT") == main and _git("rev-parse", "--abbrev-ref", "HEAD", cwd=cn / "PackT") == "main"
+    assert f'"PackT|file://{origin}|{main}||test pack|main"' in r.stdout                 # podctl saves the row whole
+
+
+def test_unit_a_shallow_checkout_on_the_stale_head_moves_to_the_rows_branch_then_is_not_fetched_again(tmp_path):
+    # what every pod cloned before 3.6.1 holds: `clone --depth 1` of the HEAD branch, so its refspec maps `dev` only
+    origin, main, dev = _stale_head_origin(tmp_path, "PackU")
+    env = _packs_env(tmp_path); cn = tmp_path / "ComfyUI" / "custom_nodes"; url = f"file://{origin}"
+    _git("clone", "-q", "--depth", "1", url, str(cn / "PackU"))
+    assert _git("rev-parse", "--abbrev-ref", "HEAD", cwd=cn / "PackU") == "dev"
+    row = f"PackU|{url}|{dev}||t|main"
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_PACKS=(); PACKS=("{row}"); base_packs git; echo FAILED=${{#BASE_FAILED[@]}}', env=env)
+    assert "FAILED=0" in r.stdout and "was on 'dev'" in r.stdout + r.stderr, r.stdout + r.stderr
+    d = cn / "PackU"
+    assert _git("rev-parse", "HEAD", cwd=d) == main and _git("rev-parse", "--abbrev-ref", "HEAD", cwd=d) == "main"
+    assert _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", cwd=d) == "origin/main"
+    spy, log = _git_spy(tmp_path)
+    r2 = _bash(f'base_env_setup; base_discover quiet; BASE_PACKS=(); PACKS=("{row}"); base_packs git; echo FAILED=${{#BASE_FAILED[@]}}', env={**env, **spy})
+    calls = log.read_text().split()
+    assert "FAILED=0" in r2.stdout and "ls-remote" in calls and "fetch" not in calls, (r2.stdout + r2.stderr, calls)
+
+
+def test_unit_a_row_branch_the_remote_does_not_have_fails_the_pack_and_says_so(tmp_path):
+    origin, main, dev = _stale_head_origin(tmp_path, "PackV")
+    env = _packs_env(tmp_path); cn = tmp_path / "ComfyUI" / "custom_nodes"
+    _git("clone", "-q", str(origin), str(cn / "PackV"))
+    r = _bash(f'base_env_setup; base_discover quiet; BASE_PACKS=(); PACKS=("PackV|{origin}|{dev}||t|trunk"); base_packs git; printf "%s\\n" "${{BASE_FAILED[@]}}"', env=env)
+    assert "no branch 'trunk'" in r.stdout + r.stderr and "pack PackV" in r.stdout, r.stdout + r.stderr
+    assert _git("rev-parse", "HEAD", cwd=cn / "PackV") == dev                                 # left where it was
+
+
+def test_unit_pack_heads_answers_a_tracked_branch_under_its_own_key(tmp_path):
+    origin, main, dev = _stale_head_origin(tmp_path, "PackW")
+    r = subprocess.run([sys.executable, str(BASE / "py" / "pack_heads.py")], input=f"{origin}\n{origin}#main\n{origin}#nope\n",
+                       capture_output=True, text=True)
+    rows = sorted(l.split("\t") for l in r.stdout.splitlines())
+    assert rows == sorted([[str(origin), "dev", dev], [f"{origin}#main", "main", main]]), r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("tail,ok", [("", True), ("|main", True), ("|release/1.x", True),
+                                     ("|5f940ddfbb83ff9c667f32ae7d0c3ad0bb8cc9ee", False), ("|5f940dd", False),
+                                     ("|two words", False), ("|main|extra", False), ("|../x", False)])
+def test_unit_the_sixth_field_is_a_branch_name_or_the_row_is_refused(tail, ok):
+    row = "X|https://h/x|" + "1" * 40 + "||why" + tail
+    r = _bash(f'BASE_PACKS=(); PACKS=("{row}"); _base_pack_rows; echo RC=$?')
+    assert ("RC=0" in r.stdout) == ok, r.stdout + r.stderr
+    if not ok:
+        assert "not a branch name" in r.stderr, r.stderr
+
+
+def test_unit_the_rgthree_base_row_tracks_main():
+    from basetest import base_packs
+    rows = {p["dir"]: p for p in base_packs()}
+    assert rows["rgthree-comfy"]["branch"] == "main" and rows["rgthree-comfy"]["why"].startswith("switches"), rows["rgthree-comfy"]
+    assert all(p["branch"] == "" for d, p in rows.items() if d != "rgthree-comfy")     # only where the remote's HEAD is wrong
+
+
+def test_unit_list_packs_hands_on_the_branch_and_fails_on_two_branches():
+    a = 'BASE_PACKS=("X|https://h/x|' + "1" * 40 + '||w|main" "Y|https://h/y|' + "2" * 40 + '||w")'
+    r = _bash(f"{a}; base_list_packs; echo RC=$?")
+    assert "RC=0" in r.stdout and "X|https://h/x|" + "1" * 40 + "|main" in r.stdout and "Y|https://h/y|" + "2" * 40 + "|\n" in r.stdout, r.stdout + r.stderr
+    b = 'BASE_PACKS=("X|https://h/x|' + "1" * 40 + '||w|main" "X|https://h/x|' + "1" * 40 + '||w")'
+    r2 = _bash(f"{b}; base_list_packs; echo RC=$?")
+    assert "RC=1" in r2.stdout and "tracks two branches: main vs its HEAD" in r2.stderr, r2.stdout + r2.stderr
+
+
+def test_unit_podctl_saves_a_six_field_record_without_losing_the_branch(tmp_path):
+    import importlib.util
+    if not (BASE / "_build" / "pod" / "podctl.py").exists():
+        pytest.skip("_build/pod is repo tooling, not in the shipped base")
+    spec = importlib.util.spec_from_file_location("podctl_b", BASE / "_build" / "pod" / "podctl.py"); podctl = importlib.util.module_from_spec(spec); spec.loader.exec_module(podctl)
+    s = tmp_path / "p-script.sh"
+    s.write_text('PACKS=(\n "rg|https://github.com/rgthree/rgthree-comfy|' + "1" * 40 + '||switches|main"\n)\n')
+    rows = podctl.pin_rows('  "rg|https://github.com/rgthree/rgthree-comfy|' + "2" * 40 + '||switches|main"\n')
+    assert rows == [("rg", "https://github.com/rgthree/rgthree-comfy", "2" * 40, "|switches|main")], rows
+    assert podctl.save_pins(s, rows) == [("rg", "1" * 40, "2" * 40)]
+    assert '"rg|https://github.com/rgthree/rgthree-comfy|' + "2" * 40 + '||switches|main"' in s.read_text()
+
+
+def _testbed_beside(tmp_path, rows):
+    """testbed.sh in a throwaway folder, beside a stand-in base whose list-packs prints `rows` (dir|url|sha|branch) and
+    whose py/ is the real one (testbed.sh asks py/pkgdirs.py where the packages are)."""
+    here = tmp_path / "tb"; cb = here / "comfyui-base"; cb.mkdir(parents=True)
+    (here / "testbed.sh").write_text((BASE / "testbed.sh").read_text(encoding="utf-8"))
+    (cb / "py").symlink_to(BASE / "py")
+    lines = "".join("echo '%s'\n" % r for r in rows)
+    (cb / "base.sh").write_text('#!/bin/bash\n[ "${1:-}" = list-packs ] || exit 2\n' + lines)
+    return here
+
+
+def test_unit_testbed_packs_clone_the_rows_branch_and_move_a_stale_checkout_across(tmp_path):
+    if not (BASE / "testbed.sh").exists() or not (BASE / "_build").exists():
+        pytest.skip("testbed.sh is repo tooling, not in the shipped base")
+    a, a_main, a_dev = _stale_head_origin(tmp_path, "PackX"); b, b_main, b_dev = _stale_head_origin(tmp_path, "PackY")
+    c, c_main, c_dev = _stale_head_origin(tmp_path, "PackZ")
+    here = _testbed_beside(tmp_path, [f"PackX|file://{a}|{'0' * 40}|main", f"PackY|file://{b}|{'0' * 40}|main", f"PackZ|file://{c}|{'0' * 40}|"])
+    cn = here / "testbed" / "custom_nodes"; cn.mkdir(parents=True)
+    _git("clone", "-q", "--depth", "1", f"file://{b}", str(cn / "PackY"))                 # a testbed cloned before 3.6.1
+    e = {k: v for k, v in os.environ.items() if not k.startswith("BASE_")}
+    r = subprocess.run(["bash", str(here / "testbed.sh"), "--packs"], capture_output=True, text=True, env=e)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _git("rev-parse", "HEAD", cwd=cn / "PackX") == a_main, r.stdout                 # cloned at the row's branch
+    assert _git("rev-parse", "HEAD", cwd=cn / "PackY") == b_main, r.stdout                 # moved off the stale HEAD
+    assert _git("rev-parse", "HEAD", cwd=cn / "PackZ") == c_dev, r.stdout                  # no branch named: the remote's HEAD
+    assert "(main)" in r.stdout and "(HEAD)" in r.stdout, r.stdout
 
 
 # ---------------------------------------------------------------- C: the lift, the override loop, the import check

@@ -64,7 +64,10 @@ _base_ensure_uv(){ # uv is how the newest Python, torch and every package arrive
   [ -x "$b/uv" ]
 }
 _base_newest_python_minor(){ # → the newest stable CPython minor uv can provide (no pre-release, no free-threaded build)
-  uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV | head -1 || true
+  _base_python_minors | head -1 || true
+}
+_base_python_minors(){ # → every stable CPython minor uv can provide, newest first
+  uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV || true
 }
 
 # ---------------------------------------------------------------- picks: genuine latest, no fallback
@@ -84,15 +87,17 @@ _base_python_pick(){ # → newest CPython minor whose uv pip compile resolves th
     err "uv listed no CPython versions — cannot pick a Python (uv $(uv --version 2>/dev/null || echo missing))"
     BASE_FAILED+=("venv: uv python list returned nothing"); return 1
   fi
-  if [ ${#reqargs[@]} -eq 0 ]; then printf '%s\n' "$cands" | head -1; return 0; fi     # nothing to resolve against: take newest
+  # 3.6.1: no shortcut when there is nothing else to resolve against. The torch family alone decides then, and it is
+  # what ruled out the newest minor on 2026-10-15: uv listed CPython 3.15 before torch shipped a cp315 wheel, and
+  # "take the newest" handed 3.15 to the torch pick, which failed every fresh venv's dry run.
   for mm in $cands; do
     printf '    trying Python %s ... ' "$mm" >&2
     if printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" --python-platform "$(_base_uv_platform)" \
          --torch-backend "$backend" --extra-index-url https://pypi.nvidia.com --index-strategy unsafe-best-match \
-         - "${reqargs[@]}" -o "$tmp" >/dev/null 2>"$errf"; then
+         - ${reqargs[@]+"${reqargs[@]}"} -o "$tmp" >/dev/null 2>"$errf"; then
       rm -f "$tmp"; echo "resolves" >&2; echo "$mm"; return 0
     fi
-    echo "no (the requirement set does not resolve)" >&2
+    echo "no (the torch family${reqargs[0]:+ and the requirement set} does not resolve)" >&2
     # uv's own words, or the failure is undiagnosable from the log (a whole run said "no" seven times over an argument error)
     { grep -v '^\s*$' "$errf" | tail -3 | sed 's/^/        /' || true; } >&2
   done
@@ -351,8 +356,10 @@ base_venv(){ # the stage: reuse when the probe passes, otherwise rebuild with ro
   case "$have_backend" in cu*) ;; *) have_backend="";; esac
   BASE_TORCH_BACKEND="$have_backend"
   if [ -z "$BASE_TORCH_BACKEND" ]; then
-    local newest; newest="$(_base_newest_python_minor)"
-    if [ -n "$newest" ] && pick="$(_base_torch_pick "$newest" "" 2>/dev/null)"; then BASE_TORCH_BACKEND="${pick#* }"; fi
+    # 3.6.1: the newest minor torch has a build for, not the newest uv lists (3.15 arrived before its torch wheels)
+    local mm1; for mm1 in $(_base_python_minors); do
+      if pick="$(_base_torch_pick "$mm1" "" 2>/dev/null)"; then BASE_TORCH_BACKEND="${pick#* }"; break; fi
+    done
   fi
   # the pick runs in a command substitution: anything it appends to BASE_FAILED is lost — the caller records the failure
   if ! pymm="$(_base_python_pick)"; then BASE_FAILED+=("venv: no Python resolves the requirement set (uv's reason is above)"); BASE_VENV_RESULT="failed-pick"; return 1; fi

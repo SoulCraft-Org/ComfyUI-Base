@@ -80,7 +80,7 @@ def load_package(pkg_dir):
     return types.SimpleNamespace(
         dir=pkg_dir, script=script, text=text, name=grab("PKG_NAME"), id=grab("PKG_ID"), version=grab("PKG_VERSION"),
         wf_name=wf_name, wf=wf, wf_version_key=grab("WF_VERSION_KEY", "package_version"),
-        packs=[dict(zip(("dir", "url", "sha", "cnr_id", "why"), p + [""] * (5 - len(p)))) for p in packs],
+        packs=[dict(zip(("dir", "url", "sha", "cnr_id", "why", "branch"), p + [""] * (6 - len(p)))) for p in packs],
         models=[dict(zip(("category", "family", "purpose", "file", "url", "bytes", "note", "alts"), m + [""] * (8 - len(m)))) for m in models],
         superseded=[t.strip("\"'") for t in sup.group(1).split()] if sup else [], loader_cats_extra=lcats,
         models_later=later)   # a package may quote its globs
@@ -95,7 +95,7 @@ def base_packs():
     """The base's own BASE_PACKS rows (lib/40-packs.sh), in the shape load_package().packs uses."""
     src = (BASE_LIB / "lib" / "40-packs.sh").read_text(encoding="utf-8")
     body = re.search(r"^BASE_PACKS=\((.*?)^\)", src, re.M | re.S).group(1)
-    return [dict(zip(("dir", "url", "sha", "cnr_id", "why"), (r.split("|") + [""] * 5)[:5])) for r in re.findall(r'"([^"]+)"', body)]
+    return [dict(zip(("dir", "url", "sha", "cnr_id", "why", "branch"), (r.split("|") + [""] * 6)[:6])) for r in re.findall(r'"([^"]+)"', body)]
 
 
 def loader_cats(pkg=None):
