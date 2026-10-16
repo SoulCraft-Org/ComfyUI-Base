@@ -61,7 +61,7 @@ _base_ledger_pack_claimed(){ # <pack dir name> → 0 when another installed pack
   done < <(_base_other_manifests)
   return 1
 }
-base_status(){ hdr "STATUS · $BASE_STATE"; "$SYS_PY" "$BASE_DIR/py/ledger.py" "$BASE_STATE" status; _base_host_status; }
+base_status(){ hdr "STATUS · $BASE_STATE"; "$SYS_PY" "$BASE_DIR/py/ledger.py" "$BASE_STATE" status; _base_host_status; _base_run_status; }
 _base_host_status(){ # 2.2.0: which host the driver recorded for this volume (state/host.env), if any
   [ -f "$BASE_STATE/host.env" ] || return 0
   hdr "HOST · state/host.env"; sed 's/^/  /' "$BASE_STATE/host.env"

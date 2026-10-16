@@ -25,58 +25,43 @@ _base_quick_cpu(){ # 3.10.0: "--cpu" for a seed build. The template image is bui
   # starts on its GPU here (as 3.9.1's BASE_NO_GPU drops the device question for venv_verify.py and nowhere else).
   [ "${BASE_SEED:-0}" = "1" ] && echo "--cpu"; return 0
 }
+_base_quick_here(){ # 3.15.0: a quick test starts where a server would, from the copy on the machine's disk when there is one.
+  # Every quick test follows a change (the run's, a rollback's, a repair's), so the copy is walked again first.
+  RUN_HERE_DIR="$COMFY"; RUN_HERE_PY="$PY"
+  if declare -F _base_run_here >/dev/null; then _base_run_gen_bump; _base_run_here; fi
+}
 _base_quick_test(){ # <log> → main.py --quick-test-for-ci's exit status (ComfyUI loads, imports every pack, exits)
-  (cd "$COMFY" && _base_timeout 900 "$PY" main.py --quick-test-for-ci --disable-auto-launch $(_base_quick_cpu) >"$1" 2>&1)
+  _base_quick_here
+  (cd "$RUN_HERE_DIR" && _base_timeout 900 "$RUN_HERE_PY" main.py --quick-test-for-ci --disable-auto-launch $(_base_quick_cpu) >"$1" 2>&1)
 }
-_base_core_failed(){ # <log> <rc> → 0 when ComfyUI ITSELF did not start (as opposed to a pack that failed to import)
-  local log="$1" rc="$2"
-  # a pack that fails to import prints its traceback and an "(IMPORT FAILED)" line, and ComfyUI still exits 0: a
-  # non-zero exit with no such line is ComfyUI itself (the same judgement 2.x made)
-  [ "$rc" -ne 0 ] && ! grep -q "IMPORT FAILED" "$log"
+_base_pkg_import_check(){ # the package's own import check, with PY the copy's interpreter when there is a good copy: its
+  # `"$PY" -c 'import …'` lines are imports like any other, and over a network volume each one costs a minute. VENV, the
+  # volume's, is what its messages name and what anything that installs must use; nothing in an import check installs.
+  local PY="$PY"
+  if declare -F _base_run_here >/dev/null; then _base_run_here; PY="$RUN_HERE_PY"; fi
+  pkg_import_check
 }
-base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.0: every dependency is at its newest, so:
-  #   a PACK that does not import with them is named as "needs upgrading upstream" (not a failure, the restart goes on);
-  #   ComfyUI's OWN startup failing is the one thing rolled back: only the packages this run changed, from the snapshot.
-  hdr "IMPORT CHECK · main.py --quick-test-for-ci in $VENV"
-  if [ "$BASE_DRY" = "1" ]; then note "skipped in --check"; BASE_IMPORT_RESULT="skipped (--check)"; return 0; fi
-  if [ "$BASE_NO_NET" = "1" ]; then note "skipped (BASE_NO_NET: fake venv)"; BASE_IMPORT_RESULT="skipped (fake)"; return 0; fi
-  case "$BASE_VENV_RESULT" in failed*|rolled*) note "skipped — the venv step failed"; BASE_IMPORT_RESULT="skipped (venv failed)"; BASE_BLOCK_RESTART=1; return 0;; esac
-  if [ ! -x "$PY" ]; then note "skipped — no interpreter at $PY"; BASE_IMPORT_RESULT="skipped (no venv)"; return 0; fi
-  _base_tmp; local log="$BASE_TMPD/import_check.log" rc=0 name failed=() diag
-  _base_quick_test_scoped "$log" || rc=$?            # 3.2.0: just the own packs when nothing else changed (lib/62-own-packs.sh)
-  # ---- ComfyUI itself did not start: that stops every machine on the store, so the newest set is rolled back
-  if _base_core_failed "$log" "$rc"; then
-    miss "ComfyUI itself did not start (exit $rc): last lines:"; tail -12 "$log" | sed 's/^/     /'
-    cp "$log" "$BASE_STATE/import_check.log" 2>/dev/null || true
-    if [ -n "$BASE_VENV_BACKUP" ] && _base_confirm_yes "Roll the venv back to $BASE_VENV_BACKUP (the old server keeps running either way)? [Y/n] "; then
-      _base_venv_rollback || true
-      BASE_FAILED+=("import check: ComfyUI did not start in the rebuilt venv; rolled back to $BASE_VENV_BACKUP"); BASE_IMPORT_RESULT="FAILED (rebuilt venv rolled back)"; BASE_BLOCK_RESTART=1; return 0
-    fi
-    if _base_runtime_on; then                         # 3.1.0: nothing was changed, so nothing is rolled back
-      BASE_FAILED+=("import check: ComfyUI did not start from the proven runtime (log: $BASE_STATE/import_check.log)"); BASE_IMPORT_RESULT="FAILED (runtime)"; BASE_BLOCK_RESTART=1; return 0
-    fi
-    local changed=""
-    if base_lift_rollback_core; then
-      changed="$(tr '\n' ' ' < "$BASE_LIFT_DIR/rollback.txt" 2>/dev/null | cut -c1-400)"
-      rc=0; _base_quick_test "$log" || rc=$?
-      if ! _base_core_failed "$log" "$rc"; then
-        err "ComfyUI starts again with the packages this run changed put back: ${changed:-none}"
-        BASE_FAILED+=("import check: ComfyUI did not start with the newest of: ${changed:-?}; those were rolled back, ComfyUI starts, and they need upgrading upstream")
-        BASE_UPSTREAM+=("ComfyUI $COMFY_NEW does not start with the newest of: ${changed:-?}")
-        BASE_IMPORT_RESULT="FAILED (core; rolled back, ComfyUI starts)"
-      else
-        BASE_FAILED+=("import check: ComfyUI does not start (exit $rc), even with this run's changes rolled back; see $BASE_STATE/import_check.log")
-        BASE_IMPORT_RESULT="FAILED (core, exit $rc)"; BASE_BLOCK_RESTART=1; return 0
-      fi
-    else
-      BASE_FAILED+=("import check: ComfyUI does not start (exit $rc) and there was no snapshot to roll back to"); BASE_IMPORT_RESULT="FAILED (core, exit $rc)"; BASE_BLOCK_RESTART=1; return 0
-    fi
-  fi
+_base_import_rides_launch(){ # 3.15.0 → 0 when the install's own launch, right after, can be the import proof instead of a quick test
+  # The quick test starts ComfyUI, imports every pack and exits; the launch after it does all of that again. Where there
+  # is no server to protect (a fresh pod, a first install, a stopped one) and the run will start one (BASE_RESTART=1),
+  # one start is enough: the launch's own log is judged by the same rules. Where a server answers, the quick test still
+  # runs first, because its job there is to leave a healthy server alone when the new code does not start.
+  [ "${BASE_IMPORT_DEFER:-1}" = "1" ] || return 1
+  [ "${BASE_RESTART:-0}" = "1" ] || return 1
+  [ "${BASE_SEED:-0}" != "1" ] || return 1
+  [ "${BASE_BLOCK_RESTART:-0}" != "1" ] || return 1
+  [ "${BASE_IMPORT_LONG_WAY:-0}" != "1" ] || return 1
+  if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then return 1; fi
+  return 0
+}
+_base_import_packs(){ # <log> <retest fn>: every pack the log says did not import is named; a missing module is repaired and
+  # <retest> writes a fresh log to judge again. Sets BASE_IMPORT_FAILED (the names).
+  local log="$1" retest="$2" name failed=() diag
   # ---- packs: named, never blocking. The pack's own newest code cannot run with a newest dependency.
   while IFS= read -r name; do [ -n "$name" ] && failed+=("$name"); done < <(grep -E '\(IMPORT FAILED\):' "$log" | sed -E 's/.*\(IMPORT FAILED\):[[:space:]]*//' | xargs -n1 basename 2>/dev/null | sort -u || true)
   # 3.3.0: a pack that fails on a module nothing declared gets it (from the reviewed map, lib/47-latest.sh), and is judged again
   if [ "${#failed[@]}" -gt 0 ] && _base_repair_modules "$log"; then
-    rc=0; _base_quick_test "$log" || rc=$?; failed=()
+    "$retest" "$log" || true; failed=()
     while IFS= read -r name; do [ -n "$name" ] && failed+=("$name"); done < <(grep -E '\(IMPORT FAILED\):' "$log" | sed -E 's/.*\(IMPORT FAILED\):[[:space:]]*//' | xargs -n1 basename 2>/dev/null | sort -u || true)
   fi
   if [ "${#failed[@]}" -gt 0 ]; then
@@ -88,11 +73,121 @@ base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.
     done
     cp "$log" "$BASE_STATE/import_check.log" 2>/dev/null || true; echo "  full log: $BASE_STATE/import_check.log"
   fi
-  if declare -F pkg_import_check >/dev/null; then pkg_import_check || { BASE_BLOCK_RESTART=1; BASE_IMPORT_RESULT="FAILED (package check)"; return 0; }; fi
+  BASE_IMPORT_FAILED="${failed[*]-}"
+}
+_base_import_result_ok(){ # [how]: the verdict line, unless something already failed it; how = "" for the quick test
+  local n=0 how="${1:-}"
+  if [ -n "${BASE_IMPORT_FAILED:-}" ]; then n="$(echo $BASE_IMPORT_FAILED | wc -w | tr -d ' ')"; fi
   if [ -z "$BASE_IMPORT_RESULT" ] || [ "${BASE_IMPORT_RESULT#FAILED}" = "$BASE_IMPORT_RESULT" ]; then
-    if [ "${#failed[@]}" -gt 0 ]; then BASE_IMPORT_RESULT="ok: ComfyUI starts; ${#failed[@]} pack(s) named for upstream (${failed[*]})"
-    else BASE_IMPORT_RESULT="ok (${#PACK_DIRS[@]} packs import)"; ok "every pack imports; ComfyUI loaded and exited cleanly"; fi
+    if [ "$n" -gt 0 ]; then BASE_IMPORT_RESULT="ok: ComfyUI starts; $n pack(s) named for upstream ($BASE_IMPORT_FAILED)${how:+; $how}"
+    elif [ -z "$how" ]; then BASE_IMPORT_RESULT="ok (${#PACK_DIRS[@]} packs import)"; ok "every pack imports; ComfyUI loaded and exited cleanly"
+    else BASE_IMPORT_RESULT="ok (${#PACK_DIRS[@]} packs import; $how)"; ok "every pack imports ($how)"; fi
   fi
+}
+_base_core_failed(){ # <log> <rc> → 0 when ComfyUI ITSELF did not start (as opposed to a pack that failed to import)
+  local log="$1" rc="$2"
+  # a pack that fails to import prints its traceback and an "(IMPORT FAILED)" line, and ComfyUI still exits 0: a
+  # non-zero exit with no such line is ComfyUI itself (the same judgement 2.x made)
+  [ "$rc" -ne 0 ] && ! grep -q "IMPORT FAILED" "$log"
+}
+base_import_check(){ # main.py --quick-test-for-ci, ONCE, after every hook. 3.0.0: every dependency is at its newest, so:
+  #   a PACK that does not import with them is named as "needs upgrading upstream" (not a failure, the restart goes on);
+  #   ComfyUI's OWN startup failing is the one thing rolled back: only the packages this run changed, from the snapshot.
+  # 3.15.0: from the copy on the machine's disk; and with no server to protect, the launch right after IS the check.
+  hdr "IMPORT CHECK · main.py --quick-test-for-ci in $VENV"
+  if [ "$BASE_DRY" = "1" ]; then note "skipped in --check"; BASE_IMPORT_RESULT="skipped (--check)"; return 0; fi
+  if [ "$BASE_NO_NET" = "1" ]; then note "skipped (BASE_NO_NET: fake venv)"; BASE_IMPORT_RESULT="skipped (fake)"; return 0; fi
+  case "$BASE_VENV_RESULT" in failed*|rolled*) note "skipped — the venv step failed"; BASE_IMPORT_RESULT="skipped (venv failed)"; BASE_BLOCK_RESTART=1; return 0;; esac
+  if [ ! -x "$PY" ]; then note "skipped — no interpreter at $PY"; BASE_IMPORT_RESULT="skipped (no venv)"; return 0; fi
+  if declare -F _base_run_gen_bump >/dev/null; then _base_run_gen_bump; fi   # this run may have changed the code: the next start walks it
+  BASE_IMPORT_FAILED=""
+  if _base_import_rides_launch; then
+    BASE_IMPORT_DEFERRED=1; BASE_IMPORT_RESULT="deferred to the launch"
+    note "no ComfyUI to keep running and BASE_RESTART=1: the install's own start below is the import check (one start, not two; BASE_IMPORT_DEFER=0 runs the quick test first)"
+    if declare -F pkg_import_check >/dev/null; then
+      _base_pkg_import_check || { BASE_BLOCK_RESTART=1; BASE_IMPORT_RESULT="FAILED (package check)"; BASE_IMPORT_DEFERRED=0; }
+    fi
+    return 0
+  fi
+  BASE_IMPORT_DEFERRED=0
+  _base_tmp; local log="$BASE_TMPD/import_check.log" rc=0
+  _base_quick_test_scoped "$log" || rc=$?            # 3.2.0: just the own packs when nothing else changed (lib/62-own-packs.sh)
+  _base_import_core "$log" "$rc" || return 0
+  _base_import_packs "$log" _base_quick_test
+  if declare -F pkg_import_check >/dev/null; then _base_pkg_import_check || { BASE_BLOCK_RESTART=1; BASE_IMPORT_RESULT="FAILED (package check)"; return 0; }; fi
+  _base_import_result_ok
+}
+_base_import_core(){ # <log> <rc> → 1 when ComfyUI ITSELF did not start and the run must not go on to a restart (rolled back or not)
+  local log="$1" rc="$2"
+  # ---- ComfyUI itself did not start: that stops every machine on the store, so the newest set is rolled back
+  _base_core_failed "$log" "$rc" || return 0
+  miss "ComfyUI itself did not start (exit $rc): last lines:"; tail -12 "$log" | sed 's/^/     /'
+  cp "$log" "$BASE_STATE/import_check.log" 2>/dev/null || true
+  if [ -n "$BASE_VENV_BACKUP" ] && _base_confirm_yes "Roll the venv back to $BASE_VENV_BACKUP (the old server keeps running either way)? [Y/n] "; then
+    _base_venv_rollback || true
+    BASE_FAILED+=("import check: ComfyUI did not start in the rebuilt venv; rolled back to $BASE_VENV_BACKUP"); BASE_IMPORT_RESULT="FAILED (rebuilt venv rolled back)"; BASE_BLOCK_RESTART=1; return 1
+  fi
+  if _base_runtime_on; then                         # 3.1.0: nothing was changed, so nothing is rolled back
+    BASE_FAILED+=("import check: ComfyUI did not start from the proven runtime (log: $BASE_STATE/import_check.log)"); BASE_IMPORT_RESULT="FAILED (runtime)"; BASE_BLOCK_RESTART=1; return 1
+  fi
+  local changed=""
+  if base_lift_rollback_core; then
+    changed="$(tr '\n' ' ' < "$BASE_LIFT_DIR/rollback.txt" 2>/dev/null | cut -c1-400)"
+    rc=0; _base_quick_test "$log" || rc=$?
+    if ! _base_core_failed "$log" "$rc"; then
+      err "ComfyUI starts again with the packages this run changed put back: ${changed:-none}"
+      BASE_FAILED+=("import check: ComfyUI did not start with the newest of: ${changed:-?}; those were rolled back, ComfyUI starts, and they need upgrading upstream")
+      BASE_UPSTREAM+=("ComfyUI $COMFY_NEW does not start with the newest of: ${changed:-?}")
+      BASE_IMPORT_RESULT="FAILED (core; rolled back, ComfyUI starts)"
+      return 0
+    fi
+    BASE_FAILED+=("import check: ComfyUI does not start (exit $rc), even with this run's changes rolled back; see $BASE_STATE/import_check.log")
+    BASE_IMPORT_RESULT="FAILED (core, exit $rc)"; BASE_BLOCK_RESTART=1; return 1
+  fi
+  BASE_FAILED+=("import check: ComfyUI does not start (exit $rc) and there was no snapshot to roll back to"); BASE_IMPORT_RESULT="FAILED (core, exit $rc)"; BASE_BLOCK_RESTART=1; return 1
+}
+_base_log_size(){ if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }
+_base_log_since(){ # <file> <offset> → what was appended after offset (the whole file when it was cut shorter since)
+  local n; n="$(_base_log_size "$1")"; n="${n:-0}"
+  if [ "$n" -lt "${2:-0}" ] 2>/dev/null; then cat "$1" 2>/dev/null; else tail -c +"$(( ${2:-0} + 1 ))" "$1" 2>/dev/null; fi
+  return 0
+}
+_base_import_relaunch(){ # <log>: the launch-mode retest: start again, and the new start's slice of comfyui.log is the log
+  local off rc=0
+  off="$(_base_log_size "$COMFY_LOG")"
+  _base_restart_comfy || rc=$?
+  _base_log_since "$COMFY_LOG" "${off:-0}" > "$1"
+  return $rc
+}
+_base_restart_proven(){ # _base_restart_comfy; when the import check rode along (3.15.0), what this start imported is judged here
+  local off rc=0
+  if [ "${BASE_IMPORT_DEFERRED:-0}" != "1" ]; then _base_restart_comfy; return $?; fi
+  off="$(_base_log_size "$COMFY_LOG")"
+  _base_restart_comfy || rc=$?
+  BASE_IMPORT_DEFERRED=0
+  _base_tmp; local log="$BASE_TMPD/import_check.log"
+  _base_log_since "$COMFY_LOG" "${off:-0}" > "$log"
+  echo "  IMPORT CHECK · judged from this start's own log"
+  if [ "$rc" -ne 0 ]; then
+    # a start that never answered may be ComfyUI itself failing: the long way, with every rollback rule, then start again
+    warn "this start did not come up: the import check runs the long way (the quick test, then the rollback rules)"
+    cp "$log" "$BASE_STATE/import_check.log" 2>/dev/null || true
+    _base_stop_comfy || true
+    BASE_IMPORT_RESULT=""; BASE_IMPORT_LONG_WAY=1
+    base_import_check || true
+    _base_own_packs_judge "$BASE_TMPD/import_check.log" || true
+    if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then miss "not started again: the import check failed (above)"; return 1; fi
+    _base_restart_comfy; return $?
+  fi
+  _base_import_packs "$log" _base_import_relaunch
+  local blocked="${BASE_BLOCK_RESTART:-0}"
+  _base_own_packs_judge "$log" || true
+  if [ "${BASE_BLOCK_RESTART:-0}" = "1" ] && [ "$blocked" != "1" ]; then
+    note "an own pack did not import and its previous copy is back: starting once more so the server runs that copy"
+    _base_restart_comfy || true
+  fi
+  _base_import_result_ok "the launch was the check"
+  return 0
 }
 
 _base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactly ONE up, wait for it; 0 when it answers
@@ -143,12 +238,13 @@ base_restart(){ # reports what needs a restart and prints the exact launch line;
   if [ "${#PKG_RESTART_WHY[@]}" -gt 0 ]; then BASE_RESTART_WHY+=(${PKG_RESTART_WHY[@]+"${PKG_RESTART_WHY[@]}"}); fi
   # 3.3.0: Python packages this run moved (the newest pass, a repaired module): the running server has the old ones loaded
   if [ "${BASE_PY_MOVED:-0}" -gt 0 ] 2>/dev/null; then BASE_RESTART_WHY+=("$BASE_PY_MOVED Python package(s) moved; the running server still has the old ones loaded"); fi
+  if [ "${BASE_IMPORT_DEFERRED:-0}" = "1" ]; then BASE_RESTART_WHY+=("the import check rides this start (3.15.0)"); fi
   local live=0
   curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1 && live=1
   if [ "$live" = 0 ]; then
     if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then miss "do NOT start ComfyUI — the import check failed; fix that first"; BASE_RESTART_RESULT="do not start (import check failed)"; BASE_RESTART_NEEDED=1; return 0; fi
     if [ "$BASE_RESTART" = "1" ]; then       # opting in means a running server at the end, whether or not one was running before (2.0.11)
-      if _base_restart_comfy; then ok "ComfyUI started (BASE_RESTART=1, $BASE_RESTART_VIA)"; BASE_RESTART_RESULT="started"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
+      if _base_restart_proven; then ok "ComfyUI started (BASE_RESTART=1, $BASE_RESTART_VIA)"; BASE_RESTART_RESULT="started"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
       else err "ComfyUI did not answer within ${BASE_START_WAIT:-600} s — last 40 lines of $COMFY_LOG:"; tail -40 "$COMFY_LOG" 2>/dev/null | sed 's/^/     /'; BASE_RESTART_RESULT="FAILED"; BASE_FAILED+=("ComfyUI did not come up"); fi
       return 0
     fi
@@ -161,7 +257,7 @@ base_restart(){ # reports what needs a restart and prints the exact launch line;
   if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then miss "do NOT restart — the import check failed; the running server is still healthy"; BASE_RESTART_RESULT="do not restart (import check failed)"; return 0; fi
   if [ "${#BASE_RESTART_WHY[@]}" -eq 0 ]; then ok "nothing changed that needs a restart"; BASE_RESTART_RESULT="not needed"; _base_preview_effective; return 0; fi
   if [ "$BASE_RESTART" = "1" ]; then
-    if _base_restart_comfy; then ok "ComfyUI restarted (BASE_RESTART=1, $BASE_RESTART_VIA)"; BASE_RESTART_RESULT="restarted"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
+    if _base_restart_proven; then ok "ComfyUI restarted (BASE_RESTART=1, $BASE_RESTART_VIA)"; BASE_RESTART_RESULT="restarted"; RUN_PID="$(_base_comfy_pids | head -1 || true)"; _base_preview_effective
     else err "ComfyUI did not answer within ${BASE_START_WAIT:-600} s — last 40 lines of $COMFY_LOG:"; tail -40 "$COMFY_LOG" 2>/dev/null | sed 's/^/     /'; BASE_RESTART_RESULT="FAILED"; BASE_FAILED+=("ComfyUI did not come back up"); fi
     return 0
   fi

@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.14.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.15.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -50,6 +50,27 @@ run once per machine as **step one**; then each workflow package is **step two**
    so a venv that cannot boot leaves a reachable machine with the reason in the boot log; `rescue` repairs it without
    executing the interpreter. A volume root that is not a mountpoint is refused outright, unless
    `BASE_VOLUME_KIND=dir` says the machine is an owned box (§1).
+   **What RUNS is a copy on the machine's own disk** (3.15.0, `lib/84-run-local.sh`, `py/run_local.py`). The volume
+   copy is the truth and the durable cache: every install writes it as above, and every ComfyUI process the base starts
+   (the boot's, the install's restart, the quick test) starts from a generation on the container disk,
+   `/opt/comfy-run/<gen>/<source path>`: the tree minus `models/ input/ output/ user/ temp/` (symlinks to the volume's),
+   every `.git` and every file of 64 MiB or more outside the venv a symlink to the volume's, the venv and the uv Python
+   whole, with the venv's own paths rewritten in the copy (bin/ links, `pyvenv.cfg`, shebangs, `*.pth`, editable
+   finders). A parallel walk copies what changed and hardlinks the rest from the previous generation, so no file is
+   written under a running server; the copy's python must import torch with `sys.prefix` inside the generation before
+   it is used; a fingerprint (`state/run.gen`, which every import check bumps, plus the mtimes of the tree, each pack,
+   the venv's stamp and site-packages) lets a start that changed nothing skip the walk. A container disk that came back
+   empty is copied again. Anything short of a good copy (no room for it plus 4 GiB, an unreadable file, the check
+   failing) says why on one line and runs from the volume, as before. `BASE_LOCAL_RUN=auto` is on for RunPod when the
+   volume's filesystem is a network one (`fuse`, `nfs`, …; `/proc/self/mountinfo`); `1` forces it on any host, `0`
+   turns it off. The boot starts the copy first thing, in the background beside sshd, JupyterLab and the extensions
+   (`boot_prewarm`), and `_base_run_prewarm` gives an install the same head start; the start that follows waits on the
+   copy's lock. A start that runs from the volume after all has the volume's code read 64 files at a time in the
+   background beside it (`run_local.py warm`, network filesystems only). MEASURED before, on RunPod network volumes:
+   1.72 ms per stat on the volume against 0.01 ms on the container disk, `import torch` alone 56 s, the import check
+   7.6 minutes and the restart 3.5 minutes (the platform orchestrator, pod kmgqu8yf0pscts); the Video Swapper's
+   `--quick-test-for-ci` 5+ minutes at near-zero CPU, 262 of 265 threads waiting and one in a FUSE read. Reading the
+   whole venv and custom_nodes 64 at a time took 18 s, after which the imports took seconds.
 5. **The library is `models/<category>/<Family>[/<Purpose>]/<upstream filename>`.** A Family is a plain folder name
    (letters, digits, `. _ -`); the base checks the shape, and a brand keeps one spelling per family across its
    packages in `<brand>/families.txt` (§4). Two packages that want the same file declare the same row and it is
@@ -530,7 +551,9 @@ so the next run's first resolve keeps it; a force a package refused is remembere
 either version moves) → `pkg_pre_models` → [join the model downloads] →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
 GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
-import check → hygiene → boot (boot.sh, tools venv, boot.env) → ledger → restart hand-off (or `BASE_RESTART=1`) →
+import check (3.15.0: from the local copy; with `BASE_RESTART=1` and no server answering, deferred to the restart, whose
+own start is judged from its slice of `comfyui.log` by the same rules) → hygiene → boot (boot.sh, tools venv, boot.env) →
+ledger → restart hand-off (or `BASE_RESTART=1`) →
 smoke → combos → the later stage handed to a detached `fetch-later` (a staged run) → the package's suite →
 `pkg_post_install` → summary (exit 0, or 1 when anything failed; the verdict kept in `state/last-run/<id>`).
 
@@ -600,6 +623,7 @@ and a failed import check is a failure, never a rollback.
 | The volume | the volume root, `BASE_VOLUME` (`/workspace` on the three clouds; your directory on an owned box): the only filesystem a stop/start keeps; a root that is not a mountpoint is refused unless `BASE_VOLUME_KIND=dir` |
 | The tree | recorded in `state/boot.env`, else an existing volume tree, else materialised at `<volume>/ComfyUI` (§0.2) |
 | The venv | `$COMFY/.venv-cu130`, interpreter under `<volume>/comfy-base/python` |
+| What runs | 3.15.0: a copy of the tree's code, the venv and the uv Python on the machine's own disk (`BASE_RUN_ROOT`, default `/opt/comfy-run`), kept in step with the volume at every start; on by default for RunPod on a network volume (`BASE_LOCAL_RUN`, §0.4) |
 | Packs | the base's six + each package's, cloned into `$COMFY/custom_nodes`; other directories there are left alone but their requirements go into the venv |
 | Models | scanned and consolidated on the volume only; the container disk is never read (it is gone at the next start) |
 | Launch flags | `state/comfyui_args.txt` (§0.10) |
@@ -636,7 +660,7 @@ every source), `boot.sh`, `comfy-base-boot.service` (the unit's text, always wri
 `/etc/systemd/system` on a VM host), `ext/` when a project's image put extensions there (§9), `state/` (`boot.env`,
 `host.env` (`BASE_HOST`, `BASE_VOLUME`, written by the driver), `comfyui_args.txt`, `tokens.env` 0600, `apps.d/<package>.list`
 (3.9.0: the package's `APP_PORTS` rows), `launch.d/<id>.env` (3.10.0: each package's `LAUNCH_ENV`, §4),
-`constraints-torch.txt`, `boot-facts.txt`, `volume.env` on RunPod, `gpu.lease`, `packages/<id>.manifest`, `logs/`: install
+`constraints-torch.txt`, `boot-facts.txt`, `volume.env` on RunPod, `run.gen` (3.15.0: bumped when the code may have changed, read by the local copy's fingerprint), `gpu.lease`, `packages/<id>.manifest`, `logs/`: install
 logs, `boot_<ts>.log`, `comfyui.log`, `jupyter.log`, `app_proxy.log`, `fetch-later_<ts>.log`; 3.1.0: `last-run/<id>` (the last run's
 verdict), `runtime.json` and `runtime.stamp` (the applied runtime), and for a staged install `standins.list`,
 `later.queue`, `later.failed`, `fetch-later.pid` and `progress.json`:
@@ -751,6 +775,32 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.15.0: ComfyUI runs from a copy of its code on the machine's own disk, and a first install starts ComfyUI once, not
+  twice (2026-10-16). Why: on a RunPod network volume every file access is a FUSE round trip, and the install's import
+  check MEASURED 5+ minutes at near-zero CPU (the Video Swapper; 262 of 265 threads on futexes, one in
+  request_wait_answer): the 12 GB venv, the uv Python and custom_nodes were all read over it at every start. What
+  changed (§0.4): every start (boot, restart, quick test) mirrors the volume's code to `/opt/comfy-run/<gen>/` in
+  parallel (32 reads at once), hardlinking what did not change, rewriting the venv's paths in the copy, proving the
+  copy imports torch, and starts there; the volume stays the truth and no install step changed. The pid matcher knows
+  a server whose cwd is the copy. The boot's own torch gate is the copy's check when there is one. And the import
+  check: with `BASE_RESTART=1` and nothing answering on the port (a fresh pod, a first install), the quick test is
+  skipped and the install's own start is the proof, judged from its slice of `comfyui.log` with the same rules
+  (packs named, the module repair with a relaunch, the own-pack judge, which starts once more on a restored copy); a
+  start that never answers is stopped and judged the long way (the quick test, the rollback) and started again. With
+  a server answering, the quick test still runs first, from the copy. `BASE_IMPORT_DEFER=0` keeps the old order;
+  `BASE_LOCAL_RUN=0` runs from the volume. `base.sh status` prints the copy. The boot starts the copy first thing, in the
+  background; without a copy the volume's code is read 64 files at a time beside the start (18 s for the whole venv
+  and custom_nodes, measured by the platform orchestrator, after which imports took seconds; before: 1.72 ms per stat,
+  `import torch` 56 s, the import check 7.6 min, the restart 3.5 min). Proven: the suite on this Mac and in CI
+  (`suite/test_run_local.py`: a real venv copied, relocated and run; hardlinks; fingerprint; fallbacks; the deferred
+  judge against a fake server) and its CI. NOT YET RUN ON A POD: RunPod had no credit on 2026-10-16, so the copy, the
+  head start and the deferred import check are proven against fakes and real local venvs only, and the before/after
+  timings on a network volume follow as soon as there is credit. What keeps that safe: a copy that fails, or a disk too
+  small for it, starts ComfyUI from the volume exactly as before. Every background start (the head start, the warm read)
+  is one exec'd `run_local.py` process, never a forked shell, which would show its parent's command line to `ps` (CI
+  caught one through 3.10.1's stray-forwarder guard). And `_build/verify.sh` now names a test that ERRORS (setup or
+  teardown), not only one that fails: that CI run said "1 error" and named nothing.
 
 - 3.14.0: delight first, then secure, then private (Paul, 2026-10-16). `podctl create` on RunPod is PUBLIC by default
   again, with ComfyUI, the Jupyter Terminal and each app named in the Connect tab; `--private` is the opt-in (3.8.1's

@@ -2141,7 +2141,10 @@ def test_unit_restart_uses_the_same_launch_function_as_boot():
     assert sum("_base_start_comfy()" in t for t in defs.values()) == 1 and "_base_start_comfy()" in defs["85-launch.sh"]
     # 3.0.3: base_restart goes through _base_restart_comfy, which starts with the same _base_start_comfy when no unit owns ComfyUI
     restart = defs["80-server.sh"][defs["80-server.sh"].index("_base_restart_comfy()"):defs["80-server.sh"].index("base_smoke()")]
-    assert "_base_start_comfy" in restart and "_base_restart_comfy" in restart[restart.index("base_restart()"):]
+    # 3.15.0: through _base_restart_proven, which is _base_restart_comfy plus the judgement of a deferred import check
+    proven = defs["80-server.sh"][defs["80-server.sh"].index("_base_restart_proven()"):defs["80-server.sh"].index("_base_restart_comfy()")]
+    assert "_base_start_comfy" in restart and "_base_restart_proven" in restart[restart.index("base_restart()"):]
+    assert "_base_restart_comfy" in proven
     assert "85-launch.sh" in defs["boot.sh"] and "_base_start_comfy" in defs["boot.sh"][defs["boot.sh"].index("boot_comfy()"):]
     # the real /proc walk feeds the same matcher (no second opinion on what a ComfyUI process is), and since 3.0.3 it lives
     # in 85-launch.sh so the boot has it too
