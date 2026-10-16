@@ -117,12 +117,100 @@ _base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHIN
     case "$d" in /*) mkdir -p "$d" 2>/dev/null || true ;; esac
   done
 }
+# 3.10.0: the LAUNCH ENVIRONMENT. ComfyUI's process environment is the base's (a package cannot reach the pod's start
+# command), so a package that needs a variable set for ComfyUI declares it, and the base starts ComfyUI with it, at every
+# restart and every boot. The contract (handbook §4):
+#   LAUNCH_ENV=( "KEY=value" ... )   in the package script; the install writes it to state/launch.d/<PKG_ID>.env
+# Only the keys below, and CT2_* (CTranslate2's own), may be set: thread counts and allocator tuning, nothing that names
+# a path, a library, a credential or a variable the base itself owns (PATH, LD_PRELOAD, PYTHONPATH, HF_HOME, the tokens).
+# A value is one word of [A-Za-z0-9_.,:+-]: a number, a flag, an allocator string, never a path or a shell expansion.
+# Precedence: a value the machine's own environment already has (the pod's env, the unit's) > the packages' files, in
+# name order, the first one naming a key winning (a different value later is named on stderr) > the base's default.
+# The base's one default is OMP_NUM_THREADS from the container's CPU QUOTA (_base_cpu_quota), never the host's count.
+BASE_LAUNCH_ENV_KEYS="OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS"
+BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING"
+_base_launch_env_ok(){ # KEY=value → 0 when it is an entry the contract above allows
+  local k v
+  case "$1" in *=*) ;; *) return 1 ;; esac
+  k="${1%%=*}"; v="${1#*=}"
+  case "$v" in ''|*[!A-Za-z0-9_.,:+-]*) return 1 ;; esac
+  case "$k" in CT2_*) case "$k" in *[!A-Z0-9_]*) return 1 ;; esac; return 0 ;; esac
+  case " $BASE_LAUNCH_ENV_KEYS " in *" $k "*) return 0 ;; esac
+  return 1
+}
+_base_launch_env_rows(){ # prints the package's validated LAUNCH_ENV entries; 1 naming each bad one (a key set twice is bad)
+  local kv k keys=" " bad=0
+  for kv in ${LAUNCH_ENV[@]+"${LAUNCH_ENV[@]}"}; do
+    if ! _base_launch_env_ok "$kv"; then
+      echo "  !! LAUNCH_ENV '$kv' is not KEY=value with an allowed key ($BASE_LAUNCH_ENV_KEYS CT2_*) and a one-word value of [A-Za-z0-9_.,:+-]" >&2
+      bad=1; continue
+    fi
+    k="${kv%%=*}"
+    case "$keys" in *" $k "*) echo "  !! LAUNCH_ENV sets $k twice" >&2; bad=1; continue ;; esac
+    keys="$keys$k "; echo "$kv"
+  done
+  return $bad
+}
+_base_cpus_online(){ nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true; }
+_base_cpu_quota(){ # → the whole CPUs this container's cgroup quota allows (rounded up, at most the CPUs online); nothing when unlimited
+  # cgroup v2 says `<quota> <period>` in cpu.max ("max 100000" when unlimited); v1 says it in cpu.cfs_quota_us (-1) and
+  # cpu.cfs_period_us. A RunPod container is a slice of a big host: nproc and torch both see the HOST's CPUs (every
+  # core of a multi-GPU server) while the CFS quota lets the container run only its own (16 vCPU, say), so a pool sized by the host is
+  # throttled. BASE_CGROUP_ROOT is the suite's fake /sys/fs/cgroup.
+  local root="${BASE_CGROUP_ROOT:-/sys/fs/cgroup}" q="" p="" d n on
+  if [ -r "$root/cpu.max" ]; then read -r q p < "$root/cpu.max" || true
+  else
+    for d in "$root/cpu" "$root/cpu,cpuacct"; do
+      if [ -r "$d/cpu.cfs_quota_us" ] && [ -r "$d/cpu.cfs_period_us" ]; then q="$(cat "$d/cpu.cfs_quota_us")"; p="$(cat "$d/cpu.cfs_period_us")"; break; fi
+    done
+  fi
+  case "$q" in ''|*[!0-9]*) return 0 ;; esac                # max, -1, or nothing readable: no quota
+  case "$p" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$p" -gt 0 ] && [ "$q" -gt 0 ] || return 0
+  n=$(( (q + p - 1) / p ))
+  on="$(_base_cpus_online)"
+  case "$on" in ''|*[!0-9]*) ;; *) if [ "$on" -gt 0 ] && [ "$n" -gt "$on" ]; then n="$on"; fi ;; esac
+  echo "$n"
+}
+_base_launch_env_dir(){ local s="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; [ -n "$s" ] && echo "$s/launch.d"; }
+_base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedence above); what was dropped, and why, on stderr
+  local dir f kv k v seen="" n first
+  dir="$(_base_launch_env_dir)"
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    for f in "$dir"/*.env; do
+      [ -f "$f" ] || continue
+      while IFS= read -r kv || [ -n "$kv" ]; do
+        case "$kv" in ''|'#'*) continue ;; esac
+        if ! _base_launch_env_ok "$kv"; then echo "  ! $(basename "$f"): '$kv' is not an allowed launch variable: left out" >&2; continue; fi
+        k="${kv%%=*}"; v="${kv#*=}"
+        case "$seen" in
+          *"|$k="*)
+            first="$(printf '%s' "$seen" | tr '|' '\n' | sed -n "s/^$k=//p" | head -1)"
+            if [ "${first%%@*}" != "$v" ]; then echo "  ! $k: ${first#*@} sets ${first%%@*}, $(basename "$f" .env) sets $v: ${first%%@*} is used (the first by name)" >&2; fi
+            continue ;;
+        esac
+        seen="$seen|$k=$v@$(basename "$f" .env)"
+      done < "$f"
+    done
+  fi
+  case "$seen" in
+    *"|OMP_NUM_THREADS="*) ;;
+    *) n="$(_base_cpu_quota)"; if [ -n "$n" ]; then seen="$seen|OMP_NUM_THREADS=$n@the CPU quota"; fi ;;
+  esac
+  printf '%s\n' "$seen" | tr '|' '\n' | while IFS= read -r kv; do         # KEY=value@source, one per line (the last one too)
+    [ -n "$kv" ] || continue
+    k="${kv%%=*}"; v="${kv#*=}"; v="${v%%@*}"
+    if [ -n "${!k+x}" ]; then echo "  ! $k=${!k} is set in this machine's environment: it wins over $k=$v (${kv#*@})" >&2
+    else echo "$k=$v"; fi
+  done
+}
 _base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints what would actually run
-  local extra pv hf ff
+  local extra pv hf ff le
   extra="$(_base_launch_args 2>/dev/null | tr '\n' ' ')"; extra="${extra% }"
   pv="$(_base_preview_flags)"; hf="$(_base_hf_home)"; ff="$(_base_ffmpeg_path)"
+  le="$(_base_launch_env 2>/dev/null | tr '\n' ' ')"; le="${le% }"     # 3.10.0: the launch environment, after the base's own two
   # `env HF_HOME=…`, not a bare assignment: the line is printed after `nohup`, and nohup would execute the assignment (2.0.11)
-  printf '%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "$PY" "${BASE_LISTEN:-0.0.0.0}" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
+  printf '%s%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "${le:+env $le }" "$PY" "${BASE_LISTEN:-0.0.0.0}" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
 }
 _base_start_comfy(){
   local extra=() w pv=()
@@ -135,8 +223,12 @@ _base_start_comfy(){
   # HF_HOME is EXPORTED in the subshell: an expansion that yields `HF_HOME=/x` in command position is a command name to
   # bash, not an assignment — the pod's restart died on "HF_HOME=/workspace/huggingface: No such file or directory" (2.0.10)
   local ff; ff="$(_base_ffmpeg_path)"; [ -n "$ff" ] && echo "  ffmpeg with nvenc: $ff (VHS_FORCE_FFMPEG_PATH)" || true
+  # 3.10.0: computed once, here, so what it dropped is said once; exported in the subshell only, so this shell (and
+  # through it a JupyterLab terminal's next install) never mistakes the base's own value for the machine's
+  local le kv; le="$(_base_launch_env || true)"; [ -n "$le" ] && echo "  launch env: $(echo $le)" || true
   (cd "$COMFY" && { if [ -n "$hf" ]; then export HF_HOME="$hf"; fi
      if [ -n "$ff" ]; then export VHS_FORCE_FFMPEG_PATH="$ff"; fi
+     while IFS= read -r kv; do if [ -n "$kv" ]; then export "$kv"; fi; done <<< "$le"
      # 3.1.0: where the base keeps its state, so a package's own route reads state/progress.json without guessing
      # (boot.sh knows BASE_HOME from boot.env; an install knows BASE_STATE)
      _cbs="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; if [ -n "$_cbs" ]; then export COMFY_BASE_STATE="$_cbs"; fi

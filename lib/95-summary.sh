@@ -20,6 +20,7 @@ _base_validate_tables(){ # every required declaration present and every table ro
   if [ -n "${GPU_PREFER:-}" ]; then        # 3.8.0: the GPU classes the package is tuned for; a typo would silence the warning
     local gp; gp="$("$SYS_PY" "$BASE_DIR/py/gpu_fit.py" --check "$GPU_PREFER" 2>&1)" || { echo "  !! GPU_PREFER: $gp" >&2; bad=1; }
   fi
+  _base_launch_env_rows >/dev/null || bad=1   # 3.10.0: LAUNCH_ENV, refused here, before anything downloads
   return $bad
 }
 _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per line, for list-packs / gen-models / suites
@@ -29,6 +30,7 @@ _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per l
   _base_later_rows | sed 's/^/MODELLATER /' || rc=1
   _base_own_rows | sed 's/^/OWNROW /' || rc=1      # 3.2.0: dir|version|digest, the package's own packs (they ship in its zip)
   _base_model_hashes | sed 's/^/MODELHASH /' || rc=1   # 3.4.0: file|sha256, from models.sha256 (base.sh gen-hashes)
+  _base_launch_env_rows | sed 's/^/LAUNCHENV /' || rc=1  # 3.10.0: KEY=value, the package's LAUNCH_ENV
   return $rc
 }
 _base_hook(){ # run a package hook if the package defines it; a failing hook fails the run (no fallbacks)
