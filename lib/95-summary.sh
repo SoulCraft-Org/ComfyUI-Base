@@ -399,8 +399,8 @@ base_cli(){ # the developer's entry (`bash base.sh test …`): a package script 
   case "${1:-}" in
     version)      echo "$BASE_VERSION" ;;
     list-packs)   shift; base_list_packs "$@" ;;
-    gen-models)   shift; base_env_setup; base_gen_models "$@" ;;
-    gen-hashes)   shift; base_env_setup; base_gen_hashes "$@" ;;                                 # 3.4.0: models.sha256, from the Hub
+    gen-models)   shift; trap _base_on_exit EXIT; base_env_setup; base_gen_models "$@" ;;     # 3.12.0: the trap, so the Hub auth file never outlives the verb
+    gen-hashes)   shift; trap _base_on_exit EXIT; base_env_setup; base_gen_hashes "$@" ;;     # 3.4.0: models.sha256, from the Hub
     stamp-models) shift; "$SYS_PY" "$BASE_DIR/py/stamp_models.py" "$@" ;;                    # 2.1.0: the workflow's own `models` array, from the rows
     status)       base_env_setup; base_status ;;
     latest)       base_env_setup; base_latest ;;
@@ -409,7 +409,7 @@ base_cli(){ # the developer's entry (`bash base.sh test …`): a package script 
     runtime-capture) shift; trap _base_on_exit EXIT; base_runtime_capture "$@" ;;
     fetch-later)     trap _base_on_exit EXIT; base_fetch_later ;;
     test|rescue|help|-h|--help) base_main "$@" ;;
-    *) echo "base.sh: unknown command '${1:-}' (version | install-self | status | latest | list-packs <dir>... | gen-models <dir> | gen-hashes <dir> [--check] | stamp-models <dir> [--check] | runtime-apply <manifest> | runtime-capture <dir> | fetch-later | test [tier] | rescue | help)" >&2; exit 2 ;;
+    *) echo "base.sh: unknown command '${1:-}' (version | install-self | status | latest | list-packs <dir>... | gen-models <dir> [--pin] | gen-hashes <dir> [--check] | stamp-models <dir> [--check] | runtime-apply <manifest> | runtime-capture <dir> | fetch-later | test [tier] | rescue | help)" >&2; exit 2 ;;
   esac
 }
 base_install_self(){ # copy this base to $BASE_HOME (the volume) unless it already runs from there; then re-exec the installed copy

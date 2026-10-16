@@ -39,7 +39,7 @@ def _stub_hf(tmp_path, delay="1"):
     """An hf that logs when each file starts and ends, sleeps, then writes the file at 4096 bytes."""
     bin_ = tmp_path / "bin"; bin_.mkdir(exist_ok=True); log = tmp_path / "times.log"
     (bin_ / "hf").write_text(
-        '#!/bin/bash\nf="$3"; d=""; while [ $# -gt 0 ]; do case "$1" in --local-dir) d="$2"; shift;; esac; shift; done\n'
+        '#!/bin/bash\n[ "$1" = cache ] && exit 0\nf="$3"; d=""; while [ $# -gt 0 ]; do case "$1" in --local-dir) d="$2"; shift;; esac; shift; done\n'
         'echo "start $f $(python3 -c "import time; print(time.time())")" >> "%s"; sleep %s\n'
         'mkdir -p "$d/$(dirname "$f")"; python3 -c "import sys; open(sys.argv[1],\'wb\').truncate(4096)" "$d/$f"\n'
         'echo "end $f $(python3 -c "import time; print(time.time())")" >> "%s"\n' % (log, delay, log))

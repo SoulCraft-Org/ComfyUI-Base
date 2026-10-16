@@ -52,9 +52,17 @@ _base_token_validate(){ # <NAME> <from> — 200 accepted; 401/403 FAIL naming th
   # offline runs validate only against an override (the suite's fake service)
   if [ "$BASE_NO_NET" = "1" ] && [ -z "${BASE_TOKEN_CHECK_URL_HF:-}" ]; then return 0; fi
   [ -n "${BASE_TMPD:-}" ] || _base_tmp
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H "@$(_base_auth_file "$name")" "$url" 2>/dev/null || echo 000)"
+  local body="$BASE_TMPD/.whoami-$name" role
+  code="$( (umask 077; curl -s -o "$body" -w '%{http_code}' --max-time 20 -H "@$(_base_auth_file "$name")" "$url" 2>/dev/null) || echo 000)"
+  # 3.12.0: least privilege. The install only reads, so a token that can write is more than it needs; only the role is
+  # read out of the answer (it also names the account, which is nobody's business here), and the answer is deleted.
+  role="$("$SYS_PY" -c 'import json,sys; print(((json.load(open(sys.argv[1])).get("auth") or {}).get("accessToken") or {}).get("role",""))' "$body" 2>/dev/null || true)"
+  rm -f "$body"
   case "$code" in
-    200) ok "$name accepted by ${url#https://}";;
+    200) ok "$name accepted by ${url#https://}${role:+ (role: $role)}"
+         if [ "$role" = "write" ]; then
+           warn "$name can WRITE to its account's repositories; this install only reads. A read-only or fine-grained read token is enough (huggingface.co/settings/tokens)"
+         fi;;
     401|403) err "$name ($from) rejected by ${url#https://} (HTTP $code) — fix that token; nothing downloads until it is accepted"
              BASE_FAILED+=("$name ($from) rejected ($code)");;
     *) warn "could not validate $name against ${url#https://} (HTTP $code) — continuing";;

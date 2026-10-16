@@ -2355,8 +2355,9 @@ def test_unit_a_snapshot_download_keeps_the_token_off_argv_and_shows_its_error(t
     r = _bash('export HF_TOKEN=hf_env_value; VENV=/nonexistent; BASE_NO_NET=0; _base_snapshot hf://owner/repo "%s" 4096; echo RC=$?' % (tmp_path / "dest"),
               env={"PATH": "%s:%s" % (bin_, os.environ["PATH"])})
     calls = log.read_text()
-    assert "--token" not in calls and "hf env HF_TOKEN=hf_env_value" in calls and calls.count("hf argv:") == 3
-    assert "Unauthorized" in r.stdout and "RC=1" in r.stdout, r.stdout + r.stderr
+    assert "--token" not in calls and "hf env HF_TOKEN=hf_env_value" in calls
+    assert calls.count("hf argv:") == 1                         # 3.12.0: a 401 is said once, never retried
+    assert "Unauthorized" in r.stdout and "refused HF_TOKEN" in r.stdout and "RC=1" in r.stdout, r.stdout + r.stderr
 
 
 def test_unit_the_launch_sets_hf_home_in_the_environment_and_still_runs_python(tmp_path):

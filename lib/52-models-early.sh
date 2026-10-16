@@ -54,13 +54,16 @@ _base_models_early_specs(){ # → one KIND|rel|url|bytes|dest line per download 
   while IFS='|' read -r cat fam purp file url bytes mnote alts; do
     [ -n "$cat" ] && [ "$url" != "LOCAL" ] || continue
     rel="$(_base_dest_rel "$cat|$fam|$purp|$file|$url|$bytes|$mnote|$alts")"; dest="$(_base_dest_path "$rel")"
-    [ ! -e "$dest" ] || continue                      # in place, partial or a stand-in: each is the model stage's to judge
+    if [ -e "$dest" ]; then                           # in place, partial or a stand-in: each is the model stage's to judge,
+      { [ -f "$dest" ] && _base_size_ok "$(_base_fsize "$dest")" "$bytes"; } || [ -d "$dest" ] || continue
+      _base_pin_moved "$dest" "$url" || continue      # 3.12.0: except one whose row's pin moved to a different file: early too
+    fi
     if [[ "$file" == */ ]]; then echo "SNAP|$rel|$url|$bytes|$dest"; continue; fi
     if [ "${BASE_STAGED:-0}" = "1" ] && _base_is_later "$file"; then continue; fi
     hit=0
     # shellcheck disable=SC2086
     while IFS=$'\t' read -r size path; do           # the same test the model stage moves by: exact name (or alternate), exact size
-      if [ -z "$path" ] || [ ! -f "$path" ]; then continue; fi
+      if [ -z "$path" ] || [ ! -f "$path" ] || [ "$path" = "$dest" ]; then continue; fi   # the dest itself is no source (3.12.0: a moved pin)
       case "$path" in "$STAGING_ROOT"/*|*.partial) continue;; esac
       if _base_size_ok "$size" "$bytes"; then hit=1; break; fi
     done < <(_base_idx_find "$(basename "$file")" $alts)

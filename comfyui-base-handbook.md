@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.11.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.12.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -75,7 +75,10 @@ run once per machine as **step one**; then each workflow package is **step two**
    aliases `HUGGING_FACE_HUB_TOKEN` / `HF_HUB_TOKEN`), else `state/tokens.env` (0600), else one prompt. Template
    placeholders (`token_here`, `replace_with_ids`…) are named and ignored; a token its service rejects fails the run
    before anything downloads. No token ever appears in a log or on the process list: `hf` reads it from its
-   environment, and the suite runs with every token name stripped. JupyterLab's token rides `JUPYTER_TOKEN` (or
+   environment, every `curl` to the Hub reads it from a 0600 header file (`-H @file`, 3.12.0), and the suite runs with
+   every token name stripped. The install only reads, so a token whose role is `write` is accepted and named as more
+   than it needs (a warning: a read-only or fine-grained read token is enough); only the role is read out of the
+   Hub's answer, never the account it names (3.12.0). JupyterLab's token rides `JUPYTER_TOKEN` (or
    `JUPYTER_PASSWORD`) in its environment; without one the boot does not start it and says so (2.1.0). Since 2.5.6,
    where `BASE_LISTEN` is loopback (every host but RunPod, so the terminal is reachable only through an ssh tunnel)
    the boot GENERATES a token instead of leaving the terminal dark, and writes it owner-only to `state/tokens.env`.
@@ -439,7 +442,16 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
   fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
-  basenames the index may adopt. `base.sh gen-hashes <pkg dir> [--check]` (3.4.0) writes `models.sha256` beside the
+  basenames the index may adopt. Pin a row to a commit (3.12.0): `resolve/<40-hex commit>/<path>` for a file,
+  `hf://owner/repo@<40-hex commit>` for a snapshot (a branch after the `@` is refused). The revision a row names is
+  the one downloaded, and every Hub download is checked with `hf cache verify` against the sha256 (LFS) or git hash the
+  Hub states for that revision before it moves into place; a file that fails is deleted, never resumed. A file is
+  hashed once, when it downloads (inside its own fetch job, so beside the other downloads), and its commit and etag go
+  to `state/verified.tsv` from the metadata `hf download` writes anyway; a later run checks size and that record and
+  hashes nothing, unless the row's pin moved to a commit whose file differs (one HEAD tells). An unpinned
+  row follows `main`, so its bytes break the day the repository changes. `base.sh gen-models <pkg dir> --pin` prints
+  the rows pinned to the commits they are at now. A Hub error retrying cannot fix (a gated repository, a refused
+  token, a missing repository, file or revision) is said once in one plain line and not retried. `base.sh gen-hashes <pkg dir> [--check]` (3.4.0) writes `models.sha256` beside the
   script (`<sha256>  <file>`, the `sha256sum` form): each Hugging Face file's sha256 as the Hub states it on a HEAD
   (`x-linked-etag`), so nothing is downloaded or hashed; the packager ships it, `BASE_DECLARE_ONLY=1` prints
   `MODELHASH file|sha256`, and stamp-models adds `hash` + `hash_type` to those entries. `base.sh stamp-models <pkg dir>` writes ComfyUI's own `models` array into the
@@ -731,6 +743,29 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.12.0: the Hub, pinned and checked (Paul, 2026-10-16: Hugging Face best practices). (1) A row's revision is what
+  downloads: the file leg parsed `resolve/<revision>/` and then dropped it, so a commit-pinned URL silently fetched
+  `main`; it now passes `--revision`. Snapshots take `hf://owner/repo@<commit>` (the 40-hex form only), which the
+  base could not pin before. (2) Every Hub download is checked with `hf cache verify` against the hashes the Hub states
+  for that revision (sha256 for LFS files) before it moves into place; size alone had been the check. A file that fails
+  is deleted rather than kept for resume; a snapshot that fails is kept, since `hf download` resumes it file by file.
+  An `hf` without `cache verify` checks size only and says so. (3) The size and sha256 HEADs put `Authorization:
+  Bearer <token>` in curl's argv since 2.0, on the process list against §0.9; they now read a 0600 header file. `gen-models` and `gen-hashes` now install the
+  exit trap, so that file (and every temp dir) is gone when the verb ends. (4)
+  A token whose role is `write` is accepted with a warning that a read-only or fine-grained read token is enough;
+  the whoami answer is read for its role only and deleted. (5) Gated, 401, not-found and bad-revision errors are said
+  once, in one line that names the fix, and not retried; transient errors keep three attempts, and the last no longer
+  sleeps. (6) `base.sh gen-models <dir> --pin` prints the rows pinned to the commits they are at now (the first hop's
+  `x-repo-commit`, the API's `sha` for a snapshot); stamp-models links a pinned snapshot to its `/tree/<commit>`. The
+  hf_xet fast path (`HF_XET_HIGH_PERFORMANCE`, 32 range gets, no chunk cache) and resumable downloads were already in
+  place and are unchanged. Speed first (Paul, 2026-10-16): a file is hashed ONCE, in its own fetch job beside the
+  other downloads, never in a pass afterwards; `state/verified.tsv` records its commit and etag from hf's own
+  `--local-dir` metadata (no request), and a file already in place costs nothing on any later run (size + record; one
+  HEAD only when its row's pin moved). Measured: `hf cache verify`'s hash runs at 2.6 GB/s on an M4, so the 174 GB
+  Video Replacer set is about 70 s of hashing in total on a fresh volume, spread over the parallel downloads, and 0 s
+  on a volume that has it. 3.11.0's downloads beside the venv build take the same path (pins, hash, record) and
+  now also take a file whose row's pin moved, so it no longer waits for the model stage. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
+  real Hub for `hf cache verify` (a flipped byte fails it, exit 1); not on a pod.
 - 3.11.0: the model downloads start beside the venv build (`lib/52-models-early.sh`, §5). Once the packs are on disk and
   the OS stage is joined, every download the model stage would start runs in the background through hf from the
   downloader's own venv (`$BASE_HOME/fetch`), and is joined just before the model stage, which still judges every row:
