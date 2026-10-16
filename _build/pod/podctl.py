@@ -172,8 +172,8 @@ def provider_for(name=None, base_dir=None, env=None):
     base = pathlib.Path(base_dir or BASE_DIR)
     name = (name or env.get("PODCTL_PROVIDER") or "").strip().lower()
     if not name:
-        root = repo_root(base)
-        hosts = sorted({b["host"] for b in (_brand.brands_under(root) if root else []) if b.get("host")})
+        root = consumer_root(base, env)
+        hosts = sorted({b["host"] for b in brands_at(root) if b.get("host")})
         if len(hosts) > 1:
             raise PodctlError("this repository has brands on %s: pass --provider <host>" % ", ".join(hosts))
         name = hosts[0] if hosts else "runpod"
@@ -377,6 +377,28 @@ def save_pins(script_path, rows):
     if changes:
         script_path.write_text(text, encoding="utf-8")
     return changes
+
+
+def consumer_root(base_dir=None, env=None):
+    """The consumer root this base serves (3.7.0): py/pkgdirs.py's one answer, both shapes. $BASE_WORKSPACE (the
+    workspace shape: one repository per package side by side, this base read from $COMFY_BASE outside it), else
+    <root> when this base is <root>/base/comfyui-base (the submodule shape), else None. A named root that does not
+    exist is an error, said here rather than read as "no packages"."""
+    try:
+        return _pkgdirs.consumer_root(pathlib.Path(base_dir or BASE_DIR), None, os.environ if env is None else env)
+    except _pkgdirs.NoSuchRoot as e:
+        raise PodctlError(str(e))
+
+
+def brands_at(root):
+    """The brands of a consumer root: the root itself when it holds brand.toml (the workspace shape keeps one brand
+    at its root), else every <root>/<brand>/brand.toml (the submodule shape). None: no brands."""
+    if root is None:
+        return []
+    root = pathlib.Path(root)
+    if (root / "brand.toml").is_file():
+        return [_brand.brand_of(root)]
+    return _brand.brands_under(root)
 
 
 def repo_root(path):
@@ -1188,14 +1210,14 @@ def cmd_lease(api, args):
 
 
 def resolve_pkg_dir(root, d):
-    """A --pkg value as a directory: absolute as given; else relative to the repository root (<brand>/packages/<name>);
-    else a bare <name> that exactly one */packages/<name> matches. Never the base folder's parent,
-    which is what 2.0.55 joined it onto and which holds no packages."""
+    """A --pkg value as a directory: absolute as given; else relative to the consumer root (<name> in the workspace
+    shape, <brand>/packages/<name> in the submodule shape); else a bare <name> that exactly one */packages/<name>
+    matches. Never the base folder's parent, which is what 2.0.55 joined it onto and which holds no packages."""
     p = pathlib.Path(d)
     if p.is_absolute():
         return p
     if root is None:
-        raise PodctlError("--pkg %r: this base is not inside a brand repository, so pass an absolute package path" % d)
+        raise PodctlError("--pkg %r: no consumer root (set $BASE_WORKSPACE to the workspace, or keep this base at <repo>/base/comfyui-base), so pass an absolute package path" % d)
     if (root / d).is_dir():
         return root / d
     hits = sorted(x for x in root.glob("*/packages/%s" % d) if x.is_dir())
@@ -1203,7 +1225,7 @@ def resolve_pkg_dir(root, d):
         return hits[0]
     if len(hits) > 1:
         raise PodctlError("--pkg %r is in more than one brand (%s): pass the <brand>/packages/<name> path" % (d, ", ".join(str(h.relative_to(root)) for h in hits)))
-    raise PodctlError("--pkg %r is not a directory under %s (try <brand>/packages/<name>)" % (d, root))
+    raise PodctlError("--pkg %r is not a directory under %s (try <name> in a workspace, <brand>/packages/<name> in a brand repository)" % (d, root))
 
 
 # The old-layout folders the 2026-09-12 rename left on the volume: a package used to be /workspace/packages/<Display Name>/
@@ -1268,7 +1290,7 @@ def cmd_install(prov, args):
     here = pathlib.Path(__file__).resolve().parents[2]
     if args.base:
         dirs.append(here)
-    root = repo_root(here)
+    root = consumer_root(here)
     for d in args.pkg or []:
         dirs.append(resolve_pkg_dir(root, d))
     if not dirs:

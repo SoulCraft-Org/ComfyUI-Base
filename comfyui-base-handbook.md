@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.6.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.7.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -303,11 +303,12 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   `host = runpod | verda | crusoe | local`). `py/brand.py` reads it; the packager names the zip `<name>-<host>.zip`
   by it and the driver takes its default provider from it. A tree with no `brand.toml` above it (an extracted zip, a
   flat checkout) is host `runpod` by default.
-- Where the packages are (3.6.0): a package directory is any `d` holding `d/<basename(d)>-script.sh`, in one of two
+- Where the packages are (3.6.0; 3.7.0 for `podctl`): a package directory is any `d` holding `d/<basename(d)>-script.sh`, in one of two
   shapes under a consumer root. The submodule shape keeps the base at `<root>/base/comfyui-base` and the packages at
   `<root>/<brand>/packages/<name>/`. The workspace shape clones one repository per package side by side as
-  `<root>/<brand>-<name>/` and reads the base from `$COMFY_BASE`, a shared checkout outside the workspace; the
-  workspace names itself with `$BASE_WORKSPACE`. The root is an explicit `--root <dir>` (the Python tools), else
+  `<root>/<name>/` (the folder is the package's name, so `<name>-script.sh` inside it passes the rule), keeps the
+  brand's `brand.toml` and `families.txt` at `<root>`, and reads the base from `$COMFY_BASE`, a shared checkout outside
+  the workspace; the workspace names itself with `$BASE_WORKSPACE`. The root is an explicit `--root <dir>` (the Python tools), else
   `$BASE_WORKSPACE` (the only override `verify.sh` and `testbed.sh` take), else `<root>` of the submodule shape, else
   none, and then only what the caller named is walked. A named root that does not exist is an error, and every walker
   fails on it rather than walking zero packages; so do `verify.sh` and `testbed.sh` when the helper itself fails.
@@ -583,6 +584,18 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.7.0: `podctl` reads the workspace shape too. 3.6.0 taught every package walker the workspace and left two readers
+  on the submodule shape, as its record said: `podctl install --pkg <name>` from a workspace stopped with "not inside a
+  brand repository", and the default provider ignored the workspace's `brand.toml` and fell back to runpod. Both now ask
+  `py/pkgdirs.py` for the consumer root (`$BASE_WORKSPACE`, then the submodule shape): `--pkg <name>` resolves to
+  `<workspace>/<name>`, and the provider comes from the brand at the workspace root (`brands_at`: the root's own
+  `brand.toml`, else every `<root>/<brand>/brand.toml`). A `$BASE_WORKSPACE` that does not exist is an error, as in every
+  other walker. The workspace folder is `<name>/`, not `<brand>-<name>/` as 3.6.0's prose said: the rule needs the
+  folder's name to be the script's stem, and the first consumer (SoulCraft, one repository per workflow under
+  SoulCraft-Org) clones each package as `<workspace>/<name>/`. New: `test_unit_podctl_reads_the_workspace_shape_for_pkg_and_provider`.
+  Exercised on temp trees only. Also: the install tier's "a second run is a no-op" checks were red on `main` since
+  3.5.0, because 3.5.0's size cache (`state/sizes.tsv`, a directory's size by path and ctime) may gain a row on the
+  second run; like `logs/` it is a runtime record, not the store, so every no-op check now skips it (`basetest.tree_hash`).
 - 3.6.1: a pack row may name the branch to track. rgthree/rgthree-comfy's GitHub default branch now points at a stale
   `dev` (5f940dd, 2023-11-20) while its work is on `main` (2026-10-15 finding, exporting the Video Replacer). Every
   install follows the remote's HEAD, so a fresh pod or testbed got 2023 rgthree, which does not import on ComfyUI

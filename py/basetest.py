@@ -386,7 +386,9 @@ def run_script(script, *args, env=None, fake_root=None, inp="", timeout=600):
 
 
 def tree_hash(root, ignore=()):
-    """A digest of every file's relative path and size under root, skipping any path with a component in `ignore`."""
+    """A digest of every file's relative path and size under root, skipping any path with a component in `ignore`.
+    The install tests pass ("logs", "sizes.tsv"): both are runtime records, not the store. sizes.tsv (3.5.0) caches a
+    directory's size by path and ctime, and a second run may add a row for a directory the first run never measured."""
     h = hashlib.sha1()
     for p in sorted(pathlib.Path(root).rglob("*")):
         if any(part in ignore for part in p.relative_to(root).parts):

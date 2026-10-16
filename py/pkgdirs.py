@@ -10,7 +10,7 @@ The shell walkers treat any other non-zero exit as the helper failing and stop, 
 A consumer keeps its packages in one of two shapes:
 
   - submodule:  <root>/base/comfyui-base is this base, and the packages are <root>/<brand>/packages/<name>/
-  - workspace:  one repository per package, cloned side by side as <root>/<brand>-<name>/, with the base read
+  - workspace:  one repository per package, cloned side by side as <root>/<name>/, with the base read
                 from $COMFY_BASE (a shared checkout that is NOT inside the workspace). $BASE_WORKSPACE names <root>.
 
 Every cross-package walker (package.py --all, podctl's pin scan, verify.sh, testbed.sh, basetest.converted_packages)

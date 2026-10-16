@@ -1,6 +1,6 @@
 """unit tier: package discovery (3.6.0). A consumer keeps its packages either under <brand>/packages/<name>/ beside a
 base submodule at base/comfyui-base, or as one repository per package cloned side by side under a workspace as
-<brand>-<name>/, with the base read from $COMFY_BASE. py/pkgdirs.py is the one place both rules live; every walker
+<name>/, with the base read from $COMFY_BASE. py/pkgdirs.py is the one place both rules live; every walker
 (package.py --all, podctl's pin scan, verify.sh, testbed.sh, basetest.converted_packages) asks it."""
 import importlib.util
 import os

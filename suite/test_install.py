@@ -17,10 +17,10 @@ def test_install_help_syntax_and_dispatch_surface(tmp_path):
 
 def test_install_check_mode_touches_nothing(tmp_path):
     fake_pod(tmp_path, STUB, strays=True, duplicates=True, foreign=True)
-    before = tree_hash(tmp_path, ignore=("logs",))
+    before = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
     r = run_script(SCRIPT, "--check", fake_root=tmp_path)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
-    assert tree_hash(tmp_path, ignore=("logs",)) == before
+    assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == before
     assert "would" in r.stdout
 
 
@@ -37,10 +37,10 @@ def test_install_real_run_moves_verifies_reports_and_second_run_is_a_noop(tmp_pa
     assert "BYPASSED" in r.stdout and "stub_bypassed.gguf" in r.stdout and not list(tmp_path.rglob("stub_bypassed.gguf"))
     assert (tmp_path / "comfy-base" / "state" / "packages" / "stub.manifest").exists()
     assert "ONE STEP LEFT" in r.stdout or "not running" in r.stdout or "skipped" in r.stdout
-    h = tree_hash(tmp_path, ignore=("logs",))
+    h = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
     r2 = run_script(SCRIPT, fake_root=tmp_path)
     assert r2.returncode == 0, r2.stdout[-3000:]
-    assert tree_hash(tmp_path, ignore=("logs",)) == h, "second run changed the tree"
+    assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == h, "second run changed the tree"
     assert "downloaded 0" in r2.stdout and "reusing our venv" in r2.stdout
 
 
@@ -95,9 +95,9 @@ def test_install_rescue_puts_back_a_venv_that_cannot_boot_and_changes_nothing_wh
     pod = fake_pod(tmp_path, STUB, dangling_venv=True)
     r = run_script(SCRIPT, "rescue", fake_root=tmp_path, env={"BASE_YES": "1"})
     assert r.returncode == 0 and os.access(pod / ".venv-cu130" / "bin" / "python", os.X_OK), r.stdout[-3000:]
-    h = tree_hash(tmp_path, ignore=("logs",))
+    h = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
     r2 = run_script(SCRIPT, "rescue", fake_root=tmp_path)
-    assert r2.returncode == 0 and "healthy" in r2.stdout and tree_hash(tmp_path, ignore=("logs",)) == h
+    assert r2.returncode == 0 and "healthy" in r2.stdout and tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == h
 
 
 def test_install_a_package_refuses_an_older_base(tmp_path):
@@ -138,20 +138,20 @@ def test_install_bare_volume_gets_a_tree_at_workspace_comfyui_and_second_run_is_
     assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-1000:]
     assert "materialis" in r.stdout and (pod / "main.py").exists() and (pod / "custom_nodes").is_dir()
     assert (pod / "user" / "default" / "workflows" / "stub-workflow.json").exists()
-    h = tree_hash(tmp_path, ignore=("logs",))
+    h = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
     r2 = run_script(SCRIPT, fake_root=tmp_path)
     assert r2.returncode == 0, r2.stdout[-4000:] + r2.stderr[-1000:]
     assert "materialis" not in r2.stdout.split("SUMMARY")[0] or "already" in r2.stdout
-    assert tree_hash(tmp_path, ignore=("logs",)) == h
+    assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == h
 
 
 @pytest.mark.parametrize("layout", ["official", "community", "bare"])
 def test_install_check_mode_touches_nothing_on_every_layout(tmp_path, layout):
     fake_pod(tmp_path, STUB, layout=layout, strays=(layout == "official"))
-    before = tree_hash(tmp_path, ignore=("logs",))
+    before = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
     r = run_script(SCRIPT, "--check", fake_root=tmp_path)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
-    assert tree_hash(tmp_path, ignore=("logs",)) == before
+    assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == before
     assert not (tmp_path / "ComfyUI" / "main.py").exists() or layout == "official"
     assert "would" in r.stdout
 

@@ -204,7 +204,7 @@ def main() -> int:
         rc = max(rc, do(BASE, members, BASE_ZIP, a.check, prefix="comfyui-base/"))
     dirs = [Path(d).resolve() for d in a.dirs]
     if a.all:
-        # 3.6.0: both shapes, <root>/<brand>/packages/<name>/ and <root>/<brand>-<name>/, from the root the caller names
+        # 3.6.0: both shapes, <root>/<brand>/packages/<name>/ and <root>/<name>/, from the root the caller names
         try:
             root = pkgdirs.consumer_root(BASE, a.root, os.environ)
         except pkgdirs.NoSuchRoot as e:                 # a mistyped --root / $BASE_WORKSPACE is an error, not zero packages
