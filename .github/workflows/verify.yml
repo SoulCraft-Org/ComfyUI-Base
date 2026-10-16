@@ -32,7 +32,7 @@ jobs:
       # clone has no venv, so without uv on PATH the suite reports "no pytest and no uv" and exits 1.
       # exact because setup-uv publishes no floating major tag (@v10 does not resolve); Dependabot
       # (.github/dependabot.yml) opens a PR whenever a newer release exists, so it never stays behind
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
 
