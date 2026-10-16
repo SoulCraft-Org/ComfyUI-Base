@@ -304,28 +304,97 @@ def wait_for(api, pod_id, ok, what, sleep, tries=90, every=5):
     raise PodctlError("gave up waiting for %s (%ds)" % (what, tries * every))
 
 
+FIRST_BOOT_WAIT = 15 * 60      # 3.10.1: the longest ensure waits for an image's own first boot before resetting the pod
+FIRST_BOOT_MIN = 180           # a pod with no 8188/http to ask: this long after it started counts as its first boot done
+
+
+def started_at(pod):
+    """RunPod's `lastStartedAt` ("2026-10-16 07:52:37.993 +0000 UTC") as epoch seconds, or None. It moves on every
+    reset, which is how ensure knows a reset has really happened (3.10.1)."""
+    import datetime
+    raw = (pod.get("lastStartedAt") or "").replace(" UTC", "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f %z", "%Y-%m-%d %H:%M:%S %z"):
+        try:
+            return datetime.datetime.strptime(raw, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def proxy_status(url, timeout=10):
+    """The HTTP status RunPod's proxy gives for `url`, or None when nothing answers at all."""
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": Api.USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        e.close()
+        return e.code
+    except Exception:
+        return None
+
+
+def first_boot_done(pod, probe, now):
+    """3.10.1: has the IMAGE's own first boot finished? An image like runpod/comfyui copies ComfyUI and its venv onto the
+    volume on its first start; a reset in the middle leaves no venv and the pod crash-loops (MEASURED 2026-10-16, pod
+    wibxqf22v26shv). Where the pod exposes 8188/http: its ComfyUI answers through the proxy (any status below 500; the
+    proxy says 502 while nothing listens). Otherwise FIRST_BOOT_MIN seconds since it started; unknown start: done."""
+    if "8188/http" in (pod.get("ports") or []):
+        code = probe(proxy_url(pod, 8188) + "/")
+        return code is not None and code < 500
+    t = started_at(pod)
+    return t is None or now() - t >= FIRST_BOOT_MIN
+
+
 def ensure(api, pod_id, pubkey, ssh_config, bootstrap, image_config=image_config, entry=None, banner=ssh_banner,
-           sleep=None, ssh_check=None, log=None):
+           sleep=None, ssh_check=None, log=None, probe=None, now=None):
     """Make the pod reachable and hand its boot to the base. Idempotent: every step checks before it changes.
-    Order: ports (22/tcp) → env.PUBLIC_KEY → wait RUNNING + mapping → ssh banner → (refused) start command → wait →
-    banner → the `Host runpod` block → `ssh runpod hostname`."""
+    Order: (the image's first boot, 3.10.1) → ports (22/tcp) → env.PUBLIC_KEY → wait RUNNING + mapping → ssh banner →
+    (refused) start command → wait for the reset → banner on the CURRENT port → the `Host runpod` block → `ssh runpod hostname`."""
     import time
     sleep = sleep or time.sleep
     log = log or (lambda s: print(s))
+    probe = probe or proxy_status
+    now = now or time.time
     pod = api.get("/pods/" + pod_id)
+    state = {"waited": False}
+
+    def before_reset(p):
+        # 3.10.1: never reset a pod whose image is still in its own first boot. Only a pod the base's boot does not own yet
+        # can be in one (with the guard installed, every boot is the base's, which a reset does not harm).
+        if state["waited"] or BOOT_GUARD in " ".join((p.get("dockerEntrypoint") or []) + (p.get("dockerStartCmd") or [])):
+            return
+        state["waited"] = True
+        t0 = now()
+        while not first_boot_done(p, probe, now):
+            if now() - t0 >= FIRST_BOOT_WAIT:
+                log("ensure: the image's first boot has not finished after %d s: going on (the pod resets)" % FIRST_BOOT_WAIT)
+                return
+            if now() - t0 < 1:
+                log("ensure: the image is still in its first boot: waiting for it before anything resets the pod")
+            sleep(10)
+            p = api.get("/pods/" + pod_id)
+        if now() - t0 >= 1:
+            log("ensure: the image's first boot is done (%d s)" % (now() - t0))
+
+    def reset(body, what):
+        before_reset(pod)
+        log(what)
+        api.patch("/pods/" + pod_id, body)
+        resets.append(pod.get("lastStartedAt"))
+
+    resets = []
     ports = list(pod.get("ports") or [])
     if "22/tcp" not in ports:
-        log("ensure: exposing 22/tcp (the pod resets)")
-        api.patch("/pods/" + pod_id, {"ports": ports + ["22/tcp"]})
+        reset({"ports": ports + ["22/tcp"]}, "ensure: exposing 22/tcp (the pod resets)")
     env = dict(pod.get("env") or {})
     if (env.get("PUBLIC_KEY") or "").strip() != pubkey.strip():
-        log("ensure: setting PUBLIC_KEY to the Mac key (the pod resets)")
         env["PUBLIC_KEY"] = pubkey.strip()
-        api.patch("/pods/" + pod_id, {"env": env})
+        reset({"env": env}, "ensure: setting PUBLIC_KEY to the Mac key (the pod resets)")
 
     def up(p):
         return p.get("desiredStatus") == "RUNNING" and bool(p.get("publicIp")) and bool((p.get("portMappings") or {}).get("22"))
-    pod = wait_for(api, pod_id, up, "RUNNING with port 22 mapped", sleep)
+    pod = after_reset(api, pod_id, resets[0] if resets else None, up, sleep) if resets else wait_for(api, pod_id, up, "RUNNING with port 22 mapped", sleep)
     host, port = pod["publicIp"], int(pod["portMappings"]["22"])
     # 2.0.52: the override is installed when it is ABSENT, not when sshd happens to be silent. It used to live
     # inside the "nothing answers" branch, so an image that runs its own sshd (runpod/comfyui:1.4.7-cuda13.0) never
@@ -349,19 +418,48 @@ def ensure(api, pod_id, pubkey, ssh_config, bootstrap, image_config=image_config
             except PodctlError as e:
                 raise PodctlError("%s: or pass --entry '<the image's start command>'" % e)
             fields = wrap_entry(cfg["entrypoint"], cfg["cmd"], bootstrap if not answers else None)
+        before_reset(pod)
+        was = pod.get("lastStartedAt")
         api.patch("/pods/" + pod_id, fields)
-        pod = wait_for(api, pod_id, up, "RUNNING with port 22 mapped after the reset", sleep)
-        host, port = pod["publicIp"], int(pod["portMappings"]["22"])
-        for _ in range(60):
-            if banner(host, port):
-                break
-            sleep(5)
-        else:
-            raise PodctlError("sshd never answered on %s:%d after the start command was set: read the pod's log" % (host, port))
+        resets.append(was)
+        after_reset(api, pod_id, was, up, sleep)
+        host, port = ssh_after_reset(api, pod_id, up, banner, sleep, log)
+    elif resets:                                         # the address read before a reset is not trusted after it
+        host, port = ssh_after_reset(api, pod_id, up, banner, sleep, log)
     write_ssh_config(ssh_config, host, port)
     log("ensure: Host %s -> %s:%d" % (_c().SSH_ALIAS, host, port))
     hostname = (ssh_check or _ssh_hostname)()
     return "reachable: %s:%d (pod hostname %s)" % (host, port, hostname)
+
+
+def after_reset(api, pod_id, before, up, sleep, tries=36, every=5):
+    """3.10.1: the pod once its reset has really happened: `lastStartedAt` moved from `before`, RUNNING, 22 mapped. Right
+    after the PATCH the API still answers with the OLD pod (RUNNING, the old port), which is how ensure came to poll the
+    old port forever (MEASURED 2026-10-16: RunPod moved 22/tcp from 20424 to 36944). A pod whose start time never moves
+    within tries*every seconds is taken as it reads then; ssh_after_reset re-reads the port on every try either way."""
+    p = None
+    for _ in range(tries):
+        p = api.get("/pods/" + pod_id)
+        if up(p) and (before is None or p.get("lastStartedAt") != before):
+            return p
+        sleep(every)
+    return wait_for(api, pod_id, up, "RUNNING with port 22 mapped after the reset", sleep)
+
+
+def ssh_after_reset(api, pod_id, up, banner, sleep, log, tries=60, every=5):
+    """3.10.1: wait for sshd on the pod's CURRENT address, re-read on every try (a reset may move the port again); (host, port)."""
+    last = None
+    for _ in range(tries):
+        p = api.get("/pods/" + pod_id)
+        if up(p):
+            cur = (p["publicIp"], int(p["portMappings"]["22"]))
+            if last and cur != last:
+                log("ensure: the pod's ssh port moved: %s:%d -> %s:%d" % (last + cur))
+            last = cur
+            if banner(*cur):
+                return cur
+        sleep(every)
+    raise PodctlError("sshd never answered on %s after the pod reset: read the pod's log" % ("%s:%d" % last if last else "any port"))
 
 
 def stop(api, pod_id, wait=True, sleep=None):

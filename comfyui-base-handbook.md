@@ -684,6 +684,17 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.10.1: `podctl ensure` on a fresh RunPod pod, and one clearer STOP (three defects from the Video Swapper's pod install,
+  2026-10-16). (1) `ensure` reset a fresh pod while its image was still in its own first boot (`runpod/comfyui` copies
+  ComfyUI and its venv onto the volume then): no venv, a crash loop, ssh never up (pod wibxqf22v26shv). It now waits,
+  before its first reset of a pod the base's boot does not own yet, until the image's ComfyUI answers through the
+  proxy (any status below 500), or three minutes after the pod started where 8188/http is not exposed, at most 15
+  minutes. (2) After its own reset it kept polling the OLD ssh port: the API answers with the pod as it was for a while
+  after the PATCH, and RunPod had moved 22/tcp (20424 to 36944). It now waits for `lastStartedAt` to move and looks for
+  sshd on the port the pod has now, re-read on every try. (3) `podctl install` on a package folder not named after its
+  package (`vr` for `video-replacer-minimax-h3`) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
+  name must be the package's and names the one to rename it to. Exercised on this Mac against the suite's fake RunPod,
+  which now answers stale reads after a reset and moves the ssh port; not yet on a live pod.
 - 3.10.0: a package can set ComfyUI's launch environment, and ComfyUI starts sized to the container's CPU quota
   (2026-10-16). `LAUNCH_ENV=( "KEY=value" ... )` (§4): an allowlist of thread, tokenizer, allocator and CTranslate2
   (`CT2_*`) variables, each value one word, so no path or secret can reach a file or a log; anything else, or a key set

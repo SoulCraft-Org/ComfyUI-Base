@@ -57,6 +57,14 @@ tokenless), the saved tokens, provisioning, ComfyUI with the base's launch line,
 carries the guard is not patched and its image is never fetched. RunPod has no systemd, so this wrap is the whole
 mechanism; `BASE_HOST` is detected on the pod itself from PID 1's `RUNPOD_POD_ID`.
 
+Every patch above resets the pod, so (3.10.1) `ensure` never resets one in the middle of its image's FIRST boot (an
+image like `runpod/comfyui` copies ComfyUI and its venv onto the volume then; a reset mid-copy left no venv and a crash
+loop): while the base's boot is not PID 1 yet, it waits until the image's ComfyUI answers through the proxy (any status
+below 500; the proxy says 502 while nothing listens), or three minutes after the pod started where 8188/http is not
+exposed, at most 15 minutes, then resets. After a reset it waits for the pod's `lastStartedAt` to move (right after the
+PATCH the API still answers with the old pod) and looks for sshd on the port the pod has NOW, re-read on every try:
+RunPod may map 22/tcp to a new port on a reset (20424 became 36944 on 2026-10-16, and `ensure` polled the old one).
+
 ## The addresses
 
 - **ssh: `<public ip>:<mapped port>`**, user `root`. The mapped port changes on every start, which is why `start --wait`,
