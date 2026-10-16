@@ -285,6 +285,16 @@ def wrap_entry(entrypoint, cmd, bootstrap):
     raise PodctlError("the image declares neither an entrypoint nor a command; pass --entry '<the image's start command>'")
 
 
+def create_start(bootstrap):
+    """3.14.0: the start command a NEW pod is created with: the base's boot when it is on the volume, else sshd and nothing
+    else. Never the image's own start: an image like runpod/comfyui starts its ComfyUI on 0.0.0.0:8188, and until the base
+    owned the pod (ensure, then the whole install) that ComfyUI answered on the public link with no key (MEASURED
+    2026-10-16, pod augydbweqttpme). With this, nothing answers on 8188 until the install starts ComfyUI on 127.0.0.1
+    behind the key's front, ensure has no start command to patch (no reset, no first-boot wait), and the base installs
+    ComfyUI itself, as on runpod/base. The entrypoint is replaced too, so an entrypoint-only image runs nothing of its own."""
+    return {"dockerEntrypoint": ["bash", "-c", "; ".join([BOOT_GUARD, bootstrap, "exec sleep infinity"])], "dockerStartCmd": []}
+
+
 def sshd_bootstrap_text():
     """The self-contained sshd snippet, from lib/boot.sh (one source for the start command and the boot)."""
     import subprocess
@@ -865,7 +875,7 @@ def encryption_words(pod, gb=None):
 
 
 def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None, names=None,
-                template_id=None, token=None, link=None):
+                template_id=None, token=None, link=None, start=None):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
     data centre, the ports, PUBLIC_KEY, the CUDA floor. No start command: `ensure` installs the base's boot guard from the
     image's own entry, as for every other pod; and no templateId but the port-names one (3.9.0), which carries nothing else.
@@ -896,6 +906,8 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
                      "env": {"PUBLIC_KEY": pubkey.strip(), "BASE_LISTEN": "127.0.0.1"}})
     if cuda:
         body["allowedCudaVersions"] = list(cuda)
+    if start:
+        body.update(start)                                     # 3.14.0: create_start, the base's boot from the first start
     return body
 
 
@@ -935,7 +947,8 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
             say("  !! the port names could not be written (%s): the Connect tab will say \"HTTP Service\"" % e)
     body = create_body(name, gpu, dc, vid, image, container_gb, pubkey, cuda=cuda, spot=spot, names=names, template_id=tid,
                        token=jupyter_token(),     # printed once, as the Jupyter Terminal link; RunPod keeps it in the pod's env
-                       link=link_token())         # 3.14.0: and the key, inside every other link printed below
+                       link=link_token(),         # 3.14.0: and the key, inside every other link printed below
+                       start=create_start(sshd_bootstrap_text()))
     try:
         made_pod = api.post("/pods", body)
         pod_id = made_pod["id"]
@@ -1012,7 +1025,8 @@ def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pu
     if not data_gb:
         raise PodctlError("--private needs --data-gb N: the size of the pod volume at %s" % VOLUME_ROOT)
     say(PRIVATE_UNENCRYPTED)
-    body = create_body(name, gpu, dc, None, image, container_gb, pubkey, cuda=cuda, spot=spot, private_gb=data_gb)
+    body = create_body(name, gpu, dc, None, image, container_gb, pubkey, cuda=cuda, spot=spot, private_gb=data_gb,
+                       start=create_start(sshd_bootstrap_text()))
     pod_id = api.post("/pods", body)["id"]
     back = api.get("/pods/%s%s" % (pod_id, POD_READ))
     ports = back.get("ports") or body["ports"]

@@ -1756,7 +1756,9 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
     assert len(tok_lines) == 1 and "Jupyter Terminal" in tok_lines[0] and "-8888.proxy.runpod.net/lab?token=" in tok_lines[0], out
     assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["gpuCount"] == 1
     assert body["allowedCudaVersions"] == ["13.0"] and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
-    assert "templateId" not in body and "dockerStartCmd" not in body and body["interruptible"] is False   # this fake has no templates
+    assert "templateId" not in body and body["interruptible"] is False   # this fake has no templates
+    # 3.14.0: a new pod starts on the base's boot guard and sshd, never its image's own start (error log row 71)
+    assert body["dockerStartCmd"] == [] and body["dockerEntrypoint"][2].startswith(podctl.BOOT_GUARD)
     assert "the port names could not be written" in out, out                     # and says so; never a reason to have no pod
     assert "created newpod0000001" in out and "next: podctl ensure newpod0000001" in out and "rp_key_create" not in out, out
 

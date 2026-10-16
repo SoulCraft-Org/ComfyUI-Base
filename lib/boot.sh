@@ -95,6 +95,7 @@ boot_jupyter(){ # JupyterLab from the base's tools venv; the token rides the env
   # read the saved one FIRST, so this does not depend on boot_tokens having run: a second boot must reuse the
   # token, never append a new line. My own test caught it doing exactly that.
   local tf="$BOOT_HOME/state/tokens.env"
+  if [ -z "$tok" ]; then tok="$(boot_pid1_env JUPYTER_TOKEN)"; fi       # 3.14.0: `boot.sh --apps` from an install's ssh shell
   if [ -n "$tok" ]; then own=0; fi
   if [ -z "$tok" ] && [ -f "$tf" ]; then tok="$(sed -n 's/^JUPYTER_TOKEN=//p' "$tf" | tail -1)"; fi
   if [ -z "$tok" ]; then
@@ -271,7 +272,11 @@ boot_main(){
     --print-sshd-bootstrap) declare -f _boot_sshd_bin; declare -f boot_sshd; echo "boot_sshd"; return 0 ;;
     --apps)                                        # 3.9.0: the install restarts the app ports without a reboot
       BOOT_HOME="${BOOT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-      boot_host >/dev/null; boot_apps; return 0 ;;
+      boot_host >/dev/null; boot_apps
+      # 3.14.0: a pod podctl creates runs nothing of its image's own (provider.create_start), so until its first restart into
+      # this boot there is no JupyterLab either: the install starts it here, once its tools venv exists, with the pod's token
+      if [ -x "$BOOT_HOME/tools/bin/jupyter-lab" ] && ! pgrep -f "jupyter-lab .*--port 8888" >/dev/null 2>&1; then boot_jupyter; fi
+      return 0 ;;
   esac
   BOOT_HOME="${BOOT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"   # the image's ENV or the unit sets it; this file's own directory otherwise
   mkdir -p "$BOOT_HOME/state/logs"

@@ -770,7 +770,11 @@ for any invocation that somehow arrives without the environment. The suite asser
   frame, +2.35 ms on a 5 MB asset (1 MiB stream buffers; 64 KiB gave +4.5 ms), and it streams, so on a real link the
   transfer hides it. Exercised on this Mac against fakes; the live pod pass (clicks from create to a working link, a
   render through the front) is owed: the RunPod balance stopped it. One live finding: until the base's boot owns a new
-  pod, the image's own ComfyUI answers on the public 8188 link without a key (for the length of the install).
+  pod, the image's own ComfyUI answered on the public 8188 link without a key, for the whole install (error log row
+  71). Closed here: `create` makes the pod with its start command already the boot guard plus sshd and nothing of its
+  image's own (`create_start`), so nothing answers on 8188 until the install starts ComfyUI on 127.0.0.1 behind the
+  front; `ensure` then has nothing to patch (no reset, no first-boot wait), the base installs ComfyUI itself, and the
+  install's `boot.sh --apps` starts JupyterLab with the pod's own token (read from PID 1).
 - 3.13.0: SageAttention is downloaded, not built, on a fresh volume (Paul, 2026-10-16: pods install as fast as
   possible). With the model downloads in parallel (3.11.0) the source build (10-20 min) was a pod's biggest step. A pod's key
   (upstream commit, Python, torch and its CUDA build, the GPU's sm) is now built ONCE per arch by

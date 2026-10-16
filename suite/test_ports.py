@@ -739,3 +739,48 @@ def test_unit_status_and_deploy_carry_the_pods_key():
                machine={"gpuTypeId": "NVIDIA B200", "secureCloud": True})
     b = podctl.deploy_body(src)
     assert re.fullmatch(r"[0-9a-f]{48}", b["env"]["BASE_LINK_TOKEN"])
+
+
+def test_unit_a_new_pod_runs_nothing_of_its_image_so_no_link_is_ever_open_without_the_key(tmp_path, monkeypatch):
+    """Error log row 71 (2026-10-16, pod augydbweqttpme): until the base owned a new pod, the image's own ComfyUI answered
+    on the public 8188 link with no key, for the whole install. A pod podctl creates now starts on the base's boot guard
+    and sshd only; ensure finds the guard and resets nothing (no first-boot wait either); the install's `boot.sh --apps`
+    starts JupyterLab with the pod's own token, so the Jupyter Terminal link works before the first restart."""
+    podctl = _load()
+    srv, store = _fake()
+    try:
+        api = podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql")
+        for private in (False, True):
+            podctl.create(api, "n%d" % private, "NVIDIA B200", "EU-RO-1", data_gb=50, image="runpod/comfyui:1.4.7-cuda13.0",
+                          pubkey="ssh-ed25519 K k", wait=False, say=lambda *a: None, private=private)
+            body = [b for p, b in srv.bodies if p == "/pods"][-1]
+            assert body["dockerStartCmd"] == [] and body["dockerEntrypoint"][:2] == ["bash", "-c"], body
+            line = body["dockerEntrypoint"][2]
+            assert line.startswith(podctl.BOOT_GUARD + "; ") and "boot_sshd" in line and line.endswith("; exec sleep infinity"), line
+            assert "start_script" not in line and "comfyui" not in line.lower()
+        # ensure on such a pod: nothing to patch, so no reset and no first-boot wait
+        srv.pod.update(ports=["8188/http", "8888/http", "22/tcp"], portMappings={"22": 15270}, env={"PUBLIC_KEY": "ssh-ed25519 K k"})
+        n = len(srv.patches)
+        podctl.ensure(api, srv.pod["id"], pubkey="ssh-ed25519 K k", ssh_config=tmp_path / "cfg", bootstrap="B",
+                      image_config=lambda ref: (_ for _ in ()).throw(AssertionError("no image read")), banner=lambda h, p: True,
+                      sleep=lambda s: None, ssh_check=lambda: "h", log=lambda s: None,
+                      probe=lambda u: (_ for _ in ()).throw(AssertionError("no first-boot wait")))
+        assert len(srv.patches) == n
+    finally:
+        srv.close()
+    # the install's `boot.sh --apps`: JupyterLab started once, with the pod's own token read from PID 1
+    home = _boot_home(tmp_path)
+    jl = home / "tools" / "bin" / "jupyter-lab"; jl.parent.mkdir(parents=True)
+    seen = tmp_path / "jl.env"
+    jl.write_text("#!/bin/sh\necho \"$JUPYTER_TOKEN\" > %s\n" % seen); jl.chmod(0o755)
+    pid1 = tmp_path / "environ"; pid1.write_bytes(b"A=1\0JUPYTER_TOKEN=pod-own-jt\0")
+    env = {k: v for k, v in os.environ.items() if k not in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD", "BASE_LINK_TOKEN")}
+    env.update(BOOT_HOME=str(home), BASE_LISTEN="127.0.0.1", BASE_HOST="vm", BOOT_ROOT=str(tmp_path / "root"), BOOT_PID1_ENVIRON=str(pid1))
+    r = subprocess.run(["bash", str(BASE / "lib" / "boot.sh"), "--apps"], capture_output=True, text=True, env=env, timeout=60)
+    for _ in range(50):
+        if seen.exists():
+            break
+        time.sleep(0.1)
+    assert r.returncode == 0 and "JupyterLab starting on 8888" in r.stdout, r.stdout + r.stderr
+    assert seen.read_text().strip() == "pod-own-jt" and "pod-own-jt" not in r.stdout + r.stderr
+    assert not (home / "state" / "tokens.env").exists() or "JUPYTER_TOKEN" not in (home / "state" / "tokens.env").read_text()

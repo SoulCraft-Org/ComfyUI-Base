@@ -163,8 +163,13 @@ GPU free (`GET /networkvolumes`; such a data centre is chosen first, so models d
 `env.PUBLIC_KEY` (the Mac key), `env.JUPYTER_TOKEN` and (3.14.0) `env.BASE_LINK_TOKEN` (each fresh per pod), `containerDiskInGb` (`--os-gb`, default 100),
 `supportPublicIp`, and `allowedCudaVersions`: REST v1's field (GraphQL's is `minCudaVersion`), every version from
 `--min-cuda`, else from the image tag (`…-cuda13.0`, `…-cu130`) but never below 13.0, upward. Without `--gpu` the stock
-check asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, and the first with stock where the pod must go is created. No templateId and no start command: `ensure`
-installs the boot guard as for every pod. A refused pod (sold out between the check and the create) deletes the volume
+check asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, and the first with stock where the pod must go is created. No templateId but the port-names one.
+3.14.0: the pod is created with its start command already the boot guard plus sshd and NOTHING of its image's own
+(`create_start`: `dockerEntrypoint` = `bash -c "<guard>; <sshd bootstrap>; exec sleep infinity"`). Before, it started on
+the image's entry until `ensure` patched it, and an image like `runpod/comfyui` served its own ComfyUI on the public 8188
+link with no key for the whole install (MEASURED 2026-10-16). Now nothing answers there until the install starts ComfyUI
+on 127.0.0.1 behind the key's front, the base installs ComfyUI itself (as on `runpod/base`), `ensure` resets nothing,
+and the install's `boot.sh --apps` starts JupyterLab with the pod's token, so the Jupyter Terminal link works at once. A refused pod (sold out between the check and the create) deletes the volume
 the same call made, so nothing is left billing. `create` is a billable verb: a consumer's guard hook prompts for it.
 
 `create --private` (3.7.4) is the shape for work that must not be reachable from a URL. It was the default from 3.8.1;
