@@ -17,6 +17,9 @@ _base_validate_tables(){ # every required declaration present and every table ro
   _base_model_rows >/dev/null || bad=1
   _base_later_rows >/dev/null || bad=1
   _base_own_rows >/dev/null || bad=1      # 3.2.0: each VENDORED_PACKS entry is a node pack beside the script
+  if [ -n "${GPU_PREFER:-}" ]; then        # 3.8.0: the GPU classes the package is tuned for; a typo would silence the warning
+    local gp; gp="$("$SYS_PY" "$BASE_DIR/py/gpu_fit.py" --check "$GPU_PREFER" 2>&1)" || { echo "  !! GPU_PREFER: $gp" >&2; bad=1; }
+  fi
   return $bad
 }
 _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per line, for list-packs / gen-models / suites

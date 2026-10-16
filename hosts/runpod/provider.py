@@ -516,6 +516,12 @@ STOCK_QUERY = "query { dataCenters { id name location gpuAvailability { gpuTypeI
 CREATE_PORTS = ["8188/http", "8888/http", "22/tcp"]      # ComfyUI and JupyterLab through the proxy, sshd on a public port
 PRIVATE_PORTS = ["22/tcp"]                               # 3.7.4 --private: sshd only; ComfyUI is reached through `podctl tunnel`
 CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
+# 3.8.0: with no --gpu, `create` asks for these in order (the video packages' GPU_PREFER, py/gpu_fit.py): B200 first,
+# then B300. "NVIDIA B300 SXM6 AC MIG 1g.34gb" is a 34 GB slice of a B300 and is never on this list.
+DEFAULT_GPUS = ("NVIDIA B200", "NVIDIA B300 SXM6 AC")
+# The base installs a cu130 torch whatever the image was built for, so a host below CUDA 13.0 (a pre-580 driver) fails at
+# the first kernel. Without --min-cuda the floor is never lower than this; an explicit --min-cuda still wins.
+DEFAULT_MIN_CUDA = "13.0"
 
 
 def stock(api, gpu):
@@ -537,6 +543,15 @@ def cuda_floor(image, min_cuda=None):
     tag = (image or "").rpartition(":")[2]
     m = re.search(r"cuda[-_]?(\d+)\.(\d+)", tag) or re.search(r"(?<![a-z])cu(\d{2})(\d)(?!\d)", tag)
     return "%s.%s" % (int(m.group(1)), m.group(2)) if m else None
+
+
+def create_floor(image, min_cuda=None):
+    """The floor `create` sends: --min-cuda as given, else the image tag's floor raised to DEFAULT_MIN_CUDA (3.8.0)."""
+    if min_cuda:
+        return str(min_cuda)
+    key = lambda v: tuple(int(x) for x in v.split("."))
+    tag = cuda_floor(image)
+    return tag if tag and key(tag) > key(DEFAULT_MIN_CUDA) else DEFAULT_MIN_CUDA
 
 
 def allowed_cuda(floor):
@@ -581,7 +596,7 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
         raise PodctlError("--image is required on RunPod (the pod's container image, e.g. a ComfyUI image built for CUDA 13)")
     if not pubkey:
         raise PodctlError("no public key for PUBLIC_KEY: pass --pubkey <file.pub>")
-    cuda = allowed_cuda(cuda_floor(image, min_cuda))
+    cuda = allowed_cuda(create_floor(image, min_cuda))
     if private:
         return _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep,
                                banner, ssh_config, say)
@@ -684,6 +699,7 @@ class RunPodProvider(Provider):
     ssh_alias = "runpod"
     key_path = pathlib.Path.home() / ".ssh" / "id_ed25519"
     experimental = False
+    default_gpus = DEFAULT_GPUS                 # 3.8.0: `create` with no --gpu tries these, in order
 
     def __init__(self, api=None):
         self.api = api or Api(load_api_key())

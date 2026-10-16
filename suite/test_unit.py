@@ -229,6 +229,54 @@ def test_unit_banner_runs_on_a_fake_pod_and_names_the_pool_honestly(tmp_path):
     assert "shared pool" in src and "_base_fs_is_pool" in src
 
 
+def test_unit_gpu_fit_names_b200_and_b300_and_judges_every_other_gpu_below(tmp_path):
+    """3.8.0: GPU_PREFER="B200 B300" is the video packages' declaration, and py/gpu_fit.py the one rule behind it: a GPU
+    of a preferred architecture fits, a newer one with the memory fits, everything else is BELOW (a warning, never a
+    stop). The numbers are nvidia-smi's own: B200 reads 183359 MiB, an H200 143771, an RTX PRO 6000 97887. A MIG slice
+    of a B300, which RunPod sells as its own type, is never a B300."""
+    sys.path.insert(0, str(BASE / "py")); import gpu_fit
+    want = ["B200", "B300"]
+    assert gpu_fit.fits(want, "10.0", 183359) == "ok" and gpu_fit.fits(want, "10.3", 275040) == "ok"
+    assert gpu_fit.fits(want, "9.0", 143771) == "below"            # H200: Hopper, 141 GB
+    assert gpu_fit.fits(want, "12.0", 97887) == "below"            # RTX PRO 6000 Blackwell: the right decade, half the memory
+    assert gpu_fit.fits(want, "11.0", 200000) == "ok"              # a newer chip with the memory, before the table names it
+    assert gpu_fit.fits(want, "12.0", 120000) == "below"
+    assert gpu_fit.fits(want, None, None) == "unknown"
+    assert gpu_fit.fits([], "8.9", 24000) == "ok"                   # no preference, nothing to fall short of
+    # a host's type id, read on the Mac with no numbers: the name decides
+    assert gpu_fit.class_of_name("NVIDIA B200") == "B200" and gpu_fit.class_of_name("NVIDIA B300 SXM6 AC") == "B300"
+    assert gpu_fit.class_of_name("NVIDIA B300 SXM6 AC MIG 1g.34gb") is None and gpu_fit.class_of_name("NVIDIA H200") is None
+    assert gpu_fit.fits(want, None, None, "NVIDIA B300 SXM6 AC") == "ok" and gpu_fit.fits(want, None, None, "NVIDIA H100 80GB HBM3") == "below"
+    assert gpu_fit.want_text(want) == "B200 (sm_100, 180 GB) or B300 (sm_103, 288 GB)"
+    assert gpu_fit.unknown_classes(["B200", "B2OO"]) == ["B2OO"]
+    r = subprocess.run([sys.executable, str(BASE / "py" / "gpu_fit.py"), "--prefer", "B200 B300", "--name", "NVIDIA H200", "--cc", "9.0", "--mib", "143771"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.split("\t")[:4] == ["fit=below", "gpu=NVIDIA H200", "sm=sm_90", "gb=151"], r.stdout
+    assert r.stdout.rstrip("\n").split("\t")[4] == "want=B200 (sm_100, 180 GB) or B300 (sm_103, 288 GB)", r.stdout
+    r = subprocess.run([sys.executable, str(BASE / "py" / "gpu_fit.py"), "--check", "B200 H9000"], capture_output=True, text=True)
+    assert r.returncode == 1 and "H9000" in r.stdout
+
+
+def test_unit_a_gpu_below_gpu_prefer_is_a_warning_in_the_banner_and_a_typo_is_refused(tmp_path):
+    """The pod's own run (preflight and the real run share base_init → base_banner) says, once, whether this GPU is the one
+    the package is tuned for: a warning that lands in the SUMMARY (podctl prints it), never a failure. An unknown class
+    in GPU_PREFER is an invalid declaration: a typo must not silence the warning on every pod."""
+    c = tmp_path / "ComfyUI"; (c / "models").mkdir(parents=True); (c / "main.py").write_text("")
+    run = "PKG_NAME=T; PKG_VERSION=1; GPU_PREFER='B200 B300'; base_env_setup; base_discover quiet; base_banner; echo W=${#BASE_WARN[@]}; printf '%s\n' \"${BASE_WARN[@]}\""
+    r = _bash(run, env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_FAKE_GPU": "NVIDIA RTX PRO 6000 Blackwell Server Edition|12.0|97887"})
+    assert r.returncode == 0 and "W=1" in r.stdout, r.stdout + r.stderr
+    assert "below what T is tuned for: B200 (sm_100, 180 GB) or B300 (sm_103, 288 GB)" in r.stdout and "(103 GB, sm_120)" in r.stdout, r.stdout
+    r = _bash(run, env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_FAKE_GPU": "NVIDIA B200|10.0|183359"})
+    assert r.returncode == 0 and "W=0" in r.stdout and "NVIDIA B200 is what T is tuned for" in r.stdout, r.stdout + r.stderr
+    r = _bash("PKG_NAME=T; PKG_VERSION=1; base_env_setup; base_discover quiet; base_banner; echo W=${#BASE_WARN[@]}",
+              env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_FAKE_GPU": "NVIDIA RTX 4090|8.9|24564"})
+    assert "W=0" in r.stdout and "gpu fit" not in r.stdout, "a package that declares no GPU_PREFER is never judged"
+    r = _bash("PKG_ID=t; PKG_NAME=T; PKG_VERSION=1; BASE_MIN=0; COMFY_MIN=0; GPU_PREFER='B200 B3OO'; base_env_setup; _base_validate_tables; echo RC=$?")
+    assert "RC=1" in r.stdout and "GPU_PREFER: unknown GPU class B3OO" in r.stderr, r.stdout + r.stderr
+    r = _bash("PKG_ID=t; PKG_NAME=T; PKG_VERSION=1; BASE_MIN=0; COMFY_MIN=0; GPU_PREFER='B200 B300'; base_env_setup; _base_validate_tables; echo RC=$?")
+    assert "RC=0" in r.stdout, r.stdout + r.stderr
+
+
 # ---------------------------------------------------------------- T3: tokens, ComfyUI update, version gate
 
 def _fake_comfy_repo(tmp_path):

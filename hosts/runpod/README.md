@@ -26,6 +26,24 @@ folder's `provider.py` is the RunPod half of the driver, moved here verbatim in 
   be in stock THERE. `podctl create` checks that first.
 - **22/tcp exposed.** `ensure` adds it when missing (the pod resets).
 
+## Which GPU
+
+The video packages are tuned for **B200** (`NVIDIA B200`, `sm_100`, 180 GB) first and **B300** (`NVIDIA B300 SXM6 AC`,
+`sm_103`, 288 GB) second; a package declares that with `GPU_PREFER="B200 B300"` and the base warns, never stops, on
+anything below (`py/gpu_fit.py`, the handbook's §1.1). `podctl create` asks for them in that order when no `--gpu` is given. On
+RunPod, as read on 2026-10-15/16 (stock moves; the create reads it live):
+
+| | B200 | B300 |
+|---|---|---|
+| type id | `NVIDIA B200` | `NVIDIA B300 SXM6 AC` (not `… MIG 1g.34gb`, a 34 GB slice) |
+| cloud | Secure | Secure (EUR-IS-1) |
+| datacenters with stock | EU-RO-1, US-CA-2, US-NC-2, US-NE-1, US-TX-6 | EUR-IS-1 (the one that also takes a network volume) |
+| CUDA floor | 13.0 (`allowedCudaVersions: ["13.0"]`) | 13.0 |
+| NVENC | none (NVIDIA's matrix: 0 encoders, 7 decoders) | none |
+
+A network volume pins its datacenter, so create the volume where the GPU is. With no NVENC, video is encoded on the CPU
+(`libx264`); `h264_nvenc` fails on both.
+
 ## How the boot is handed over
 
 `podctl ensure <pod>` wraps the image's own start command with the boot guard:
@@ -54,8 +72,8 @@ mechanism; `BASE_HOST` is detected on the pod itself from PID 1's `RUNPOD_POD_ID
 ## The commands
 
     uv run "_build/pod/podctl.py" pods                          # every pod: id, name, image, status, public ip, port 22
-    uv run "_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 [--location <dc> | --volume <id>]
-                                                                # stock check (names the data centres with the GPU free now), network volume, Secure Cloud pod
+    uv run "_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location <dc> | --volume <id>]
+                                                                # stock check (B200, then B300 unless --gpu; names the data centres with it free now), network volume, Secure Cloud pod
     uv run "_build/pod/podctl.py" status <pod>                  # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
     uv run "_build/pod/podctl.py" ensure <pod>                  # 22/tcp, PUBLIC_KEY, the boot guard, Host runpod
     uv run "_build/pod/podctl.py" install <pod> --base --pkg <dir>...   # upload, extract, --check, run (everything newest), poll, logs, pack records
@@ -76,7 +94,8 @@ the `--volume`'s) has none; `POST /networkvolumes` (`--data-gb` in that data cen
 one; `POST /pods` with `cloudType SECURE`, `dataCenterIds` [that one], the network volume at `/workspace`, ports
 `8188/http 8888/http 22/tcp`, `env.PUBLIC_KEY` (the Mac key), `containerDiskInGb` (`--os-gb`, default 100),
 `supportPublicIp`, and `allowedCudaVersions`: REST v1's field (GraphQL's is `minCudaVersion`), every version from
-`--min-cuda`, else from the image tag (`…-cuda13.0`, `…-cu130`), upward. No templateId and no start command: `ensure`
+`--min-cuda`, else from the image tag (`…-cuda13.0`, `…-cu130`) but never below 13.0, upward. Without `--gpu` the stock
+check asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, and the first with stock where the pod must go is created. No templateId and no start command: `ensure`
 installs the boot guard as for every pod. A refused pod (sold out between the check and the create) deletes the volume
 the same call made, so nothing is left billing. `create` is a billable verb: a consumer's guard hook prompts for it.
 

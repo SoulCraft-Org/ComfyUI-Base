@@ -774,6 +774,36 @@ def test_unit_podctl_install_refuses_a_gpu_that_is_not_ours(tmp_path, monkeypatc
     assert podctl.gpu_verdict(97887, 620, []) == gpu_facts.verdict(97887, 620, [])
 
 
+def test_unit_podctl_install_warns_when_the_pod_gpu_is_below_a_packages_gpu_prefer(tmp_path, monkeypatch, capsys):
+    """3.8.0: before the upload, podctl asks the pod the three numbers the pod's own run reads (name, compute capability,
+    memory) and holds them against every package's GPU_PREFER. Below is a WARNING naming what the package wants; the
+    install goes on. A package without GPU_PREFER costs no extra ssh call."""
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path)
+    (pkg / "My Pkg-script.sh").write_text('# GPU_PREFER="H9000" in a comment is not a declaration\nGPU_PREFER="B200 B300"\n' + (pkg / "My Pkg-script.sh").read_text())
+    assert podctl.gpu_prefer_of(pkg / "My Pkg-script.sh") == ["B200", "B300"]
+    def smi(where, name, cc, mib):
+        d = tmp_path / where; d.mkdir(parents=True, exist_ok=True)
+        (d / "nvidia-smi").write_text('#!/bin/bash\ncase "$*" in *query-gpu=name,compute_cap,memory.total*) echo "%s, %s, %d";; *query-gpu=memory*) echo "%d, 600";; '
+                                      '*query-compute-apps*) :;; *) exit 1;; esac\n' % (name, cc, mib, mib))
+        (d / "nvidia-smi").chmod(0o755); return str(d)
+    monkeypatch.setenv("PATH", "%s:%s" % (smi("h200", "NVIDIA H200", "9.0", 143771), os.environ["PATH"]))
+    io = LocalPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-10-16", save_pins=False)
+    out = capsys.readouterr().out
+    assert rc == 0 and "WARNING: NVIDIA H200 (151 GB, sm_90) is below what My Pkg is tuned for: B200 (sm_100, 180 GB) or B300 (sm_103, 288 GB)" in out, out
+    assert out.index("WARNING") < out.index("extracted"), "the warning comes before the upload"
+    monkeypatch.setenv("PATH", "%s:%s" % (smi("b300", "NVIDIA B300 SXM6 AC", "10.3", 275040), os.environ["PATH"]))
+    io = LocalPodIO(tmp_path / "pod2")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-10-16", save_pins=False)
+    out = capsys.readouterr().out
+    assert rc == 0 and "gpu fit NVIDIA B300 SXM6 AC is what My Pkg is tuned for" in out and "WARNING" not in out, out
+    (pkg / "My Pkg-script.sh").write_text("PACKS=()\n")
+    io = LocalPodIO(tmp_path / "pod3")
+    assert podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-10-16", save_pins=False) == 0
+    assert not [c for c in io.cmds if "compute_cap" in c], "no GPU_PREFER, no question"
+
+
 def test_unit_podctl_deploy_clones_the_pod_onto_its_own_volume(tmp_path):
     """2026-09-06: a stop/start put pod fakepod0000003 back on the machine whose GPU is not ours. The next rung is a NEW pod
     on the same network volume, cloned from the old one — image, GPU type, disk, ports, env, and the base's boot override as
@@ -1738,6 +1768,50 @@ def test_unit_runpod_cuda_floor_comes_from_the_flag_or_the_image_tag():
     assert podctl.allowed_cuda(None) is None and podctl.allowed_cuda("13.0") == ["13.0"]
     with pytest.raises(podctl.PodctlError):
         podctl.allowed_cuda("14.0")
+
+
+def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor(tmp_path, capsys):
+    """3.8.0, Paul's decision of 2026-10-16: the video packages run on B200 first and B300 second, so `create` without
+    --gpu asks for "NVIDIA B200", then "NVIDIA B300 SXM6 AC" (never the 34 GB MIG slice), and takes the first with stock
+    where the pod must go: the --location, the --volume's data centre, else the first data centre with it. The CUDA floor
+    is never below 13.0 without --min-cuda: the base installs a cu130 torch whatever the image's tag says."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    stock = {"dataCenters": [
+        {"id": "EU-RO-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B200", "stockStatus": "Low", "available": True}]},
+        {"id": "EUR-IS-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B300 SXM6 AC", "stockStatus": "Low", "available": True},
+                                               {"gpuTypeId": "NVIDIA B300 SXM6 AC MIG 1g.34gb", "stockStatus": "High", "available": True}]}]}
+    assert podctl.RunPodProvider.default_gpus == ("NVIDIA B200", "NVIDIA B300 SXM6 AC")
+    srv = FakeRunPod(_pod(), volumes={"isvol": {"id": "isvol", "size": 500, "dataCenterId": "EUR-IS-1"}}, gql=stock)
+    def create(*argv, image="someone/comfy:cu128"):
+        prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+        args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "bw", "--image", image, "--no-wait", *argv])
+        return podctl.cmd_create(prov, args)
+    try:
+        assert create("--data-gb", "500") in (None, 0)
+        out = capsys.readouterr().out
+        body = srv.bodies[-1][1]
+        assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["dataCenterIds"] == ["EU-RO-1"], body
+        assert body["allowedCudaVersions"] == ["13.0"], "a cu128 image tag must not lower the floor below the base's cu130"
+        assert "gpu     NVIDIA B200, in EU-RO-1 (no --gpu: the host's order is NVIDIA B200, NVIDIA B300 SXM6 AC)" in out, out
+        # the volume pins EUR-IS-1, which has no B200: the B300 there
+        assert create("--volume", "isvol") in (None, 0)
+        out = capsys.readouterr().out
+        assert srv.bodies[-1][1]["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"] and srv.bodies[-1][1]["dataCenterIds"] == ["EUR-IS-1"]
+        assert "stock   NVIDIA B200 free now in: EU-RO-1" in out and "stock   NVIDIA B300 SXM6 AC free now in: EUR-IS-1" in out, out
+        # a data centre with neither: STOP, naming where each is free, nothing created
+        n = len(srv.bodies)
+        assert create("--data-gb", "100", "--location", "US-CA-2") == 1
+        out = capsys.readouterr().out
+        assert "STOP: US-CA-2 has no NVIDIA B200 or NVIDIA B300 SXM6 AC free right now; NVIDIA B200 is free in: EU-RO-1; NVIDIA B300 SXM6 AC is free in: EUR-IS-1" in out, out
+        assert [p for p, _ in srv.bodies[n:] if p != "/graphql"] == [], "a STOP creates no volume and no pod"
+        # an explicit --gpu is the only one asked; an explicit --min-cuda still wins over the floor
+        assert create("--data-gb", "100", "--gpu", "NVIDIA B300 SXM6 AC", "--min-cuda", "12.9") in (None, 0)
+        assert srv.bodies[-1][1]["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"] and srv.bodies[-1][1]["allowedCudaVersions"] == ["13.0", "12.9"]
+    finally:
+        srv.close()
+    assert podctl.create_floor("someone/comfy:latest") == "13.0" and podctl.create_floor("runpod/comfyui:1.4.7-cuda13.0") == "13.0"
+    assert podctl.create_floor("x/y:cu128", "12.8") == "12.8"
 
 
 def test_unit_create_flags_a_host_does_not_take_are_refused_by_name(tmp_path):

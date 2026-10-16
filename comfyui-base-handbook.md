@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.7.5.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.8.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -200,8 +200,8 @@ it rides a bearer header and is never printed.
 ```bash
 uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>     # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
 uv run "base/comfyui-base/_build/pod/podctl.py" deploy --like <pod> --wait   # a NEW pod cloned onto the same volume (rule 11's redeploy rung)
-uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500   # a first pod: stock check, network volume, Secure Cloud pod
-uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 --private   # encrypted pod volume, 22/tcp only, ComfyUI via podctl tunnel
+uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500   # a first pod: stock check (B200, then B300), network volume, Secure Cloud pod
+uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 --private   # encrypted pod volume, 22/tcp only, ComfyUI via podctl tunnel
 uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg <dir> --no-suite --env KEY=VALUE   # BASE_NO_SUITE=1 and KEY on every run on the machine
 uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>     # 22/tcp · PUBLIC_KEY = the Mac key · the start command · Host runpod · state/host.env
 uv run "base/comfyui-base/_build/pod/podctl.py" upload <zip>...  # to /workspace/packages, size + sha256 checked both sides
@@ -215,6 +215,28 @@ private images). Before the base is installed that boots the image as it was plu
 (8188) and JupyterLab (8888) are also on RunPod's HTTP proxy ports, which is why this host binds `0.0.0.0`. Fallback
 when the API is not available: the JupyterLab terminal on port 8888, where `bash lib/boot.sh --print-sshd-bootstrap`
 prints the sshd snippet to paste.
+
+**Which GPU (3.8.0).** The video packages are tuned for NVIDIA's datacenter Blackwell: **B200** (RunPod type
+`NVIDIA B200`, compute capability 10.0 = `sm_100`, 180 GB HBM3e) first, then **B300** (`NVIDIA B300 SXM6 AC`, 10.3 =
+`sm_103`, 288 GB). A package says so with `GPU_PREFER="B200 B300"` (§4), and `py/gpu_fit.py` is the one table and rule
+behind it: the pod's own run warns in its banner and SUMMARY, and `podctl install` warns before it uploads, when the
+GPU is below (another architecture with less memory: an H200 at 141 GB, an RTX PRO 6000 at 96 GB). Never a stop.
+`podctl create` takes the same order when no `--gpu` is given, and a CUDA floor of 13.0. What holds on RunPod, read 2026-10-15/16 (stock moves; the
+create reads it live):
+
+- B200 is Secure Cloud, with stock in EU-RO-1, US-CA-2, US-NC-2, US-NE-1 and US-TX-6; B300 in EUR-IS-1, the
+  one datacenter with B300 that also takes a network volume. `NVIDIA B300 SXM6 AC MIG 1g.34gb` is a 34 GB slice, not
+  a B300, and `gpu_fit.py` never counts it as one.
+- A network volume pins its datacenter: create it where the GPU is, and a pod on it can only ever be that DC's GPU.
+- The CUDA floor is 13.0 (REST `allowedCudaVersions: ["13.0"]`; GraphQL calls it `minCudaVersion`): the base's cu130
+  torch and the Blackwell kernels need a 580+ driver, and a host on CUDA 12.x answers with an older one.
+- No NVENC. NVIDIA's encode/decode matrix gives the HGX B200 and B300 0 NVENC engines (7 NVDEC), like the H100, so an
+  `h264_nvenc` save fails there; encode on the CPU (`libx264`). "RTX" features (RTX Video Super Resolution) name an
+  RTX GPU, which these are not.
+- Attention (3.7.5): SageAttention's `auto` (KJ's default, and `--use-sage-attention`) has no `sm_100` dispatch, so on a
+  B200 it fails at the first step. The base runs every KJ mode on a tiny tensor and keeps the answer per GPU
+  (`$VENV/.comfy-base-sage/<sm>.json`, `base_sage_mode`, `bash base.sh sage`); a package uses the mode it names, and
+  SageAttention's Triton kernel (`sageattn_qk_int8_pv_fp16_triton`) is the safe choice on both chips.
 
 ### 1.2 Verda
 
@@ -325,7 +347,10 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   checked for shape only, so no zip carries the list. A brand without the file skips the check.
 - Optional: `WF_VERSION_KEY` (the `extra` key carrying the workflow's version; default `package_version`),
   `DRIVER_MIN SUPERSEDED LEGACY_DIRS DROPPED_PACKS TOKENS PIP_EXTRA HYGIENE_ARGS HYGIENE_ARGS_REMOVE LOADER_CATS
-  PKG_COMMANDS PKG_IMPORT_CHECK PKG_NO_SUITE ZIP_EXTRA VENDORED_PACKS`. `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
+  PKG_COMMANDS PKG_IMPORT_CHECK PKG_NO_SUITE ZIP_EXTRA VENDORED_PACKS GPU_PREFER`. `GPU_PREFER="B200 B300"` (3.8.0) names
+  the GPU classes the package is tuned for, best first, from `py/gpu_fit.py`'s table (an unknown class is an invalid
+  declaration); a GPU below them is a warning in the run's banner and SUMMARY and in `podctl install`, never a stop
+  (§1.1). `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
   says so: the run's test stage notes it, and `verify.sh` passes the package as "no suite, declared". `LOADER_CATS`
   rows (`NodeType|library category`) extend the base's map of loader node types to library folders (`lib/60-sync.sh`
   covers ComfyUI's core loaders and the shared packs'); a package whose own pack loads models declares its loaders here.
@@ -600,6 +625,22 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.8.0: B200 and B300 are the defaults (Paul's decision of 2026-10-16: the video packages run on NVIDIA's datacenter
+  Blackwell, optimised for it). `py/gpu_fit.py` is the one table (B200: compute capability 10.0, 180 GB; B300: 10.3,
+  288 GB) and the one rule: a package declares `GPU_PREFER="B200 B300"` (§4; an unknown class is an invalid
+  declaration), and a GPU of another architecture with less than 90 % of the smallest preferred memory is BELOW. The
+  pod's run says so in its banner and its SUMMARY warnings (preflight and the real run share `base_init`), and
+  `podctl install` asks the pod the same three numbers before it uploads and prints a WARNING; neither ever stops. A
+  RunPod MIG slice (`NVIDIA B300 SXM6 AC MIG 1g.34gb`, 34 GB) is never a B300. `podctl create` on RunPod without
+  `--gpu` asks the stock check for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, and creates the first with stock where
+  the pod must go (the `--location`, the `--volume`'s data centre, else the first that has it), naming each one's data
+  centres when none fits; `allowedCudaVersions` is never below 13.0 without `--min-cuda` (the base installs a cu130
+  torch whatever the image's tag says). The banner's torch line names every Blackwell arch the wheel carries (`sm_1xx`),
+  not only `sm_12x`, so a B200's `sm_100` shows. The handbook (§1.1 "Which GPU") and `hosts/runpod/README.md` carry the
+  RunPod facts read 2026-10-15/16: B200 stock in EU-RO-1, US-CA-2, US-NC-2, US-NE-1 and US-TX-6; B300 in EUR-IS-1, the
+  one data centre with B300 that takes a network volume; a volume pins its data centre; the CUDA floor; and NVIDIA's
+  encode matrix: 0 NVENC on HGX B200 and B300, so `h264_nvenc` fails there. Exercised on this Mac against the suite's
+  fakes (fake RunPod, fake nvidia-smi, a fake pod); not on a B200 or a B300.
 - 3.7.5: SageAttention is proven by RUNNING it. A B200 (sm_100, 2026-10-16) imported a correct sm_100a build and died
   at the first sampling step: upstream's `sageattn()` (KJ's "auto", ComfyUI's `--use-sage-attention`) dispatches
   sm80/86/89/90/120/121 only. Upstream withdrew SM100 in 2025-12 (#322) and SageAttention3 refuses sm_100 (#346).

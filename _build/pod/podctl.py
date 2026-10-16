@@ -57,6 +57,7 @@ sys.modules["comfyui_podctl"] = sys.modules[__name__] if __name__ in sys.modules
 _hosts = _load_by_path("comfyui_hosts", BASE_DIR / "hosts" / "__init__.py", BASE_DIR / "hosts")
 _brand = _load_by_path("comfyui_brand", BASE_DIR / "py" / "brand.py")
 _pkgdirs = _load_by_path("comfyui_pkgdirs", BASE_DIR / "py" / "pkgdirs.py")     # 3.6.0: the one package-discovery rule
+_gpu_fit = _load_by_path("comfyui_gpu_fit", BASE_DIR / "py" / "gpu_fit.py")     # 3.8.0: the one GPU-preference rule (GPU_PREFER)
 PodctlError = _hosts.PodctlError
 Provider = _hosts.Provider
 
@@ -66,7 +67,7 @@ _runpod = _hosts.load_provider("runpod", BASE_DIR)
 RunPodProvider = _runpod.RunPodProvider
 for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "Api", "pod_image", "pod_volume_id", "env_verdicts", "pod_facts",
            "BOOT_GUARD", "image_config", "wrap_entry", "sshd_bootstrap_text", "wait_for", "ensure", "stop", "start", "restart", "deploy_body",
-           "deploy", "volume_size_gb", "record_volume", "POD_READ", "pod_volume", "volume_line", "stock", "cuda_floor", "allowed_cuda",
+           "deploy", "volume_size_gb", "record_volume", "POD_READ", "pod_volume", "volume_line", "stock", "cuda_floor", "create_floor", "DEFAULT_GPUS", "DEFAULT_MIN_CUDA", "allowed_cuda",
            "create_body", "create"):
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
@@ -535,6 +536,39 @@ def gpu_gate(io, say, uploading=True):
     return False
 
 
+def gpu_prefer_of(script_path):
+    """The GPU classes a package script declares (GPU_PREFER="B200 B300", 3.8.0), in its order; [] when it names none."""
+    try:
+        text = pathlib.Path(script_path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    m = re.search(r'^[^#\n]*?\bGPU_PREFER="([^"]*)"', text, re.M)        # the first assignment, never inside a comment
+    return _gpu_fit.parse_prefer(m.group(1)) if m else []
+
+
+def gpu_fit_note(io, items, say):
+    """Before the upload, the pod's GPU against every package's GPU_PREFER: a GPU below what a package is tuned for is a
+    WARNING with what it lacks, never a stop (the run is the person's call). Asked over ssh, the same three numbers the
+    pod's own run reads (py/gpu_fit.py), so the Mac and the pod never disagree."""
+    wants = [(it["name"], gpu_prefer_of(it["local_script"])) for it in items if it.get("kind") == "pkg" and it.get("local_script")]
+    wants = [(n, p) for n, p in wants if p]
+    if not wants:
+        return
+    rc, out, _ = io.remote("nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader,nounits 2>/dev/null")
+    parts = [x.strip() for x in (out or "").strip().splitlines()[0].split(",")] if rc == 0 and (out or "").strip() else []
+    if len(parts) < 3 or not parts[2].isdigit():
+        say("gpu fit no nvidia-smi answer on the pod: %s not verified" % "; ".join("%s wants %s" % (n, _gpu_fit.want_text(p)) for n, p in wants))
+        return
+    name, cc, mib = parts[0], parts[1], int(parts[2])
+    for n, p in wants:
+        if _gpu_fit.fits(p, cc, mib, name) == "ok":
+            say("gpu fit %s is what %s is tuned for (%s)" % (name, n, _gpu_fit.want_text(p)))
+        else:
+            say("WARNING: %s (%d GB, %s) is below what %s is tuned for: %s. The install goes on; it runs slower or with "
+                "offloading. For the handbook's speed, deploy one of those (podctl create picks them by default on RunPod)."
+                % (name, round(mib * 1024 * 1024 / 1e9), _gpu_fit.sm_of(cc), n, _gpu_fit.want_text(p)))
+
+
 def item_for(directory):
     """What an item is on both sides: the base (its zip extracts to 'comfyui-base/…') or a package (a flat zip that
     extracts into '<Name>/…' — see below)."""
@@ -813,6 +847,7 @@ def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_
             io.say("STOP: %s has no zip (%s) — build it first" % (it["name"], it["zip"].name)); return 1
     if not gpu_gate(io, io.say):
         return 1
+    gpu_fit_note(io, items, io.say)
     for it in items:
         io.say("══ %s ══" % it["name"])
         try:
@@ -1589,15 +1624,29 @@ def cmd_create(prov, args):
         loc = vloc
     elif not args.data_gb:
         raise PodctlError("--data-gb N (a new volume) or --volume <id> (an existing one)")
-    locs = prov.availability(args.gpu, spot=args.spot)
-    print("stock   %s%s free now in: %s" % (args.gpu, spot, ", ".join(locs) if locs else "no location"))
-    if not locs:
-        print("STOP: %s is sold out in every location right now%s" % (args.gpu, spot)); return 1
-    if loc and loc not in locs:
-        print("STOP: %s has no %s free right now%s; it is free in: %s%s" % (
-            loc, args.gpu, spot, ", ".join(locs), " (the volume pins the data centre: wait, or create a new volume there)" if volume else ""))
+    # 3.8.0: --gpu names one type; without it the host's default order (RunPod: B200, then B300) is tried, and the first
+    # with stock where the pod must go (the --location, the volume's data centre, else anywhere) is the one created
+    defaulted = not args.gpu
+    gpus = [args.gpu] if args.gpu else list(getattr(prov, "default_gpus", ()) or ())
+    if not gpus:
+        raise PodctlError("--gpu is required on host %s (it has no default GPU order)" % getattr(prov, "name", "?"))
+    seen = []
+    for gpu in gpus:
+        locs = prov.availability(gpu, spot=args.spot)
+        print("stock   %s%s free now in: %s" % (gpu, spot, ", ".join(locs) if locs else "no location"))
+        seen.append((gpu, locs))
+        if locs and (not loc or loc in locs):
+            args.gpu, loc = gpu, loc or locs[0]
+            break
+    else:
+        if not any(locs for _, locs in seen):
+            print("STOP: %s sold out in every location right now%s" % (" and ".join(g for g, _ in seen) + (" is" if len(seen) == 1 else " are"), spot)); return 1
+        print("STOP: %s has no %s free right now%s; %s%s" % (
+            loc, " or ".join(g for g, _ in seen), spot, "; ".join("%s is free in: %s" % (g, ", ".join(l)) for g, l in seen if l),
+            " (the volume pins the data centre: wait, or create a new volume there)" if volume else ""))
         return 1
-    loc = loc or locs[0]
+    if defaulted:
+        print("gpu     %s, in %s (no --gpu: the host's order is %s)" % (args.gpu, loc, ", ".join(gpus)))
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
     extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private)) if v}
     import inspect
@@ -1714,12 +1763,13 @@ def build_parser():
     p.add_argument("--spot", action="store_true")
     p = sub.add_parser("create", help="a machine from nothing, after a stock check that names where the GPU is free: a data volume (or --volume), "
                                       "then the machine on it (Verda: NVMe disk + instance; RunPod: network volume + Secure Cloud pod); ensure configures it")
-    p.add_argument("--name", required=True); p.add_argument("--gpu", required=True, help="Verda: an instance type; RunPod: a GPU type id, e.g. 'NVIDIA B200'")
+    p.add_argument("--name", required=True); p.add_argument("--gpu", help="Verda: an instance type (required); RunPod: a GPU type id (default: "
+                                                                      "'NVIDIA B200', then 'NVIDIA B300 SXM6 AC', the first with stock)")
     p.add_argument("--location", help="Verda: a location; RunPod: a data centre id (default: the first with the GPU free now)")
     p.add_argument("--data-gb", dest="data_gb", type=int, help="the size of a NEW data volume (RunPod: a network volume in that data centre)")
     p.add_argument("--volume", help="RunPod: an EXISTING network volume id to put the pod on (its data centre is the pod's)")
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
-    p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: read from the image tag)")
+    p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
     p.add_argument("--private", action="store_true", help="RunPod: an ENCRYPTED pod volume of --data-gb (network volumes cannot be "
                    "encrypted), ports 22/tcp only (no proxy URL, no JupyterLab), ComfyUI on loopback: reach it with podctl tunnel")

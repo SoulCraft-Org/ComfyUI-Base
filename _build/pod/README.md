@@ -1,7 +1,7 @@
 # podctl — the Claude-driven pod path (Mac side)
 
     uv run "base/comfyui-base/_build/pod/podctl.py" pods
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 [--location EU-RO-1 | --volume <id>]
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location EU-RO-1 | --volume <id>]   # RunPod default: B200, then B300
     uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>        # facts; env NAMES and placeholder verdicts, never values
     uv run "base/comfyui-base/_build/pod/podctl.py" image <pod>         # the image's entrypoint/cmd and how ensure wraps them
     uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>        # TCP 22 · PUBLIC_KEY · the base's boot as start command · Host runpod
@@ -40,15 +40,20 @@ are printed, the values never.
 
 ## create — a pod from nothing (3.7.3, RunPod; Verda since 3.1.0)
 
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 [--location EU-RO-1]
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --volume <network volume id>
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--location EU-RO-1]
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --volume <network volume id>
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA H200" --image <img> --data-gb 500   # one named type instead
+
+Without `--gpu` (3.8.0) RunPod asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, the order the video packages'
+`GPU_PREFER` names, and creates the first with stock where the pod must go (the `--location`, the `--volume`'s data
+centre, else the first data centre that has it); a host with no default order (Verda) still needs `--gpu`.
 
 The stock check runs first and prints every data centre where the GPU is free now (RunPod's GraphQL `dataCenters`;
 REST v1 has no stock call). A `--location` (or the `--volume`'s own data centre) without stock stops there, naming the
 ones that have it, before anything is created. Then a network volume of `--data-gb` in that data centre (or the existing
 `--volume`), then a Secure Cloud pod on it: the image, ports `8188/http 8888/http 22/tcp`, `PUBLIC_KEY` from the Mac key,
-`--os-gb` of container disk (default 100), and `allowedCudaVersions` from `--min-cuda` or the image tag (`cuda13.0`,
-`cu130` → 13.0 and newer). A refused pod deletes the volume that same call created; an existing volume is never deleted.
+`--os-gb` of container disk (default 100), and `allowedCudaVersions` from `--min-cuda`, else the image tag (`cuda13.0`,
+`cu130` → 13.0 and newer) never below 13.0 (3.8.0: the base installs a cu130 torch whatever the image was built for). A refused pod deletes the volume that same call created; an existing volume is never deleted.
 `--wait` is the default (until sshd answers, then `Host runpod` → the new pod); then `podctl ensure <pod>`. `create` bills:
 a consumer's guard hook prompts for it like `deploy`.
 

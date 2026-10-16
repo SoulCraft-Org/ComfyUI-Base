@@ -43,6 +43,25 @@ _base_gpu_headroom(){ # the GPU must be ours: memory no visible process holds be
   return 0
 }
 
+_base_gpu_fit(){ # 3.8.0: GPU_PREFER="B200 B300" names the GPUs a package is tuned for; a GPU below them is a warning, never a stop
+  [ -n "${GPU_PREFER:-}" ] || return 0
+  local line fit gpu sm gb want
+  if [ -n "${BASE_FAKE_GPU:-}" ]; then          # the suite's GPU: "name|compute capability|MiB"
+    IFS='|' read -r gpu sm gb <<< "$BASE_FAKE_GPU"
+    line="$("$SYS_PY" "$BASE_DIR/py/gpu_fit.py" --prefer "$GPU_PREFER" --name "$gpu" --cc "$sm" --mib "$gb" 2>/dev/null || true)"
+  elif [ -z "$BASE_FAKE_ROOT" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    line="$("$SYS_PY" "$BASE_DIR/py/gpu_fit.py" --prefer "$GPU_PREFER" 2>/dev/null || true)"
+  else return 0; fi
+  IFS=$'\t' read -r fit gpu sm gb want <<< "$line"            # tab-separated key=value (py/gpu_fit.py): names have spaces
+  fit="${fit#fit=}"; gpu="${gpu#gpu=}"; sm="${sm#sm=}"; gb="${gb#gb=}"; want="${want#want=}"
+  case "$fit" in
+    ok)    echo "  gpu fit      $gpu is what ${PKG_NAME:-this package} is tuned for ($want)";;
+    below) warn "GPU $gpu ($gb GB, $sm) is below what ${PKG_NAME:-this package} is tuned for: $want. It runs, slower or with offloading; deploy one of those for the speed and quality the handbook states";;
+    *)     note "gpu fit      not verifiable here (no nvidia-smi answer); ${PKG_NAME:-this package} is tuned for $want";;
+  esac
+  return 0
+}
+
 _base_vol(){ # the ONE filesystem a stop/start keeps: BASE_VOLUME on a machine, the fake root in tests, COMFY_DIR's grandparent off-pod
   if [ -n "$BASE_FAKE_ROOT" ]; then echo "$BASE_FAKE_ROOT"
   elif [ -d "$BASE_VOLUME" ]; then echo "$BASE_VOLUME"
@@ -237,7 +256,7 @@ base_discover(){ # base_discover [quiet] → 3 when the pod has no network volum
     _base_gpu_headroom
   fi
   if [ -z "$BASE_FAKE_ROOT" ] && [ -x "$RUN_PY" ]; then
-    TORCH_NOW="$(_base_timeout 120 "$RUN_PY" -c 'import torch; print("torch %s · CUDA %s · %s" % (torch.__version__, torch.version.cuda, ",".join(a for a in torch.cuda.get_arch_list() if a.startswith("sm_12")) or "no sm_12x"))' 2>/dev/null || echo "torch not importable")"
+    TORCH_NOW="$(_base_timeout 120 "$RUN_PY" -c 'import torch; print("torch %s · CUDA %s · %s" % (torch.__version__, torch.version.cuda, ",".join(a for a in torch.cuda.get_arch_list() if a.startswith("sm_1")) or "no Blackwell arch (sm_1xx)"))' 2>/dev/null || echo "torch not importable")"
   elif [ -n "$BASE_FAKE_ROOT" ]; then TORCH_NOW="(fake root: not probed)"; fi
   PORT=8188
   local pf="" p
@@ -271,6 +290,7 @@ base_banner(){
     _base_venv_boot_line "$VENV"                                   # 2.0.8: the home DIR was handed to a predicate expecting a venv
   fi
   echo "  GPU          $GPU_NAME · driver $DRIVER${BASE_GPU_SM:+ · $BASE_GPU_SM}"
+  _base_gpu_fit
   # A RunPod volume is backed by a shared pool and df reports the POOL (702026 GB was a real reading).
   # Printed as "free" it reads like headroom you own; name it instead of quietly trusting it.
   local vol_note=""
