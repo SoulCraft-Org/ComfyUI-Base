@@ -911,6 +911,48 @@ def test_unit_manager_security_level_is_set_to_normal_and_package_hygiene_hook_r
     assert (tmp_path / "runpod-slim" / "comfyui_args.txt").read_text() == ""                  # the template's file: untouched
 
 
+def test_unit_hygiene_marks_the_app_mode_tour_seen_and_keeps_every_other_setting(tmp_path):
+    """3.17.1 (error log row 81): frontend 1.55.x opens a full-screen "Welcome to Apps" tour over the App Mode form on a
+    first visit. Hygiene appends "appMode" to "Comfy.OnboardingCoachmarks.Seen" (ComfyUI_frontend v1.55.17's
+    TOUR_SEEN_SETTING) in the settings file the server reads, keeping the list's items and every other key; a dry run
+    writes nothing, a second run changes nothing, a corrupt file is left alone and named, and on a shared volume the file
+    is the one under BASE_LOCAL_STATE (the server's --user-directory), never $COMFY/user."""
+    import json
+    c = _pod(tmp_path); (tmp_path / "runpod-slim").mkdir(); (tmp_path / "runpod-slim" / "comfyui_args.txt").write_text("")
+    f = c / "user" / "default" / "comfy.settings.json"; f.parent.mkdir(parents=True)
+    orig = json.dumps({"Comfy.ColorPalette": "light", "Comfy.OnboardingCoachmarks.Seen": ["firstRun"], "pysssss.X": 3}, indent=4)
+    f.write_text(orig)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1"}
+    run = lambda extra="", **kw: _bash('%s base_env_setup; base_discover quiet; base_hygiene; echo CHANGED=${#BASE_CHANGED[@]}' % extra, env={**env, **kw})
+    r = run(BASE_DRY="1")
+    assert f.read_text() == orig and "would mark the App Mode tour seen" in r.stdout, r.stdout + r.stderr
+    r = run(); got = json.loads(f.read_text())
+    assert got == {"Comfy.ColorPalette": "light", "Comfy.OnboardingCoachmarks.Seen": ["firstRun", "appMode"], "pysssss.X": 3}, got
+    assert "the App Mode tour marked seen" in r.stdout, r.stdout + r.stderr
+    before = f.read_bytes(); r = run()
+    assert f.read_bytes() == before and "CHANGED=0" in r.stdout and "tour is marked seen" in r.stdout, r.stdout + r.stderr
+    f.write_text("{ half a file"); r = run()
+    assert f.read_text() == "{ half a file" and "left untouched" in r.stdout and str(f) in r.stdout, r.stdout + r.stderr
+    f.unlink(); run()
+    assert json.loads(f.read_text()) == {"Comfy.OnboardingCoachmarks.Seen": ["appMode"]}
+    f.unlink(); state = tmp_path / "local-state"
+    r = run(BASE_VOLUME_SHARED="1", BASE_LOCAL_STATE=str(state))
+    shared = state / "user" / "default" / "comfy.settings.json"
+    assert json.loads(shared.read_text()) == {"Comfy.OnboardingCoachmarks.Seen": ["appMode"]} and not f.exists(), r.stdout + r.stderr
+
+
+def test_unit_comfy_settings_merge_appends_and_never_breaks_the_list():
+    """The merge does what the frontend's own markTourSeen does: the list kept in order, the missing entry appended; a
+    value that is not a list (the frontend calls .includes on it) becomes the seed's list; other keys never move."""
+    import comfy_settings as cs
+    key = "Comfy.OnboardingCoachmarks.Seen"
+    assert cs.SEED == {key: ["appMode"]}
+    assert cs.merge({}) == ({key: ["appMode"]}, [key])
+    assert cs.merge({key: ["firstRun"], "a": 1}) == ({key: ["firstRun", "appMode"], "a": 1}, [key])
+    assert cs.merge({key: ["appMode", "firstRun"]}) == ({key: ["appMode", "firstRun"]}, [])
+    assert cs.merge({key: "appMode"}) == ({key: ["appMode"]}, [key])
+
+
 def test_unit_yaml_register_appends_once_and_respects_a_foreign_entry(tmp_path):
     y = tmp_path / "extra_model_paths.yaml"; y.write_text("comfyui:\n  base_path: /x\n")
     r = _bash(f'EXTRA_YAML="{y}"; _base_yaml_register pkg_a VHS_video_formats /workspace/pkg_a/video_formats; _base_yaml_register pkg_a VHS_video_formats /workspace/pkg_a/video_formats; echo CHANGED=${{#BASE_CHANGED[@]}}')
@@ -2777,6 +2819,31 @@ def test_unit_latest_is_a_plain_run_and_nothing_is_left_to_settle():
     src = code_only((BASE / "lib" / "95-summary.sh").read_text())
     assert "--latest)  base_install" in src and "_base_warn_settle" not in src and "BASE_LATEST=1" not in src
     assert "BASE_LATEST" not in code_only((BASE / "lib" / "40-packs.sh").read_text())
+
+
+def test_unit_snapshot_drivers_serve_the_seed_and_report_a_tour():
+    """3.17.1 (row 81): the App-view drivers' settings stub serves what the base seeds, and coach_tour, the one shared
+    replacement for the packages' dismiss loops, returns None when no tour shows and, when ComfyUI_frontend's landing
+    (data-testid coach-landing-overlay) shows, clicks its exact Skip and reports {"shown", "dismissed"}."""
+    _repo_only("_build/canvas/snapshot.py")
+    import importlib.util, comfy_settings
+    spec = importlib.util.spec_from_file_location("snapshot", BASE / "_build" / "canvas" / "snapshot.py"); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    assert all(m.SETTINGS.get(k) == v for k, v in comfy_settings.SEED.items())
+
+    class Page:
+        def __init__(self, showing): self.showing = showing; self.calls = []; self.keyboard = self
+        def evaluate(self, js, *a):
+            self.calls.append(js)
+            if js == m.JS_COACH_SHOWN: return self.showing
+            if js == m.JS_COACH_SKIP:
+                if self.showing: self.showing = None; return "coach-landing"
+                return None
+        def wait_for_timeout(self, ms): pass
+        def press(self, key): self.calls.append(key); self.showing = None
+
+    assert m.coach_tour(Page(None), wait_ms=500) is None
+    p = Page("coach-landing-overlay")
+    assert m.coach_tour(p) == {"shown": "coach-landing-overlay", "dismissed": True} and m.JS_COACH_SKIP in p.calls and "Escape" not in p.calls
 
 
 def test_unit_snapshot_console_errors_are_classified_not_counted(tmp_path):

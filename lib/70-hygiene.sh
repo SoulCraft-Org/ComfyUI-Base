@@ -85,6 +85,24 @@ _base_manager_security(){ # security_level = normal; network_mode and everything
     BASE_CHANGED+=("ComfyUI-Manager config.ini: security_level = normal"); ok "Manager security_level = normal"
   fi
 }
+# 3.17.1 (error log row 81): frontend 1.55.x opens a full-screen "Welcome to Apps" tour over the App Mode form on a user's
+# first visit, and every package opens in App Mode. "Comfy.OnboardingCoachmarks.Seen" gains "appMode" (the list kept, every
+# other key untouched; py/comfy_settings.py has the first-party sources) in the settings file the SERVER reads:
+# _base_user_dir, the same folder the workflow lands in, so wherever there is a workflow to open there is a seed beside it.
+_base_settings_seed(){
+  local f; f="$(_base_user_dir)/default/comfy.settings.json"
+  local py="${SYS_PY:-}"; [ -n "$py" ] && command -v "$py" >/dev/null 2>&1 || py="$(command -v python3 || true)"
+  if [ -z "$py" ]; then warn "comfy.settings.json: no python to seed the App Mode tour as seen ($f)"; return 0; fi
+  local out rc=0 dry=(); [ "$BASE_DRY" = "1" ] && dry=(--dry)
+  out="$("$py" "$BASE_DIR/py/comfy_settings.py" "$f" ${dry[@]+"${dry[@]}"} 2>&1)" || rc=$?
+  case "$rc:$out" in
+    0:seeded*)     BASE_CHANGED+=("comfy.settings.json: the App Mode tour marked seen"); ok "comfy.settings.json: the App Mode tour marked seen ($f)";;
+    0:already*)    ok "comfy.settings.json: the App Mode tour is marked seen";;
+    0:would*)      would "mark the App Mode tour seen in $f";;
+    *)             warn "comfy.settings.json: ${out:-exit $rc} (the App Mode tour may open over the form)";;
+  esac
+  return 0
+}
 _base_yaml_register(){ # <section> <key> <path> — register a folder in extra_model_paths.yaml once; a foreign entry is left alone
   local section="$1" key="$2" path="$3" y="${EXTRA_YAML:-$COMFY/extra_model_paths.yaml}"
   if [ -f "$y" ]; then
@@ -238,6 +256,7 @@ base_hygiene(){
     elif [ -f "$ARGS_FILE" ] && grep -q -- '--use-sage-attention' "$ARGS_FILE"; then ok "args: --use-sage-attention kept (sageattention imports in the venv)"; fi
   else _base_args_remove --use-sage-attention "sageattention is not importable in $VENV"; fi
   _base_manager_security
+  _base_settings_seed
   if declare -F pkg_hygiene >/dev/null; then pkg_hygiene; fi
   if [ "${#BASE_CHANGED[@]}" -gt "$before" ]; then echo "  changed:"; printf '    • %s\n' "${BASE_CHANGED[@]:$before}"; fi
   return 0

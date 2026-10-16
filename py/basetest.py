@@ -218,6 +218,17 @@ def type_index(node_src):
     return idx
 
 
+# ---------------------------------------------------------------- 3.17.1: verify.sh's VERIFY_SUITE=zip
+_SKIPPED_OUT = pytest.StashKey[str](); _ONLY_IDS = pytest.StashKey[str]()
+
+
+def pytest_configure(config):
+    """Read once and taken out of the environment, so a test that runs pytest or a suite of its own never inherits them
+    and overwrites this run's record."""
+    config.stash[_SKIPPED_OUT] = os.environ.pop("BASE_SKIPPED_OUT", "")
+    config.stash[_ONLY_IDS] = os.environ.pop("BASE_ONLY_IDS", "")
+
+
 # ---------------------------------------------------------------- tiers by name prefix
 def pytest_collection_modifyitems(config, items):
     """test_<tier>_<name> carries the <tier> marker when <tier> is one of the suite's ini markers, so a converted
@@ -227,6 +238,17 @@ def pytest_collection_modifyitems(config, items):
         m = re.match(r"test_([a-z0-9]+)_", item.name)
         if m and m.group(1) in tiers and not any(mk.name == m.group(1) for mk in item.iter_markers()):
             item.add_marker(getattr(pytest.mark, m.group(1)))
+    # 3.17.1: verify.sh's VERIFY_SUITE=zip. The zip run records what it skipped (BASE_SKIPPED_OUT, below); the repo run
+    # then keeps only those (BASE_ONLY_IDS). A whole module skipped at collection is recorded by its file, which keeps
+    # every test in it. Node ids are relative to the suite's rootdir, so the zip's and the repo's are the same.
+    only = config.stash.get(_ONLY_IDS, "")
+    if only:
+        want = {ln.strip() for ln in open(only, encoding="utf-8") if ln.strip()}
+        keep = [i for i in items if i.nodeid in want or i.nodeid.split("::")[0] in want]
+        dropped = [i for i in items if i not in keep]
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
+        items[:] = keep
 
 
 PID1_ENV = "PUBLIC_KEY=ssh-ed25519 AAAAC3fake mac@key\nHF_TOKEN=token_here\nSOME_IDS=replace_with_ids\nJUPYTER_PASSWORD=x\ndownload_example=true\nRUNPOD_POD_ID=fakepod\n"
@@ -442,6 +464,11 @@ def tree_hash(root, ignore=()):
 
 # ---------------------------------------------------------------- the per-tier table
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    out = config.stash.get(_SKIPPED_OUT, "")
+    if out:                                       # 3.17.1: what this run skipped, for verify.sh's repo pass (see above)
+        ids = sorted({r.nodeid for r in terminalreporter.stats.get("skipped", []) if getattr(r, "nodeid", "")})
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("".join(i + "\n" for i in ids))
     tiers = [ln.split(":")[0].strip() for ln in config.getini("markers")]
     counts = collections.defaultdict(collections.Counter)
     for outcome in ("passed", "failed", "skipped", "error"):

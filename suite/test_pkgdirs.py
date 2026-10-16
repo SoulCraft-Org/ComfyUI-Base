@@ -157,8 +157,8 @@ def test_unit_a_named_root_that_does_not_exist_is_an_error_not_an_empty_workspac
         pkgdirs.consumer_root(BASE, str(gone), {})
     r = subprocess.run([sys.executable, str(PKGDIRS), "--root"], capture_output=True, text=True, env=_env(BASE_WORKSPACE=str(gone)))
     assert r.returncode == 1 and "does not exist" in r.stderr, r.stdout + r.stderr
-    if not (BASE / "_build").exists():
-        return
+    if not (BASE / "_build").exists():   # a skip, never a return: VERIFY_SUITE=zip re-runs a skipped test from the repo (3.17.1)
+        pytest.skip("the walkers' half is repo tooling (_build/)")
     r = subprocess.run([sys.executable, str(BASE / "_build" / "package.py"), "--all", "--check"], capture_output=True, text=True, env=_env(BASE_WORKSPACE=str(gone)))
     assert r.returncode == 1 and "does not exist" in r.stderr, r.stdout + r.stderr
     r = subprocess.run(["bash", str(BASE / "_build" / "verify.sh")], capture_output=True, text=True, env=_env(BASE_WORKSPACE=str(gone)))
@@ -234,10 +234,12 @@ def _verify_beside(tmp_path, start="exit 0", owned='echo "127.0.0.1:$(cat "$TEST
     (b / "py" / "pkgdirs.py").write_text("print('')\n")
     (b / "_build" / "package.py").write_text("print('comfyui-base.zip current')\n")
     log = tmp_path / "calls.log"
-    base_sh = '#!/bin/bash\necho "suite $BASE_SERVER" >> "%s"; echo "1 passed"\n' % log
+    base_sh = ('#!/bin/bash\necho "suite $BASE_SERVER" >> "%s"\n'
+               '[ -n "${STUB_SKIP:-}" ] && [ -n "${BASE_SKIPPED_OUT:-}" ] && echo "suite/test_a.py::test_needs_build" > "$BASE_SKIPPED_OUT"\n'
+               '[ -n "${BASE_ONLY_IDS:-}" ] && echo "only $(cat "$BASE_ONLY_IDS")" >> "%s"\necho "1 passed"\n') % (log, log)
     (b / "base.sh").write_text(base_sh)
     with zipfile.ZipFile(b / "comfyui-base.zip", "w") as z:
-        z.writestr("comfyui-base/base.sh", base_sh)
+        z.writestr("comfyui-base/base.sh", base_sh.replace('"suite ', '"zip-suite '))
     (b / "testbed.sh").write_text('#!/bin/bash\necho "$1|${TESTBED_STATE:-}|${TESTBED_PORT:-}" >> "%s"\n'
                                   'case "$1" in\n  --start) echo "${TESTBED_PORT:-}" > "$TESTBED_STATE/p"; %s;;\n  --owned) %s;;\nesac\nexit 0\n'
                                   % (log, start, owned))
@@ -285,3 +287,51 @@ def test_unit_verify_talks_only_to_a_server_it_started_or_proved(tmp_path):
     run, calls, log = _verify_beside(tmp_path / "c")
     r = run(BASE_SERVER="127.0.0.1:9911")
     assert r.returncode == 0 and "set by the caller" in r.stdout and [x[0] for x in calls()] == ["suite 127.0.0.1:9911"] * 2, r.stdout + log.read_text()
+
+
+def test_unit_verify_suite_zip_runs_the_zip_then_only_what_it_skipped(tmp_path):
+    """3.17.1: VERIFY_SUITE=zip (CI's mode) runs the suite from the extracted zip first, which is what a pod runs, then from
+    the repo ONLY the tests that run skipped (those need the repo's own files), so every test runs once and none twice;
+    the zip check still runs first. With nothing skipped, the repo pass is not run at all. repo runs the tree's alone;
+    both (the default) runs the two; anything else is a red gate that says so before any work."""
+    _repo_only("_build/verify.sh")
+    run, calls, log = _verify_beside(tmp_path, start="exit 3")
+    suites = lambda: [x for x in log.read_text().splitlines() if "suite " in x or x.startswith("only ")]
+    r = run(VERIFY_SUITE="zip")
+    assert r.returncode == 0 and "comfyui-base.zip current" in r.stdout and "the zip run skipped no test" in r.stdout, r.stdout + r.stderr
+    assert suites() == ["zip-suite 127.0.0.1:0"], suites()
+    log.unlink()
+    r = run(VERIFY_SUITE="zip", STUB_SKIP="1")
+    assert r.returncode == 0 and "suite the 1 the zip skipped: 1 passed" in r.stdout, r.stdout + r.stderr
+    assert suites() == ["zip-suite 127.0.0.1:0", "suite 127.0.0.1:0", "only suite/test_a.py::test_needs_build"], suites()
+    log.unlink()
+    r = run(VERIFY_SUITE="repo")
+    assert r.returncode == 0 and suites() == ["suite 127.0.0.1:0"], r.stdout + log.read_text()
+    log.unlink()
+    r = run(STUB_SKIP="1")
+    assert r.returncode == 0 and suites() == ["suite 127.0.0.1:0", "zip-suite 127.0.0.1:0"], r.stdout     # both: no narrowing
+    log.unlink()
+    r = run(VERIFY_SUITE="fast")
+    assert r.returncode == 1 and "VERIFY_SUITE=fast" in r.stdout and "══" not in r.stdout and not log.exists(), r.stdout
+
+
+def test_unit_basetest_records_what_a_run_skipped_and_runs_only_that(tmp_path):
+    """The plugin half of VERIFY_SUITE=zip, through real pytest: BASE_SKIPPED_OUT gets the node id of every test the run
+    skipped (a module skipped whole is recorded by its file), and BASE_ONLY_IDS keeps exactly those, so the repo pass
+    runs what the zip pass could not and nothing else."""
+    s = tmp_path / "s"; s.mkdir()
+    (s / "pytest.ini").write_text("[pytest]\\nmarkers =\\n    unit: u\\n")
+    (s / "test_a.py").write_text("import pytest\\ndef test_unit_runs(): pass\\n"
+                                 "def test_unit_needs_build():\\n    pytest.skip('no _build')\\n")
+    (s / "test_b.py").write_text("import pytest\\npytest.skip('repo only', allow_module_level=True)\\ndef test_unit_x(): pass\\n")
+    out = tmp_path / "skipped"
+    env = {**{k: v for k, v in os.environ.items() if k not in ("BASE_SKIPPED_OUT", "BASE_ONLY_IDS")}, "PYTHONPATH": str(BASE / "py")}
+    py = lambda **kw: subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "basetest", "-c", str(s / "pytest.ini"), str(s)],
+                                     capture_output=True, text=True, cwd=s, env={**env, **kw}, timeout=120)
+    r = py(BASE_SKIPPED_OUT=str(out))
+    assert r.returncode == 0 and "1 passed, 2 skipped" in r.stdout, r.stdout + r.stderr
+    assert out.read_text().splitlines() == ["test_a.py::test_unit_needs_build", "test_b.py"], out.read_text()
+    (s / "test_b.py").write_text("def test_unit_x(): pass\\n")          # the repo has what the zip lacked
+    (s / "test_a.py").write_text("def test_unit_runs(): pass\\ndef test_unit_needs_build(): pass\\n")
+    r = py(BASE_ONLY_IDS=str(out))
+    assert r.returncode == 0 and "2 passed, 1 deselected" in r.stdout, r.stdout + r.stderr

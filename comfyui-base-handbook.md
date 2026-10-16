@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.17.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.17.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -681,6 +681,9 @@ from the disk and the file replaced whole, never written in place; ComfyUI's env
 `bash base.sh status` renders them and prints `state/host.env` when there is one; `bash base.sh latest` asks every
 pinned pack's remote what HEAD is now.
 
+ComfyUI's own user folder (`_base_user_dir`) gets one key from the base (3.17.1): `default/comfy.settings.json` holds
+`"Comfy.OnboardingCoachmarks.Seen"` with `"appMode"` in it, so the App Mode tour never opens over a package's form.
+
 ## 8. Tests
 
 Tiers: `unit` (source contracts on the library, podctl and the RunPod provider against a fake RunPod REST server,
@@ -696,6 +699,7 @@ over), `bare` (the shell sources without a machine).
 cd base/comfyui-base && bash base.sh test                                                        # every tier
 uv run --no-project --with pytest python base/comfyui-base/_build/rehearse.py <brand>/packages/<name> --layout official|community|bare|volume
 bash base/comfyui-base/_build/verify.sh [<brand>/packages/<name>...]                            # zip current, suite from the repo, suite from the zip
+VERIFY_SUITE=zip bash base/comfyui-base/_build/verify.sh                                       # every test once: the zip's run, then from the repo only what it skipped (3.17.1)
 VERIFY_SERVER=reuse bash base/comfyui-base/_build/verify.sh                                    # this checkout's testbed --server, proven by --owned (default: a server of the run's own)
 ```
 
@@ -716,7 +720,7 @@ against the real frontend and a real defect.
 |---|---|---|
 | graph helpers (`byid` through subgraphs, `links`, the frontend's bypass resolver `resolve_frontend`), geometry (`nbound`, rgthree's `membership`), the size floor, `structure_sha`, `note_height`, `Budgets`, `CanvasSpec` | `py/canvas.py` | `from canvas import ...` in suite.py |
 | 41 generic tests: the `uiux` budgets (collisions, spacing, grid, notes and labels fit, LOD cliff, fill, bloat, flow, palette, titles, reading order), the `snapshot` tier (the real frontend), the shape-only `config` guards (zip = shipped pair, versions agree, tier gates, handbook numbers, packs pinned) | `py/canvastest.py` | `CANVAS = CanvasSpec(...)` then `from canvastest import *`; markers `uiux`, `snapshot`, `config` in pytest.ini |
-| `snapshot.py` (photograph + `sizes.json`), `render.py` (offline review, `--review`), `page.py` (before/after), `panels.py` (every rgthree row clicked in the real frontend), `probe.py` (`graphToPrompt` per state), `canvaslayout.py` (the layout engine) | `_build/canvas/` (repo tooling, not in the zip) | every tool takes `--pkg <package dir>`; `<pkg>/_build/layout.py` = tables + `run(globals())` |
+| `snapshot.py` (photograph + `sizes.json`; its `route_settings` stub serves the base's seeded settings and `coach_tour(page)` dismisses and reports the frontend's onboarding tour, 3.17.1), `render.py` (offline review, `--review`), `page.py` (before/after), `panels.py` (every rgthree row clicked in the real frontend), `probe.py` (`graphToPrompt` per state), `canvaslayout.py` (the layout engine) | `_build/canvas/` (repo tooling, not in the zip) | every tool takes `--pkg <package dir>`; `<pkg>/_build/layout.py` = tables + `run(globals())` |
 
 Adopting a package: (1) put its constants in suite.py as literals and declare `CANVAS = CanvasSpec(user_facing=...,
 markers=..., cuda_only=..., start_card=..., display="1512x982@2", nest=..., partial=..., tier_gates=...)`, then
@@ -789,6 +793,35 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.17.1: the App Mode tour is marked seen, so the form opens clear (error log row 81); and `VERIFY_SUITE=zip` runs
+  every test once, the zip first (2026-10-16).
+  The tour: ComfyUI frontend 1.55.x opens a full-screen "Welcome to Apps" tour over the App Mode form on a first visit;
+  its scrim takes every click until dismissed, and every package opens in App Mode. Hygiene (`_base_settings_seed`, after
+  `_base_manager_security`, before `pkg_hygiene`) appends `"appMode"` to `"Comfy.OnboardingCoachmarks.Seen"` in
+  `$(_base_user_dir)/default/comfy.settings.json` through the new `py/comfy_settings.py`: the list kept in order, every
+  other key untouched, written atomically, a file that is not a JSON object left alone and named. First-party sources:
+  ComfyUI_frontend v1.55.17 `onboardingTours.ts` (`TOUR_SEEN_SETTING`, `ENTRY_PATHS`), `onboardingTourStore.ts`
+  (`startTour` returns when the list holds the path; `markTourSeen` appends), `useTourTriggers.ts` (only `appMode` opens
+  on its own); ComfyUI v0.41.2 `app/app_settings.py` (reads the file on every request, writes it whole on each save).
+  Boot needs nothing: the seed lands in the same user folder as the workflow in the same install (on a shared volume,
+  `BASE_LOCAL_STATE/user`, the server's `--user-directory`; under 3.15's local copy `user/` is a link to the volume's,
+  never copied from the twin). `testbed.sh` seeds its tree before it starts a server, and the canvas kit's settings stub
+  serves the seed. `coach_tour(page)` in `_build/canvas/snapshot.py` replaces the packages' own dismiss loops: None when
+  no tour shows, else it clicks the frontend's exact Skip (by its `coach-landing` / `coach-card` test ids) or presses
+  Escape and returns `{"shown", "dismissed"}`, a finding to report: on a machine the base installed, a tour means the seed
+  missed. Tests: hygiene on a fake pod (dry run writes nothing, the list merged, a second run byte-identical, a corrupt file
+  untouched, a shared volume's file), the merge itself, and the stub plus `coach_tour` on a fake page.
+  The gate: `_build/verify.sh` ran every suite twice, from the tree and from the extracted zip. `VERIFY_SUITE=zip` runs
+  the zip's first (what a pod runs), then from the repo ONLY what that run skipped: `py/basetest.py` records the skipped
+  node ids in `BASE_SKIPPED_OUT` and keeps only those under `BASE_ONLY_IDS` (both read once and taken out of the
+  environment, so a test that runs pytest itself cannot overwrite the record). Every test runs once and none twice, so it
+  is lossless for a suite whose repo-only checks SKIP. The base's suite is (audited: every `_build/`, testbed and
+  consumer-root check skips; the one that returned early now skips), so the base's CI uses it. The packages' suites are
+  not yet (13 tests in six packages branch on `_build/` or a sibling package instead of skipping, and would pass from
+  the zip without their repo half), so `package-ci.yml` keeps `both` until each package turns those into skips.
+  `repo` runs the tree's alone; `both` stays the default and the local gate; anything else is a red gate before any work.
+  Tests: the three modes against a stand-in base (zip, then only the skipped id from the repo), and the plugin's record
+  and filter through real pytest.
 - 3.17.0: testing that costs nothing, in three tiers (2026-10-16, when the private repositories' GitHub-hosted minutes ran
   out). **Tier 0**, `_build/quick.sh [<pkg>...]`, seconds on any CPU before every commit: `package.py --check`, the suite's
   pure tiers (`<name>-script.sh test quick`: every tier the suite declares except `BASE_HEAVY_TIERS`, those that need a
