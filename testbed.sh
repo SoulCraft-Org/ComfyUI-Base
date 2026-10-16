@@ -7,7 +7,7 @@
 #      bash testbed.sh --server   # also build a CPU venv and start ComfyUI
 #      COMFY_REF=master bash testbed.sh --server   # ComfyUI at a ref NEWER than the newest release (default: the newest release)
 #  3.0.0: always the newest. ComfyUI at its newest release, every pack at its remote's HEAD, the newest Python uv
-#  provides, torch upgraded, and every requirement installed from one pin-free set (py/reqlift.py), so ComfyUI's
+#  provides that torch ships for (3.7.1), torch upgraded, and every requirement installed from one pin-free set (py/reqlift.py), so ComfyUI's
 #  own == pins (its frontend packages) never hold anything below its newest. --latest is accepted and changes nothing.
 #      bash testbed.sh --packs    # the node packs alone, each to its tip (3.6.1); ComfyUI left as it is
 #      bash testbed.sh --stop     # stop the server
@@ -194,18 +194,53 @@ provision_source() {
   note "use it with:  BASE_NODE_SRC=\"$COMFY\"   (converted packages find it on their own)"
 }
 
+_venv_minor(){ "$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true; }   # empty: no venv, or one whose python cannot run
+
+# 3.7.1: the newest Python torch actually ships for. uv can list a CPython minor (3.15 on 2026-10-15) weeks before
+# torch publishes wheels for it, and the newest-listed pick then died in the torch install ("No solution found").
+# Newest first, each minor asked whether the torch family resolves on it (a cached resolve, no install), the first
+# yes wins: still "always the newest", only the newest that works. The pod does the same in lib/30-venv.sh
+# (_base_python_pick, against the whole derived set, since 3.6.1). Stable minors only: the pattern skips 3.16.0a1 and +freethreaded.
+_testbed_python_pick(){ # → x.y on stdout; why on stderr
+  local cands mm tmp="${TMPDIR:-/tmp}/testbed-pick.$$.txt" have
+  cands="$(uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV || true)"
+  [ -n "$cands" ] || { warn "uv lists no CPython: cannot pick a Python" >&2; return 1; }
+  for mm in $cands; do
+    if printf 'torch\ntorchvision\ntorchaudio\n' | uv pip compile --quiet --python-version "$mm" - -o "$tmp" >/dev/null 2>&1; then
+      rm -f "$tmp"; echo "$mm"; return 0
+    fi
+    note "Python $mm: torch has no build for it yet, trying the next" >&2
+  done
+  rm -f "$tmp"
+  # nothing resolves (offline, or the index is down): keep a venv that runs rather than tear it down for a guess
+  have="$(_venv_minor)"
+  local keep="trying the newest"; [ -z "$have" ] || keep="keeping the venv's Python $have"
+  warn "torch resolves on none of: $(echo $cands) (offline?): $keep" >&2
+  if [ -n "$have" ]; then echo "$have"; else printf '%s\n' $cands | head -1; fi
+}
+
+# A venv is reused only when its python runs and is the picked minor. Anything else at $VENV is removed first: an
+# older minor, and a half-made one (3.7.1) whose bin/python is gone or dangling (its interpreter was removed, or the
+# first build died), which `-x` could not see and `uv venv` then refused with "A virtual environment already exists".
+_testbed_venv(){ # <x.y>
+  local mm="$1" have; have="$(_venv_minor)"
+  if [ -e "$VENV" ] || [ -L "$VENV" ]; then
+    if [ -z "$have" ]; then note "the venv at $VENV has no working python (a half-made build): replacing it"; rm -rf "$VENV"
+    elif [ "$have" != "$mm" ]; then note "the venv is Python $have, the newest torch supports is $mm: rebuilding it"; rm -rf "$VENV"; fi
+  fi
+  if [ ! -e "$VENV" ]; then
+    note "creating a Python $mm venv …"
+    uv venv --python "$mm" "$VENV" >/dev/null || { rm -rf "$VENV"; warn "uv could not create a Python $mm venv"; return 1; }
+  fi
+}
+
 provision_server() {
   hdr "VENV + SERVER (CPU)"
   command -v uv >/dev/null || { warn "uv is not installed — needed to build the venv"; return 1; }
-  local mm have
-  mm="$(uv python list 2>/dev/null | grep -oE '^cpython-3\.[0-9]+\.[0-9]+-' | sed -E 's/^cpython-(3\.[0-9]+)\..*/\1/' | sort -u -rV | head -1)"
-  have="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
-  if [ -x "$VENV/bin/python" ] && [ -n "$mm" ] && [ "$have" != "$mm" ]; then note "the venv is Python $have, the newest is $mm: rebuilding it"; rm -rf "$VENV"; fi
-  if [ ! -x "$VENV/bin/python" ]; then
-    note "creating a Python ${mm:-3} venv …"
-    uv venv --python "${mm:-3}" "$VENV" >/dev/null
-  fi
-  uv python upgrade "${mm:-}" >/dev/null 2>&1 || true
+  local mm
+  mm="$(_testbed_python_pick)" || return 1
+  _testbed_venv "$mm" || return 1
+  uv python upgrade "$mm" >/dev/null 2>&1 || true
   note "installing torch (CPU) + every requirement at its newest: this is the slow part …"
   uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
   # one pin-free set: ComfyUI's own == pins (its frontend packages) and every pack's are lifted by the base's reqlift
@@ -284,6 +319,9 @@ status() {
   note "packs: ${#PACKS[@]} derived${REPO_ROOT:+ · packages under $REPO_ROOT (${#PKGS[@]})}${REPO_ROOT:+ · ${#VENDORED[@]} vendored}"
   echo; note "BASE_NODE_SRC=\"$COMFY\"   BASE_SERVER=127.0.0.1:$PORT"
 }
+
+# sourced (the suite does, to test the picks above): define, never run
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
 case "${1:-}" in
   "")        provision_source; status;;

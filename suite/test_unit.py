@@ -1083,6 +1083,109 @@ def test_unit_the_testbed_finds_packages_without_naming_one():
     assert not bad, "a packages/ glob anchored on a literal directory, not a variable: %r" % (bad,)
 
 
+
+# ---------------------------------------------------------------- 3.7.1: the testbed's Python is the newest torch ships for
+
+_FAKE_UV = r"""#!/bin/bash
+# a uv stand-in: `python list` prints a canned listing, `pip compile` resolves only on $TORCH_OK's minors,
+# `venv` behaves like uv 0.13 (refuses an existing directory) and makes a python that reports the minor it was given
+echo "$*" >> "$UV_LOG"
+case "$1 $2" in
+  "python list") cat <<'EOF'
+cpython-3.16.0a1-macos-aarch64-none                 <download available>
+cpython-3.16.0a1+freethreaded-macos-aarch64-none    <download available>
+cpython-3.15.0-macos-aarch64-none                   /x/cpython-3.15/bin/python3.15
+cpython-3.15.0+freethreaded-macos-aarch64-none      <download available>
+cpython-3.14.8-macos-aarch64-none                   /x/cpython-3.14/bin/python3.14
+cpython-3.13.15-macos-aarch64-none                  <download available>
+pypy-3.12.14-macos-aarch64-none                     <download available>
+EOF
+    exit 0;;
+  "pip compile") cat >/dev/null; v=""; prev=""
+    for a in "$@"; do [ "$prev" = "--python-version" ] && v="$a"; prev="$a"; done
+    for ok in $TORCH_OK; do [ "$ok" = "$v" ] && exit 0; done
+    echo "No solution found when resolving dependencies: torch" >&2; exit 1;;
+  "venv --python") d="$4"
+    [ -e "$d" ] && { echo "error: A virtual environment already exists at $d" >&2; exit 2; }
+    mkdir -p "$d/bin"; printf '#!/bin/bash\necho %s\n' "$3" > "$d/bin/python"; chmod +x "$d/bin/python"; exit 0;;
+esac
+exit 0
+"""
+
+
+def _testbed_sandbox(tmp_path, torch_ok):
+    """testbed.sh copied into an empty folder (no base beside it, so no packs and no pkgdirs), and a fake uv first on PATH."""
+    _repo_only("the repo's testbed.sh")
+    tb = tmp_path / "tb"; tb.mkdir(parents=True); (tb / "testbed.sh").write_text((BASE / "testbed.sh").read_text())
+    bindir = tmp_path / "bin"; bindir.mkdir(); uv = bindir / "uv"; uv.write_text(_FAKE_UV); uv.chmod(0o755)
+    log = tmp_path / "uv.log"
+    env = dict(os.environ, PATH="%s:%s" % (bindir, os.environ.get("PATH", "")), UV_LOG=str(log), TORCH_OK=torch_ok, TMPDIR=str(tmp_path))
+    def run(snippet):
+        return subprocess.run(["bash", "-c", 'source "%s/testbed.sh"; %s' % (tb, snippet)], capture_output=True, text=True, env=env)
+    return tb, log, run
+
+
+def test_unit_testbed_picks_the_newest_python_torch_ships_for(tmp_path):
+    """uv listed 3.15 on 2026-10-15 before torch had a cp315 wheel, and `testbed.sh --server` died in the torch install.
+    The pick goes newest first and takes the first minor the torch family resolves on; pre-releases and free-threaded
+    builds are never candidates."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "3.14 3.13")
+    r = run("_testbed_python_pick")
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.14", r.stdout + r.stderr
+    assert "3.15: torch has no build for it yet" in r.stderr, r.stderr
+    tried = [ln.split("--python-version ")[1].split()[0] for ln in log.read_text().splitlines() if ln.startswith("pip compile")]
+    assert tried == ["3.15", "3.14"], tried                                   # newest first, stops at the first yes, no 3.16a1
+    # the day torch ships for 3.15, the same run takes it: still always the newest
+    tb, log, run = _testbed_sandbox(tmp_path / "later", "3.15 3.14")
+    r = run("_testbed_python_pick")
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.15", r.stdout + r.stderr
+
+
+def test_unit_testbed_pick_keeps_a_working_venv_when_nothing_resolves(tmp_path):
+    """Offline, no minor resolves: the pick keeps the venv's own Python instead of tearing a working venv down, and with
+    no venv names the newest, with a warning either way."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "")
+    r = run("_testbed_python_pick")
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.15" and "torch resolves on none of" in r.stderr, r.stdout + r.stderr
+    v = tb / "testbed" / ".venv-testbed" / "bin"; v.mkdir(parents=True)
+    (v / "python").write_text("#!/bin/bash\necho 3.13\n"); (v / "python").chmod(0o755)
+    r = run("_testbed_python_pick")
+    assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "3.13" and "keeping the venv's Python 3.13" in r.stderr, r.stdout + r.stderr
+
+
+def test_unit_testbed_replaces_a_half_made_venv(tmp_path):
+    """A first build that died (or whose interpreter uv later removed) left $VENV with a dangling bin/python. `-x` could not
+    see it, the rebuild was skipped, and `uv venv` refused with "A virtual environment already exists". Anything at $VENV
+    whose python does not run, or runs the wrong minor, is removed first; a venv already on the picked minor is reused."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "3.14")
+    venv = tb / "testbed" / ".venv-testbed"
+    (venv / "bin").mkdir(parents=True); (venv / "bin" / "python").symlink_to(tmp_path / "gone" / "python3.15")
+    (venv / "lib").mkdir(); (venv / "lib" / "half-installed").write_text("")
+    r = run("_testbed_venv 3.14 && _venv_minor")
+    assert r.returncode == 0 and r.stdout.strip().endswith("3.14"), r.stdout + r.stderr
+    assert "half-made build" in r.stdout and not (venv / "lib").exists(), r.stdout + r.stderr
+    # reused when it already is the picked minor: no `uv venv` call
+    n = sum(1 for ln in log.read_text().splitlines() if ln.startswith("venv "))
+    r = run("_testbed_venv 3.14")
+    assert r.returncode == 0 and sum(1 for ln in log.read_text().splitlines() if ln.startswith("venv ")) == n, r.stdout + r.stderr
+    # an older minor is rebuilt onto the picked one
+    r = run("_testbed_venv 3.15 && _venv_minor")
+    assert r.returncode == 0 and "rebuilding it" in r.stdout and r.stdout.strip().endswith("3.15"), r.stdout + r.stderr
+
+
+def test_unit_testbed_sourced_runs_nothing(tmp_path):
+    """The suite sources testbed.sh for its functions: sourcing defines and returns, it never provisions or prints usage."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "3.14")
+    r = run("type provision_server >/dev/null && echo defined")
+    assert r.returncode == 0 and r.stdout.strip().endswith("defined") and "usage:" not in r.stdout and "SOURCE" not in r.stdout, r.stdout + r.stderr
+    assert not (tb / "testbed").exists() and not log.exists()
+
+
+
 # ---------------------------------------------------------------- plan 2 / T1: tier markers by prefix; converted packages agree
 
 def test_unit_prefix_markers_apply_to_converted_suites(tmp_path):

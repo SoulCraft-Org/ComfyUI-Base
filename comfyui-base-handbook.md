@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.7.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.7.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -390,7 +390,10 @@ is taken whole — the port file is read from the same root that supplied the tr
 by name forever, which is a poor thing to hand someone who forked the repository to work on it. `bash testbed.sh
 --server` provisions an upstream ComfyUI at its newest release tag (or `COMFY_REF`) plus the base's own packs at their
 HEAD (derived from `list-packs`, never hand-listed), every requirement at its newest through `py/reqlift.py`, on the
-newest Python, and starts it on CPU. It is several GB and gitignored.
+newest Python torch ships for, and starts it on CPU. It is several GB and gitignored. 3.7.1: uv lists a CPython minor
+before torch has wheels for it (3.15, October 2026), so the minors are tried newest first and the first one the torch
+family resolves on wins, the pod's rule (`_base_python_pick`) on a smaller set; a venv whose python does not run (a
+build that died, an interpreter uv removed) is replaced instead of blocking the next run.
 
 ## 5. Pipeline (install)
 
@@ -584,6 +587,14 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.7.1: the testbed's Python is the newest torch ships for. uv listed CPython 3.15 on 2026-10-15 before torch had a
+  cp315 wheel, and `testbed.sh --server` took the newest listed minor and died in the torch install ("No solution
+  found"). The minors are now tried newest first and the first one the torch family resolves on wins (a cached
+  `uv pip compile`, no install); offline, the venv's own Python is kept. A venv whose python does not run (a build
+  that died, an interpreter uv removed, a dangling `bin/python` that `-x` could not see) is removed before the
+  rebuild instead of making `uv venv` refuse with "A virtual environment already exists". The pod side already had
+  this rule since 3.6.1 (`_base_python_pick`). Exercised on this Mac against the real uv (3.15 rejected, 3.14 picked)
+  and on temp trees with a uv stand-in; not on a pod (the pod path is unchanged).
 - 3.7.0: `podctl` reads the workspace shape too. 3.6.0 taught every package walker the workspace and left two readers
   on the submodule shape, as its record said: `podctl install --pkg <name>` from a workspace stopped with "not inside a
   brand repository", and the default provider ignored the workspace's `brand.toml` and fell back to runpod. Both now ask
