@@ -72,8 +72,9 @@ mechanism; `BASE_HOST` is detected on the pod itself from PID 1's `RUNPOD_POD_ID
 ## The commands
 
     uv run "_build/pod/podctl.py" pods                          # every pod: id, name, image, status, public ip, port 22
-    uv run "_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location <dc> | --volume <id>]
-                                                                # stock check (B200, then B300 unless --gpu; names the data centres with it free now), network volume, Secure Cloud pod
+    uv run "_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location <dc>] [--public [--volume <id>]]
+                                                                # stock check (B200, then B300 unless --gpu); a PRIVATE Secure Cloud pod (encrypted pod volume,
+                                                                # ssh only, ComfyUI through podctl tunnel) unless --public (network volume, proxy URLs)
     uv run "_build/pod/podctl.py" status <pod>                  # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
     uv run "_build/pod/podctl.py" ensure <pod>                  # 22/tcp, PUBLIC_KEY, the boot guard, Host runpod
     uv run "_build/pod/podctl.py" install <pod> --base --pkg <dir>...   # upload, extract, --check, run (everything newest), poll, logs, pack records
@@ -99,7 +100,8 @@ check asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, and the first with sto
 installs the boot guard as for every pod. A refused pod (sold out between the check and the create) deletes the volume
 the same call made, so nothing is left billing. `create` is a billable verb: a consumer's guard hook prompts for it.
 
-`create --private` (3.7.4) is the shape for work that must not be reachable from a URL. RunPod's storage docs: "Encryption
+`create --private` (3.7.4) is the shape for work that must not be reachable from a URL, and since 3.8.1 the default:
+`--public` asks for the network-volume pod with proxy URLs instead, and `--volume` needs it. RunPod's storage docs: "Encryption
 applies only to volume disk. Container disk and network volumes cannot be encrypted." So it makes an encrypted POD volume
 (`volumeInGb` = `--data-gb`, `volumeEncrypted: true`) instead of a network volume and refuses `--volume`; exposes `22/tcp`
 only; sets `BASE_LISTEN=127.0.0.1` in the pod's env (boot reads it; `install` passes it to its runs) so ComfyUI listens on

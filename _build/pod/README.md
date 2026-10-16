@@ -1,7 +1,7 @@
 # podctl — the Claude-driven pod path (Mac side)
 
     uv run "base/comfyui-base/_build/pod/podctl.py" pods
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location EU-RO-1 | --volume <id>]   # RunPod default: B200, then B300
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--gpu <type>] [--location EU-RO-1] [--public [--volume <id>]]   # RunPod: private, B200 then B300
     uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>        # facts; env NAMES and placeholder verdicts, never values
     uv run "base/comfyui-base/_build/pod/podctl.py" image <pod>         # the image's entrypoint/cmd and how ensure wraps them
     uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>        # TCP 22 · PUBLIC_KEY · the base's boot as start command · Host runpod
@@ -40,8 +40,9 @@ are printed, the values never.
 
 ## create — a pod from nothing (3.7.3, RunPod; Verda since 3.1.0)
 
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--location EU-RO-1]
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --volume <network volume id>
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 [--location EU-RO-1]          # private (the default)
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 --public                       # a network volume and proxy URLs
+    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --public --volume <network volume id>
     uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA H200" --image <img> --data-gb 500   # one named type instead
 
 Without `--gpu` (3.8.0) RunPod asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, the order the video packages'
@@ -57,7 +58,11 @@ ones that have it, before anything is created. Then a network volume of `--data-
 `--wait` is the default (until sshd answers, then `Host runpod` → the new pod); then `podctl ensure <pod>`. `create` bills:
 a consumer's guard hook prompts for it like `deploy`.
 
-    uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --gpu "NVIDIA B200" --image <img> --data-gb 500 --private
+**Private is the default (3.8.1)**, on RunPod: Paul's order for everything a person touches is as simple, then as secure,
+then as private as possible, so a plain `create` makes the pod below, and `--public` is the one way to the network-volume
+pod above (`--volume` names a network volume, which cannot be encrypted, so it needs `--public` and is refused without it,
+naming both ways out). `--private` is still accepted and means the default. A host whose create has no private mode
+(Verda) is unchanged; asking it for `--private` is refused by name.
 
 `--private` (3.7.4): an **encrypted pod volume** of `--data-gb` at `/workspace` (`volumeInGb` + `volumeEncrypted`; RunPod
 cannot encrypt a network volume or a container disk, so `--volume` is refused), `22/tcp` the only port (no proxy URL, no

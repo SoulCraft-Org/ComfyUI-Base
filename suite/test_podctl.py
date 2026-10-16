@@ -1674,8 +1674,10 @@ B200_STOCK = {"dataCenters": [
 
 def _create(podctl, srv, pub, *argv):
     prov = podctl.RunPodProvider(api=podctl.Api("rp_key_create", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    # 3.8.1: a pod is private unless --public; these helpers test the network-volume path, so they say --public
+    pub_flag = [] if "--private" in argv else ["--public"]
     args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "b2", "--gpu", "NVIDIA B200",
-                                             "--image", "runpod/comfyui:1.4.7-cuda13.0", "--no-wait", *argv])
+                                             "--image", "runpod/comfyui:1.4.7-cuda13.0", "--no-wait", *pub_flag, *argv])
     return podctl.cmd_create(prov, args)
 
 
@@ -1785,7 +1787,7 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
     srv = FakeRunPod(_pod(), volumes={"isvol": {"id": "isvol", "size": 500, "dataCenterId": "EUR-IS-1"}}, gql=stock)
     def create(*argv, image="someone/comfy:cu128"):
         prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
-        args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "bw", "--image", image, "--no-wait", *argv])
+        args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "bw", "--image", image, "--no-wait", "--public", *argv])
         return podctl.cmd_create(prov, args)
     try:
         assert create("--data-gb", "500") in (None, 0)
@@ -1902,6 +1904,49 @@ def test_unit_runpod_create_private_is_an_encrypted_pod_volume_behind_ssh_only(t
         assert "does not say" in str(e.value) and srv.deletes == []
     finally:
         srv.close()
+
+
+def test_unit_runpod_create_is_private_unless_public(tmp_path, capsys):
+    """3.8.1, Paul's order (as simple, then as secure, then as private as possible): `podctl create` with no flag makes the
+    private pod (an encrypted pod volume, 22/tcp only, ComfyUI on loopback) on Secure Cloud, B200 first. --public is the
+    one way to a network volume and proxy URLs; --volume without it is refused with both ways out, never silently public.
+    A host whose create has no private mode (Verda) keeps working without a flag; asking it for --private is refused."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    def create(*argv):
+        prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+        args = podctl.build_parser().parse_args(["--pubkey", str(pub), "create", "--name", "p", "--image", "x/comfy:cu130", "--no-wait", *argv])
+        return podctl.cmd_create(prov, args)
+    try:
+        assert create("--data-gb", "300") in (None, 0)
+        body = srv.bodies[-1][1]
+        assert srv.posts == ["/graphql", "/pods"] and body["volumeEncrypted"] is True and body["ports"] == ["22/tcp"], (srv.posts, body)
+        assert body["cloudType"] == "SECURE" and body["gpuTypeIds"] == ["NVIDIA B200"] and body["env"]["BASE_LISTEN"] == "127.0.0.1"
+        assert "podctl tunnel" in capsys.readouterr().out
+        with pytest.raises(podctl.PodctlError) as e:
+            create("--volume", "oldvol")
+        assert "cannot encrypt a network volume" in str(e.value) and "--public" in str(e.value) and "--data-gb" in str(e.value)
+        with pytest.raises(podctl.PodctlError) as e:
+            create("--data-gb", "300", "--public", "--private")
+        assert "contradict" in str(e.value)
+        srv.posts.clear()
+        assert create("--data-gb", "300", "--public") in (None, 0)
+        assert srv.posts == ["/graphql", "/networkvolumes", "/pods"] and "8188/http" in srv.bodies[-1][1]["ports"]
+    finally:
+        srv.close()
+
+    class Verda:
+        name = "verda"; made = []
+        def availability(self, gpu, spot=False): return ["FIN-01"]
+        def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True, ssh_config=None, say=print):
+            self.made.append(name); return "i-1"
+    v = Verda()
+    podctl.cmd_create(v, podctl.build_parser().parse_args(["create", "--name", "n", "--gpu", "1B200.30V", "--data-gb", "100"]))
+    assert v.made == ["n"], "a host without a private mode is not refused for the default"
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.cmd_create(v, podctl.build_parser().parse_args(["create", "--name", "n2", "--gpu", "1B200.30V", "--data-gb", "100", "--private"]))
+    assert "--private: not offered by host verda" in str(e.value)
 
 
 def test_unit_install_keeps_a_private_pods_loopback_listen():

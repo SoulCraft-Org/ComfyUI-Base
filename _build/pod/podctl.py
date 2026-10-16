@@ -1613,9 +1613,19 @@ def cmd_create(prov, args):
     the user named (or the existing volume's) that has none stops here, before anything is created or billed."""
     _offered(prov, "create_machine", "availability")
     loc, volume, spot = args.location, getattr(args, "volume", None), " (spot)" if args.spot else ""
-    private = bool(getattr(args, "private", False))
+    # 3.8.1 (Paul, 2026-10-16: as simple, then as secure, then as private as possible): a new pod is PRIVATE unless --public
+    # says otherwise, on every host whose create offers it (RunPod); a host without a private mode keeps its own create, and
+    # only an explicit --private there is refused. --private is still accepted, and means what it always meant.
+    import inspect
+    offers_private = "private" in inspect.signature(prov.create_machine).parameters
+    public = bool(getattr(args, "public", False))
+    if public and getattr(args, "private", False):
+        raise PodctlError("--public and --private contradict each other: a pod is private unless --public")
+    private = not public and (offers_private or bool(getattr(args, "private", False)))
     if private and volume:
-        raise PodctlError("--private cannot use --volume: RunPod cannot encrypt a network volume; --private makes an encrypted pod volume of --data-gb")
+        raise PodctlError("--volume is a network volume and RunPod cannot encrypt a network volume, so a pod on it cannot be "
+                          "private (the default since base 3.8.1): drop --volume for an encrypted pod volume of --data-gb, or pass "
+                          "--public to put this pod on the network volume with proxy URLs")
     if volume:
         _offered(prov, "volume_location")                # 3.7.3: reuse an existing volume (RunPod); its data centre is fixed
         vloc = prov.volume_location(volume)
@@ -1649,7 +1659,6 @@ def cmd_create(prov, args):
         print("gpu     %s, in %s (no --gpu: the host's order is %s)" % (args.gpu, loc, ", ".join(gpus)))
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
     extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private)) if v}
-    import inspect
     takes = inspect.signature(prov.create_machine).parameters
     for k in extra:
         if k not in takes:
@@ -1771,8 +1780,11 @@ def build_parser():
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
-    p.add_argument("--private", action="store_true", help="RunPod: an ENCRYPTED pod volume of --data-gb (network volumes cannot be "
-                   "encrypted), ports 22/tcp only (no proxy URL, no JupyterLab), ComfyUI on loopback: reach it with podctl tunnel")
+    p.add_argument("--private", action="store_true", help="the default since 3.8.1 (RunPod): an ENCRYPTED pod volume of --data-gb "
+                   "(network volumes cannot be encrypted), ports 22/tcp only (no proxy URL, no JupyterLab), ComfyUI on loopback: "
+                   "reach it with podctl tunnel")
+    p.add_argument("--public", action="store_true", help="RunPod: NOT private: a network volume (new, or --volume), ComfyUI and "
+                   "JupyterLab on RunPod's proxy URLs, ComfyUI on 0.0.0.0")
     p.add_argument("--spot", action="store_true"); p.add_argument("--no-wait", dest="no_wait", action="store_true")
     p = sub.add_parser("pause", help="delete the instance and keep its disks (the same as stop --wait): only storage bills"); p.add_argument("pod")
     p = sub.add_parser("put-away", help="copy output/ and input/ to this Mac; with --yes, then delete the machine and its disks (to the trash)")

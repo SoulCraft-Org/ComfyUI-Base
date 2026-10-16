@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.8.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.8.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -200,8 +200,8 @@ it rides a bearer header and is never printed.
 ```bash
 uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>     # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
 uv run "base/comfyui-base/_build/pod/podctl.py" deploy --like <pod> --wait   # a NEW pod cloned onto the same volume (rule 11's redeploy rung)
-uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500   # a first pod: stock check (B200, then B300), network volume, Secure Cloud pod
-uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 --private   # encrypted pod volume, 22/tcp only, ComfyUI via podctl tunnel
+uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500   # a first pod: stock check (B200, then B300), PRIVATE: encrypted pod volume, 22/tcp only, ComfyUI via podctl tunnel
+uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 --public   # not private: a network volume, ComfyUI and JupyterLab on proxy URLs
 uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg <dir> --no-suite --env KEY=VALUE   # BASE_NO_SUITE=1 and KEY on every run on the machine
 uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>     # 22/tcp · PUBLIC_KEY = the Mac key · the start command · Host runpod · state/host.env
 uv run "base/comfyui-base/_build/pod/podctl.py" upload <zip>...  # to /workspace/packages, size + sha256 checked both sides
@@ -625,6 +625,14 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.8.1: a new pod is PRIVATE unless `--public` (Paul, 2026-10-16: everything a person touches is as simple, then as
+  secure, then as private as possible). `podctl create` on RunPod with no flag makes 3.7.4's private pod (an encrypted pod
+  volume, `22/tcp` only, ComfyUI on loopback through `podctl tunnel`) on Secure Cloud, B200 first; `--public` is the one way
+  to a network volume and proxy URLs, and `--volume` (a network volume, which RunPod cannot encrypt) is refused without it,
+  naming both ways out, never silently made public. `--private` is still accepted and means the default; `--public
+  --private` is refused. A host whose create has no private mode (Verda) is unchanged, and an explicit `--private` there is
+  refused by name. The GPU settings need no flag either: B200/B300 by default, `GPU_PREFER` per package, the Sage mode per
+  GPU (3.7.5). Exercised on this Mac against the suite's fake RunPod; not against the live API.
 - 3.8.0: B200 and B300 are the defaults (Paul's decision of 2026-10-16: the video packages run on NVIDIA's datacenter
   Blackwell, optimised for it). `py/gpu_fit.py` is the one table (B200: compute capability 10.0, 180 GB; B300: 10.3,
   288 GB) and the one rule: a package declares `GPU_PREFER="B200 B300"` (§4; an unknown class is an invalid
