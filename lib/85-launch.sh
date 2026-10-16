@@ -17,12 +17,17 @@ _base_pids_from_table(){ # stdin: pid|ppid|cwd|argv → the pids of ComfyUI serv
     case "$1" in *python*) ;; *) continue;; esac
     script="$2"; dir=""
     case "$script" in main.py) ;; */main.py) dir="${script%/main.py}";; *) continue;; esac
-    if [ "$cwd" = "$COMFY" ] || { [ -n "$dir" ] && { [ "$dir" = "$COMFY" ] || [ "$(basename "$dir")" = "ComfyUI" ]; }; }; then
+    if [ "$cwd" = "$COMFY" ] || _base_run_cwd "$cwd" || { [ -n "$dir" ] && { [ "$dir" = "$COMFY" ] || [ "$(basename "$dir")" = "ComfyUI" ]; }; }; then
       if [ "$pid" = "1" ]; then echo "  ! PID 1 is ComfyUI itself ($argv) — never killed: stopping it would stop the pod" >&2; continue; fi
       echo "$pid"
     fi
   done
   return 0
+}
+_base_run_cwd(){ # <cwd> → 0 when it is this tree's copy on the machine's disk (3.15.0, lib/84-run-local.sh): <run root>/g…$COMFY
+  [ -n "${COMFY:-}" ] || return 1
+  case "$1" in "${BASE_RUN_ROOT:-/opt/comfy-run}"/g*"$COMFY") return 0 ;; esac
+  return 1
 }
 _base_comfy_pids(){ # pids of ComfyUI servers on this pod: /proc → the one matcher above
   local pid
@@ -231,14 +236,16 @@ _base_start_comfy(){
   # 3.10.0: computed once, here, so what it dropped is said once; exported in the subshell only, so this shell (and
   # through it a JupyterLab terminal's next install) never mistakes the base's own value for the machine's
   local le kv; le="$(_base_launch_env || true)"; [ -n "$le" ] && echo "  launch env: $(echo $le)" || true
-  (cd "$COMFY" && { if [ -n "$hf" ]; then export HF_HOME="$hf"; fi
+  # 3.15.0: from the copy on the machine's own disk when there is a good one (lib/84-run-local.sh), else from the volume
+  RUN_HERE_DIR="$COMFY"; RUN_HERE_PY="$PY"; if declare -F _base_run_here >/dev/null; then _base_run_here; fi
+  (cd "$RUN_HERE_DIR" && { if [ -n "$hf" ]; then export HF_HOME="$hf"; fi
      if [ -n "$ff" ]; then export VHS_FORCE_FFMPEG_PATH="$ff"; fi
      while IFS= read -r kv; do if [ -n "$kv" ]; then export "$kv"; fi; done <<< "$le"
      # 3.1.0: where the base keeps its state, so a package's own route reads state/progress.json without guessing
      # (boot.sh knows BASE_HOME from boot.env; an install knows BASE_STATE)
      _cbs="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; if [ -n "$_cbs" ]; then export COMFY_BASE_STATE="$_cbs"; fi
      unset BASE_LINK_TOKEN                        # 3.14.0: the key is the forwarder's alone; no pack in ComfyUI reads it
-     nohup "$PY" main.py --listen "$(_base_comfy_listen)" --port "$PORT" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} >> "$COMFY_LOG" 2>&1 & })
+     nohup "$RUN_HERE_PY" main.py --listen "$(_base_comfy_listen)" --port "$PORT" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} >> "$COMFY_LOG" 2>&1 & })
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
   # (ComfyUI-SeedVR2_VideoUpscaler 67 s, and thirty more packs behind it), so a flat 180 s window
   # declared `restart FAILED`, skipped smoke and combos, and failed the whole install — while the

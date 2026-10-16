@@ -43,7 +43,10 @@ boot_tcmalloc(){ # the allocator the images preload; harmless when absent
 boot_launch_lib(){ # 85-launch.sh: on the pod beside boot.sh's lib/, in the suite beside boot.sh itself
   local d here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   for d in "$BOOT_HOME/lib" "$here" "$here/lib"; do
-    if [ -f "$d/85-launch.sh" ]; then . "$d/85-launch.sh"; return 0; fi
+    if [ -f "$d/85-launch.sh" ]; then
+      if [ -f "$d/84-run-local.sh" ]; then . "$d/84-run-local.sh"; fi     # 3.15.0: the copy on the machine's own disk
+      . "$d/85-launch.sh"; return 0
+    fi
   done
   echo "boot: 85-launch.sh not found (looked in $BOOT_HOME/lib and beside boot.sh) — not starting ComfyUI"; return 1
 }
@@ -155,6 +158,16 @@ boot_tokens(){ # 2.1.0: the tokens an earlier install saved (state/tokens.env, 0
   echo "boot: tokens — $n loaded from state/tokens.env; exported for the download buttons: ${names:-(none)}"
   return 0
 }
+boot_prewarm(){ # 3.15.0: the copy of ComfyUI's code to this machine's disk starts NOW, in the background, beside sshd,
+  # JupyterLab and the extensions; boot_comfy then waits for it on its lock and finds it current. In a subshell: boot.env's
+  # names are boot_comfy's to set. No boot.env yet (a fresh volume): nothing to copy.
+  local f="$BOOT_HOME/state/boot.env"
+  [ -f "$f" ] || return 0
+  ( . "$f"; PY="$VENV/bin/python"
+    boot_launch_lib >/dev/null || exit 0
+    if declare -F _base_run_prewarm >/dev/null; then _base_run_prewarm | sed 's/^ */boot: /'; fi )
+  return 0
+}
 boot_comfy(){ # ComfyUI from the base's venv with the base's launch line, only when that venv can boot
   local f="$BOOT_HOME/state/boot.env"
   if [ ! -f "$f" ]; then echo "boot: no $f — the base has not installed ComfyUI on this volume yet; nothing to start"; return 0; fi
@@ -162,8 +175,11 @@ boot_comfy(){ # ComfyUI from the base's venv with the base's launch line, only w
   PY="$VENV/bin/python"; HOSTPORT="127.0.0.1:$PORT"; COMFY_LOG="$BOOT_HOME/state/logs/comfyui.log"
   BASE_PERSIST_ROOT="${PERSIST:-}"; BASE_PREVIEW_SIZE="${PREVIEW_SIZE:-1024}"; ARGS_IMPORT=""
   if [ ! -x "$PY" ]; then echo "boot: $PY is missing — not starting ComfyUI. Fix: bash '<package>-script.sh' rescue"; return 0; fi
-  if ! "$PY" -c 'import torch' >/dev/null 2>&1; then echo "boot: $VENV cannot import torch — not starting ComfyUI. Fix: bash '<package>-script.sh' rescue, or re-run a package script"; return 0; fi
   boot_launch_lib || return 0
+  # 3.15.0: the copy on this machine's disk first. Its python has just imported torch (run_local.py checks it before the
+  # copy is used), so the volume's own torch import, a minute or more over a network volume, is asked only without one.
+  RUN_HERE_PY="$PY"; if declare -F _base_run_here >/dev/null; then echo "boot: ComfyUI's code to this machine's disk"; _base_run_here; fi
+  if [ "$RUN_HERE_PY" = "$PY" ] && ! "$PY" -c 'import torch' >/dev/null 2>&1; then echo "boot: $VENV cannot import torch — not starting ComfyUI. Fix: bash '<package>-script.sh' rescue, or re-run a package script"; return 0; fi
   if command -v nvidia-smi >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && [ -f "$BOOT_HOME/py/gpu_facts.py" ]; then
     echo "boot: gpu $(python3 "$BOOT_HOME/py/gpu_facts.py" 2>/dev/null || echo 'unreadable')"     # NOT-OURS here = memory held outside this container: stop/start or redeploy (2.0.26)
   fi
@@ -288,6 +304,7 @@ boot_main(){
   echo "== comfy-base boot $(date -u +%Y-%m-%dT%H:%M:%SZ) · $(hostname 2>/dev/null || echo ?) =="
   boot_tcmalloc
   boot_host
+  boot_prewarm
   boot_sshd
   boot_jupyter
   boot_tokens

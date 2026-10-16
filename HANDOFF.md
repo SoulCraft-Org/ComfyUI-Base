@@ -69,6 +69,31 @@ parallel downloads (3.12.0) once both are in.
   apt could overlap the downloads if the downloader did not need uv's bootstrap (python3-venv comes from apt); the
   model index walk runs twice (early pass, model stage).
 
+## 3. ComfyUI runs from a copy on the machine's own disk; a first install starts it once (3.15.0)   (2026-10-16, no pod used)
+
+**Proven.** On this Mac and in the PR's CI, against fakes and real local venvs only. `suite/test_run_local.py`: a real
+venv copied to a generation, relocated (bin/ links, `pyvenv.cfg`, shebangs, `*.pth`) and run from the copy with
+`sys.prefix` inside it; a uv Python root mapped, a `ComfyUI-old` path and a `models/` path left alone; `models/ input/
+output/ user/`, every `.git` and a pack's weight file are symlinks to the volume's; a venv backup never copied; a second
+sync with nothing changed is `fresh` without a walk; a bumped `run.gen` makes a new generation that hardlinks what did not
+change and never writes the old one; a new pack re-walks; no room and a failed import check fall back to the volume and
+leave no generation; `--auto` copies only from a network filesystem (mountinfo parsing, fuse vs fuseblk); the warm read;
+the boot's head start before sshd; the pid matcher; the deferred import check (a named pack from this start's log slice
+only, a clean start, a start that never answers judged the long way and started again, the own-pack judge held back).
+
+**How.** `python3 -m pytest suite/test_run_local.py -q -p basetest` (PYTHONPATH=py); the full gate in CI.
+
+**Owed (needs a real pod; nothing here ran on one: RunPod had no credit on 2026-10-16).**
+- One fresh pod on a NEW network volume (the Video Replacer's models do not fit 60 GB, so the base's own install):
+  3.13.0 then this branch, timing the import check, the restart and a stop/start boot to 8188 up; the copy's own line
+  (`copied from the volume in N s`) and `state/logs/run-local.log`. Before, measured by the platform orchestrator on
+  kmgqu8yf0pscts: 1.72 ms per stat, `import torch` 56 s, import check 7.6 min, restart 3.5 min.
+- On the same pod: one `tar.zst` of the venv unpacked from the volume against the parallel copy, and a venv built on the
+  container disk against one built on the volume. These decide the next step: the install building the venv on local
+  disk and writing it back (packed or in parallel), which is where a first install's minutes of FUSE writes go.
+- That RunPod's FUSE mount reports a `fuse*` type in `/proc/self/mountinfo` (auto mode keys on it; `BASE_LOCAL_RUN=1`
+  forces it if not).
+
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port

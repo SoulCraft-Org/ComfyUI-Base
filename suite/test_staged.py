@@ -248,4 +248,4 @@ def test_unit_comfyui_is_told_where_the_base_keeps_its_state():
     start = body[body.index("_base_start_comfy(){"):]
     start = start[:start.index("\n}\n")]
     assert 'export COMFY_BASE_STATE="$_cbs"' in start and '${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}' in start
-    assert start.index("COMFY_BASE_STATE") < start.index('nohup "$PY" main.py')
+    assert start.index("COMFY_BASE_STATE") < start.index('nohup "$RUN_HERE_PY" main.py')       # 3.15.0: the copy's python, or $PY
