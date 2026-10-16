@@ -1098,15 +1098,167 @@ def put_away(prov, pod_id, io, to, yes=False):
     if not yes:
         io.say("copied. Nothing deleted: run again with --yes to delete the machine and its disks %s" % ", ".join(vols))
         return 2
+    runner_off(pod_id, say=io.say)
     io.say(prov.stop(pod_id, wait=True))
     prov.delete_volumes(vols)
     io.say("put away: the machine and its disks (%s) are in Verda's trash; the images are in %s" % (", ".join(vols), to))
     return 0
 
 
+# ---------------------------------------------------------------- 3.16.0: the machine as a GitHub self-hosted runner, opt-in
+# Self-hosted minutes are free, so a machine that is up anyway can run a repository's GPU jobs (`runs-on: [self-hosted,
+# gpu-pod]`) while it is up. `podctl runner <pod>` registers it as an EPHEMERAL runner (one job, then GitHub removes it;
+# run it again for the next), on the container disk, so a stopped machine has nothing left behind; `stop`, `pause` and
+# `put-away` remove it through GitHub's API first. The registration token is minted by this Mac's `gh`, read into memory,
+# handed to the machine on ssh's stdin (never argv: ssh_run says why) and from there to the runner in its environment
+# (ACTIONS_RUNNER_INPUT_TOKEN, which config.sh reads in place of --token); it is never printed, logged or written to disk.
+# A job on the machine reaches the GPU only through the machine's own ComfyUI (127.0.0.1:8188): never a second GPU
+# process beside it.
+RUNNER_VERSION = "2.338.0"
+RUNNER_SHA256 = "af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32"   # linux-x64, from the v2.338.0 release notes
+RUNNER_DIR = "/opt/gh-runner"                     # the container disk: gone when the machine stops
+RUNNER_LABELS = "gpu-pod"
+
+
+def runner_name(pod_id):
+    """The runner's name, derived from the machine alone, so `stop` finds it without asking the machine."""
+    return "gpu-pod-%s" % re.sub(r"[^A-Za-z0-9_.-]", "-", str(pod_id))
+
+
+def runner_scope(given=None, root=None, env=None, git=None):
+    """(api path, registration url) for --scope ORG or OWNER/REPO; else $PODCTL_RUNNER_SCOPE; else the GitHub owner of
+    the consumer root's origin remote (an organisation-wide runner, for the organisation's repositories only)."""
+    env = os.environ if env is None else env
+    scope = (given or env.get("PODCTL_RUNNER_SCOPE") or "").strip().strip("/")
+    if not scope and root:
+        import subprocess
+        r = (git or subprocess.run)(["git", "-C", str(root), "remote", "get-url", "origin"], capture_output=True, text=True)
+        m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+)/", (r.stdout or "").strip()) if r.returncode == 0 else None
+        scope = m.group(1) if m else ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?", scope or ""):
+        raise PodctlError("no runner scope: pass --scope <org> or <owner>/<repo> (or set PODCTL_RUNNER_SCOPE)")
+    if "/" in scope:
+        return "repos/%s/actions/runners" % scope, "https://github.com/%s" % scope
+    return "orgs/%s/actions/runners" % scope, "https://github.com/%s" % scope
+
+
+def gh_json(args, run=None):
+    """`gh api <args>` as JSON. A failure says gh's stderr (never its stdout, which may carry a token)."""
+    import subprocess
+    try:
+        r = (run or subprocess.run)(["gh", "api"] + list(args), capture_output=True, text=True)
+    except OSError as e:                                   # no gh on this Mac
+        raise PodctlError("gh is not usable here (%s)" % e)
+    if r.returncode != 0:
+        raise PodctlError("gh api %s failed: %s" % (args[-1], (r.stderr or "").strip()[-300:] or "exit %d" % r.returncode))
+    return json.loads(r.stdout or "null")
+
+
+def runner_token(api_path, run=None):
+    """A one-hour registration token from this Mac's gh: returned, never printed."""
+    tok = (gh_json(["-X", "POST", api_path + "/registration-token"], run=run) or {}).get("token") or ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", tok):
+        raise PodctlError("gh returned no usable registration token (does this gh login administer the scope?)")
+    return tok
+
+
+def runner_script(url, name, labels=RUNNER_LABELS, group=None, cache=None, version=RUNNER_VERSION, sha256=RUNNER_SHA256):
+    """The bash the machine runs; the token is the first line of its stdin. The runner tarball is cached on the volume
+    and checked against its published SHA-256 every time; the runner itself lives on the container disk."""
+    cache = cache or (VOLUME_ROOT + "/.cache/gh-runner")
+    tgz = "%s/actions-runner-linux-x64-%s.tar.gz" % (cache, version)
+    src = "https://github.com/actions/runner/releases/download/v%s/actions-runner-linux-x64-%s.tar.gz" % (version, version)
+    sums = _sq("%s  %s" % (sha256, tgz))
+    return "\n".join([
+        "set -euo pipefail",
+        "IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN; export ACTIONS_RUNNER_INPUT_TOKEN",
+        "[ \"$(uname -m)\" = x86_64 ] || { echo \"runner: x86_64 only (this machine is $(uname -m))\"; exit 3; }",
+        "mkdir -p %s" % _sq(cache),
+        "echo %s | sha256sum -c --status - 2>/dev/null || { curl -fsSL -o %s.part %s && mv %s.part %s; }" % (sums, _sq(tgz), _sq(src), _sq(tgz), _sq(tgz)),
+        "echo %s | sha256sum -c --status - || { echo 'runner: the tarball does not match its published SHA-256'; exit 4; }" % sums,
+        "pkill -f %s 2>/dev/null || true" % _sq(RUNNER_DIR + "/bin/Runner.Listener"),
+        "rm -rf %s && mkdir -p %s && tar xzf %s -C %s && cd %s" % (_sq(RUNNER_DIR), _sq(RUNNER_DIR), _sq(tgz), _sq(RUNNER_DIR), _sq(RUNNER_DIR)),
+        "export RUNNER_ALLOW_RUNASROOT=1 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1",
+        "./config.sh --unattended --ephemeral --replace --disableupdate --url %s --name %s --labels %s%s --work _work >config.log 2>&1 "
+        "|| { tail -5 config.log; exit 5; }" % (_sq(url), _sq(name), _sq(labels), (" --runnergroup %s" % _sq(group)) if group else ""),
+        "unset ACTIONS_RUNNER_INPUT_TOKEN",
+        "setsid nohup ./run.sh >run.log 2>&1 < /dev/null &",
+        "echo \"runner  %s listening on the machine (pid $!)\"" % name,
+    ]) + "\n"
+
+
+def runner_mark(pod_id, env=None):
+    """This Mac's note that it registered a runner for the machine (the scope's API path, nothing secret): `stop` asks
+    GitHub only when it is there, so a machine that never ran one stops exactly as before, offline."""
+    env = os.environ if env is None else env
+    return pathlib.Path(env.get("PODCTL_RUNNER_MARKS") or (pathlib.Path.home() / ".cache" / "podctl" / "runners")) / runner_name(pod_id)
+
+
+def runner_ids(api_path, name, run=None):
+    """The ids of the scope's runners called `name` (a stale one may share it after a crash)."""
+    got = gh_json(["--paginate", api_path + "?per_page=100"], run=run) or {}
+    return [r["id"] for r in got.get("runners", []) if r.get("name") == name]
+
+
+def runner_off(pod_id, api_path=None, run=None, say=print, ssh=None, env=None):
+    """Remove the machine's runner from GitHub and stop its listener. Without `api_path` it acts only when this Mac's
+    mark says a runner was registered; it never raises, because a stop must never be held up by it."""
+    mark = runner_mark(pod_id, env)
+    if api_path is None:
+        if not mark.is_file():
+            return 0
+        api_path = mark.read_text(encoding="utf-8").strip()
+    name = runner_name(pod_id)
+    try:
+        ids = runner_ids(api_path, name, run=run)
+    except PodctlError as e:
+        say("runner  %s not removed (%s): remove it on GitHub's runners page" % (name, e))
+        return 0
+    for rid in ids:
+        try:
+            gh_json(["-X", "DELETE", "%s/%s" % (api_path, rid)], run=run)
+            say("runner  %s removed from GitHub (id %s)" % (name, rid))
+        except PodctlError as e:
+            say("runner  %s NOT removed (%s): remove it on GitHub's runners page" % (name, e))
+    try:
+        (ssh or ssh_run)("pkill -f %s 2>/dev/null; rm -rf %s; true" % (_sq(RUNNER_DIR + "/bin/Runner.Listener"), _sq(RUNNER_DIR)), timeout=20)
+    except Exception:                                      # a machine already stopped or gone: GitHub's side is what matters
+        pass
+    mark.unlink(missing_ok=True)
+    return len(ids)
+
+
+def cmd_runner(prov, args):
+    api_path, url = runner_scope(args.scope, consumer_root(BASE_DIR))
+    pod = prov.pod(args.pod)
+    pod_id = pod.get("id") or args.pod
+    if args.remove:
+        if not runner_off(pod_id, api_path):
+            print("runner  none registered for %s" % pod_id)
+        return 0
+    blocked, why = lease_blocks(lease_read(), lease_me())
+    if blocked and not args.force_lease:
+        print("STOP: %s\n      a runner job uses this machine's ComfyUI: wait, message that session, or pass --force-lease" % why)
+        return 3
+    name = runner_name(pod_id)
+    r = ssh_run("bash -c %s" % _sq(runner_script(url, name, labels=args.labels, group=args.group)),
+                input=runner_token(api_path) + "\n", timeout=600)
+    out = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+    if r.returncode != 0:
+        raise PodctlError("the runner did not start on the machine (exit %d): %s" % (r.returncode, "\n".join(out)[-400:]))
+    mark = runner_mark(pod_id)
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.write_text(api_path + "\n", encoding="utf-8")
+    print(out[-1] if out else "runner  %s started" % name)
+    print("runner  %s for %s, labels self-hosted,%s: it takes one job, then GitHub removes it (podctl runner %s again for "
+          "the next); stop, pause and put-away remove it first" % (name, url, args.labels, args.pod))
+    return 0
+
+
 # ---------------------------------------------------------------- CLI
 
 def cmd_stop(prov, args):
+    runner_off(args.pod)
     print(prov.stop(args.pod, wait=args.wait))
 
 
@@ -1928,6 +2080,7 @@ def cmd_create(prov, args):
 
 
 def cmd_pause(prov, args):
+    runner_off(args.pod)
     print(prov.stop(args.pod, wait=True))
 
 
@@ -2012,6 +2165,14 @@ def build_parser():
     p.add_argument("--purpose", default="", help="what you are doing, so the next session knows whether to wait")
     p.add_argument("--minutes", type=int, default=60, help="how long to hold it (default 60)")
     p.add_argument("--force", action="store_true", help="take it even though another session holds a live one")
+    p = sub.add_parser("runner", help="3.16.0, opt-in: register the machine as an ephemeral GitHub self-hosted runner (label gpu-pod; one job, "
+                                      "then GitHub removes it); the token comes from this Mac's gh and is never printed; --remove takes it off")
+    p.add_argument("pod"); p.add_argument("--remove", action="store_true", help="remove it from GitHub and stop it on the machine")
+    p.add_argument("--scope", default=None, help="an organisation, or OWNER/REPO (default: $PODCTL_RUNNER_SCOPE, else the GitHub owner of the "
+                                                 "consumer root's origin)")
+    p.add_argument("--labels", default=RUNNER_LABELS, help="comma-separated, beside self-hosted,Linux,X64 (default %s)" % RUNNER_LABELS)
+    p.add_argument("--group", default=None, help="the organisation's runner group (default: its Default group)")
+    p.add_argument("--force-lease", dest="force_lease", action="store_true", help="register even though another session holds the GPU lease")
     p = sub.add_parser("jupyter", help="the JupyterLab URL with the token in it, read from the machine over ssh"); p.add_argument("pod")
     p = sub.add_parser("tunnel", help="the ONE ssh session that forwards ports (ComfyUI 8188, Jupyter Terminal 8888, each app port the "
                                       "machine serves) and prints them as named localhost links; runs until killed")
@@ -2083,7 +2244,8 @@ def main(argv=None):
          "stop": cmd_stop, "start": cmd_start, "restart": cmd_restart, "deploy": cmd_deploy, "upload": cmd_upload, "tunnel": cmd_tunnel, "jupyter": cmd_jupyter, "install": cmd_install,
          "lease": cmd_lease, "pins": cmd_pins, "prune": cmd_prune, "mcp": cmd_mcp,
          "balance": cmd_balance, "availability": cmd_availability, "create": cmd_create, "pause": cmd_pause, "put-away": cmd_put_away,
-         "buyer-install": cmd_buyer_install, "progress": cmd_progress, "runtime-capture": cmd_runtime_capture}[args.cmd](prov, args)
+         "buyer-install": cmd_buyer_install, "progress": cmd_progress, "runtime-capture": cmd_runtime_capture,
+         "runner": cmd_runner}[args.cmd](prov, args)
         if isinstance(rc, int):
             return rc
     except PodctlError as e:

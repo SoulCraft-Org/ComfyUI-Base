@@ -2127,3 +2127,78 @@ def test_unit_create_offers_only_data_centres_a_pod_and_its_volume_can_be_made_i
         srv.close()
     # an unreadable schema falls back to the list read on 2026-10-16
     assert "US-NE-1" not in podctl._runpod.CREATE_DCS and len(podctl._runpod.CREATE_DCS) == 30 and "EU-RO-1" in podctl._runpod.CREATE_DCS
+
+
+# ---------------------------------------------------------------- 3.16.0: podctl runner (the machine as a self-hosted runner)
+
+class _Gh:
+    """A fake `gh api`: records argv, answers by the path; never a real call."""
+    def __init__(self, runners=()):
+        self.calls, self.runners = [], list(runners)
+    def __call__(self, argv, capture_output=True, text=True):
+        self.calls.append(argv)
+        out = ""
+        if argv[-1].endswith("/registration-token"):
+            out = json.dumps({"token": "AAAATESTREGISTRATIONTOKEN0123456789", "expires_at": "later"})
+        elif "?per_page=" in argv[-1]:
+            out = json.dumps({"total_count": len(self.runners), "runners": self.runners})
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+
+def test_unit_podctl_runner_scope_comes_from_the_flag_the_env_or_the_origin_owner():
+    podctl = _load()
+    assert podctl.runner_scope("Acme") == ("orgs/Acme/actions/runners", "https://github.com/Acme")
+    assert podctl.runner_scope("Acme/pkg") == ("repos/Acme/pkg/actions/runners", "https://github.com/Acme/pkg")
+    assert podctl.runner_scope(None, env={"PODCTL_RUNNER_SCOPE": "Env-Org"})[0] == "orgs/Env-Org/actions/runners"
+    git = lambda argv, **k: subprocess.CompletedProcess(argv, 0, "https://github.com/From-Origin/workspace.git\n", "")
+    assert podctl.runner_scope(None, root="/ws", env={}, git=git)[0] == "orgs/From-Origin/actions/runners"
+    with pytest.raises(podctl.PodctlError):
+        podctl.runner_scope("bad scope; rm -rf /", env={})
+    assert podctl.runner_name("abc123xyz") == "gpu-pod-abc123xyz"
+
+
+def test_unit_podctl_runner_hands_the_token_over_stdin_only_and_never_prints_it(tmp_path, monkeypatch, capsys):
+    podctl = _load()
+    gh = _Gh()
+    real_token = podctl.runner_token
+    monkeypatch.setattr(podctl, "runner_token", lambda api_path, run=None: real_token(api_path, run=gh))
+    seen = []
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None, input=None: (seen.append((cmd, input)),
+                        subprocess.CompletedProcess(cmd, 0, "runner  gpu-pod-pod1 listening on the machine (pid 42)\n", ""))[1])
+    monkeypatch.setattr(podctl, "lease_read", lambda timeout=30: None)
+    monkeypatch.setenv("PODCTL_RUNNER_MARKS", str(tmp_path / "marks"))
+    prov = type("P", (), {"pod": lambda self, p: {"id": "pod1"}})()
+    args = podctl.build_parser().parse_args(["runner", "pod1", "--scope", "Acme"])
+    assert podctl.cmd_runner(prov, args) == 0
+    token = "AAAATESTREGISTRATIONTOKEN0123456789"
+    (cmd, given), = seen
+    assert given == token + "\n" and token not in cmd                       # stdin, never argv
+    assert token not in capsys.readouterr().out
+    for needle in ("--ephemeral", "--labels gpu-pod", "--name gpu-pod-pod1", "--url https://github.com/Acme", "sha256sum -c",
+                   podctl.RUNNER_SHA256, "ACTIONS_RUNNER_INPUT_TOKEN", "unset ACTIONS_RUNNER_INPUT_TOKEN", "/opt/gh-runner"):
+        assert needle in cmd, needle
+    assert "--token" not in cmd
+    assert gh.calls == [["gh", "api", "-X", "POST", "orgs/Acme/actions/runners/registration-token"]]
+    assert (tmp_path / "marks" / "gpu-pod-pod1").read_text().strip() == "orgs/Acme/actions/runners"
+
+
+def test_unit_podctl_stop_removes_a_registered_runner_and_never_asks_github_without_one(tmp_path, monkeypatch):
+    podctl = _load()
+    env = {"PODCTL_RUNNER_MARKS": str(tmp_path)}
+    gh = _Gh(runners=[{"id": 7, "name": "gpu-pod-pod1"}, {"id": 8, "name": "someone-else"}])
+    said, ssh = [], []
+    assert podctl.runner_off("pod1", run=gh, say=said.append, ssh=lambda *a, **k: ssh.append(a), env=env) == 0
+    assert gh.calls == [] and ssh == []                                       # no mark: offline, exactly as before
+    (tmp_path / "gpu-pod-pod1").write_text("orgs/Acme/actions/runners\n")
+    assert podctl.runner_off("pod1", run=gh, say=said.append, ssh=lambda *a, **k: ssh.append(a), env=env) == 1
+    assert ["gh", "api", "-X", "DELETE", "orgs/Acme/actions/runners/7"] in gh.calls
+    assert not any(c[-1].endswith("/8") for c in gh.calls) and ssh and not (tmp_path / "gpu-pod-pod1").exists()
+    assert any("removed from GitHub (id 7)" in s for s in said)
+    broken = lambda argv, **k: (_ for _ in ()).throw(FileNotFoundError("gh"))     # no gh on this Mac: said, never raised
+    (tmp_path / "gpu-pod-pod1").write_text("orgs/Acme/actions/runners\n")
+    assert podctl.runner_off("pod1", run=broken, say=said.append, ssh=lambda *a, **k: None, env=env) == 0
+    assert "not removed" in said[-1]
+    src = TOOL.read_text()
+    for cmd in ("def cmd_stop", "def cmd_pause"):
+        assert "runner_off(args.pod)" in src[src.index(cmd):src.index(cmd) + 200], cmd
+    assert "runner_off(pod_id, say=io.say)" in src[src.index("def put_away"):src.index("def cmd_stop")]

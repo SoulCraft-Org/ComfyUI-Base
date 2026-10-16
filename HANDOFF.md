@@ -112,6 +112,23 @@ packs pip resolve 3.11.0 meant to skip (138 s): fixed here, held by `suite/test_
 the bare image. The next serial step worth cutting is the newest pass (467 s here: two forcing rounds, each a full
 re-resolve and install, plus the holders' import probe).
 
+## 5. Testing that costs nothing: tier 0, the cloud brief, the pod as a runner (3.17.0)   (2026-10-16, no pod used)
+
+**Proven.** Offline only, by the unit tier: `_build/objinfo.py` refuses what ComfyUI's validator refuses on a synthetic
+schema (a missing required input, a link to no node or past a node's outputs or of the wrong type, a value below min or
+above max or not a number, a combo value not in the list, with a "did it become" hint when one option shares its head)
+and leaves upload combos, empty option lists and V3 dynamic inputs "unjudged", never passed; it judges only what the
+outputs reach. `test quick` hands pytest one `-m` expression of the light tiers. `podctl runner` puts the token on ssh's
+stdin and nowhere else, and `stop` asks GitHub only when this Mac registered a runner. `_build/quick.sh` was timed on
+the Video Replacer (the PR has the numbers).
+
+**Owed.**
+- `podctl runner` on a live pod: config.sh with `ACTIONS_RUNNER_INPUT_TOKEN` on the RunPod image, one job taken from a
+  `runs-on: [self-hosted, gpu-pod]` workflow, the runner gone from GitHub after it and after `podctl stop`.
+- `_build/cloud-verify.md` run once in a cloud session (the orchestrator launches it): whether the environment's network
+  lets `testbed.sh` provision, and whether the proxy lets `gh pr comment` through.
+- A package's first `objinfo.py save` from the pod, so its prompts are checked against the pod's own lists.
+
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port

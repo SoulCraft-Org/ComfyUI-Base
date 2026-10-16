@@ -98,3 +98,27 @@ and its summary prints what the read-back says (`ENCRYPTED pod volume`, `pod vol
 The one ssh session that forwards ports (keepalives on, a taken port fails loudly). Every other podctl ssh/scp call
 clears forwards, so a running tunnel never makes them print "bind: Address already in use".
 
+
+## runner — the machine as a free GitHub self-hosted runner while it is up (3.16.0, opt-in)
+
+    uv run "base/comfyui-base/_build/pod/podctl.py" runner <pod> [--scope <org> | <owner>/<repo>] [--labels gpu-pod] [--group <name>]
+    uv run "base/comfyui-base/_build/pod/podctl.py" runner <pod> --remove
+
+Self-hosted minutes cost nothing, so a machine that is up for real work can also take a repository's GPU job
+(`runs-on: [self-hosted, gpu-pod]`). `runner` registers it as an **ephemeral** runner named `gpu-pod-<pod id>`: it takes
+one job, then GitHub removes it; run it again for the next. The scope is `--scope`, else `$PODCTL_RUNNER_SCOPE`, else the
+GitHub owner of the consumer root's `origin` (an organisation-wide runner; the organisation's runner group decides
+which repositories may use it, and a group that refuses public repositories keeps forks away).
+
+- **The token.** This Mac's `gh` mints a one-hour registration token (`POST …/actions/runners/registration-token`; the
+  login must administer the scope). It is held in memory, written to ssh's stdin, read by the machine into the
+  runner's environment (`ACTIONS_RUNNER_INPUT_TOKEN`, which `config.sh` reads in place of `--token`) and unset after
+  configuration. Never in argv, a log, a file or the output.
+- **The machine.** actions/runner 2.338.0 (x86_64), the tarball cached under `/workspace/.cache/gh-runner` and checked
+  against its published SHA-256 on every use; the runner itself in `/opt/gh-runner` on the container disk, so a stopped
+  machine keeps nothing. It runs as root (`RUNNER_ALLOW_RUNASROOT=1`), with no self-update.
+- **Removal.** `stop`, `pause` and `put-away` first remove the runner through GitHub's API when this Mac registered one
+  (a mark in `~/.cache/podctl/runners/`, holding the scope's API path only); a machine that never ran one stops as
+  before, with no call to GitHub. `--remove` does it on demand.
+- **The GPU.** A job on the machine reaches the GPU only through the machine's own ComfyUI (`127.0.0.1:8188`), never as
+  a second GPU process beside it; `runner` refuses while another session holds the GPU lease (`--force-lease`).

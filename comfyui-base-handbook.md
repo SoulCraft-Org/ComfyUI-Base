@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.16.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.17.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -699,6 +699,10 @@ bash base/comfyui-base/_build/verify.sh [<brand>/packages/<name>...]            
 VERIFY_SERVER=reuse bash base/comfyui-base/_build/verify.sh                                    # this checkout's testbed --server, proven by --owned (default: a server of the run's own)
 ```
 
+Tier 0 (3.17.0), seconds, before every commit: `bash _build/quick.sh [<pkg>...]` (zip current, the suite's pure tiers via
+`test quick`, the API prompts against the cached `/object_info`, the brand's zip guard). `verify.sh` is Tier 1, once per
+release; a pod is Tier 2 (`podctl runner`).
+
 The rehearsal unpacks the shipped zips, runs the two steps on a fake pod of that layout, then boots it through
 `comfy-base/boot.sh` with stubs; ALL OK means the zips are ready to upload. Standalone (this base as its own
 repository), `rehearse.py stub --layout volume` uses the fixture package.
@@ -785,6 +789,18 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.17.0: testing that costs nothing, in three tiers (2026-10-16, when the private repositories' GitHub-hosted minutes ran
+  out). **Tier 0**, `_build/quick.sh [<pkg>...]`, seconds on any CPU before every commit: `package.py --check`, the suite's
+  pure tiers (`<name>-script.sh test quick`: every tier the suite declares except `BASE_HEAVY_TIERS`, those that need a
+  live machine), the package's `*.api.json` prompts against its cached `/object_info` (`_build/objinfo.py check`: classes,
+  required inputs, links and their types, ranges, combo options, from the output nodes back, as ComfyUI's validator reads
+  the schema; `objinfo.py save` takes the cache from the pod through `podctl tunnel`, in the shape image-creator-krea-2
+  already commits), and the brand's zip guard when its `brand.toml` names one (`zip_guard`). **Tier 1** is `verify.sh`,
+  once per release on a free runner; `_build/cloud-verify.md` is the brief for a Claude Code cloud session (what its
+  GitHub proxy allows: no check runs, statuses or deployments). **Tier 2**, `podctl runner <pod>`, opt-in: the machine as
+  an ephemeral GitHub self-hosted runner (label `gpu-pod`) while it is up; the token from this Mac's `gh` goes over ssh's
+  stdin into the runner's environment, never argv or output; `stop`, `pause` and `put-away` remove it first. Unit tier
+  only (`suite/test_quick.py`, `suite/test_podctl.py`, `suite/test_unit.py`); no pod used.
 - 3.16.0: the gate talks only to a server it started (2026-10-16, error log row 84). `_build/verify.sh` used whatever
   answered on the port in `.testbed-server.port`, else 8199, and so did the runner's `_base_use_testbed`, podctl's gate
   and a bare `pytest suite/`. On a Mac where several sessions each run a testbed, the Video Replacer's local gate met
