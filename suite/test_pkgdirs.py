@@ -23,8 +23,10 @@ def _repo_only(what="_build/"):
 
 
 def _env(**extra):
-    """The caller's environment without any BASE_* (a session that exports BASE_WORKSPACE must not steer these tests)."""
-    e = {k: v for k, v in os.environ.items() if not k.startswith("BASE_") and k != "ROOT"}
+    """The caller's environment without any BASE_* (a session that exports BASE_WORKSPACE must not steer these tests) and
+    without VERIFY_* (3.17.1: the CI job runs the gate with VERIFY_SUITE=zip, and a verify.sh these tests start must not
+    inherit it); a test that wants one sets it."""
+    e = {k: v for k, v in os.environ.items() if not k.startswith(("BASE_", "VERIFY_")) and k != "ROOT"}
     e.update(extra)
     return e
 
@@ -320,10 +322,10 @@ def test_unit_basetest_records_what_a_run_skipped_and_runs_only_that(tmp_path):
     skipped (a module skipped whole is recorded by its file), and BASE_ONLY_IDS keeps exactly those, so the repo pass
     runs what the zip pass could not and nothing else."""
     s = tmp_path / "s"; s.mkdir()
-    (s / "pytest.ini").write_text("[pytest]\\nmarkers =\\n    unit: u\\n")
-    (s / "test_a.py").write_text("import pytest\\ndef test_unit_runs(): pass\\n"
-                                 "def test_unit_needs_build():\\n    pytest.skip('no _build')\\n")
-    (s / "test_b.py").write_text("import pytest\\npytest.skip('repo only', allow_module_level=True)\\ndef test_unit_x(): pass\\n")
+    (s / "pytest.ini").write_text("[pytest]\nmarkers =\n    unit: u\n")
+    (s / "test_a.py").write_text("import pytest\ndef test_unit_runs(): pass\n"
+                                 "def test_unit_needs_build():\n    pytest.skip('no _build')\n")
+    (s / "test_b.py").write_text("import pytest\npytest.skip('repo only', allow_module_level=True)\ndef test_unit_x(): pass\n")
     out = tmp_path / "skipped"
     env = {**{k: v for k, v in os.environ.items() if k not in ("BASE_SKIPPED_OUT", "BASE_ONLY_IDS")}, "PYTHONPATH": str(BASE / "py")}
     py = lambda **kw: subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "basetest", "-c", str(s / "pytest.ini"), str(s)],
@@ -331,7 +333,7 @@ def test_unit_basetest_records_what_a_run_skipped_and_runs_only_that(tmp_path):
     r = py(BASE_SKIPPED_OUT=str(out))
     assert r.returncode == 0 and "1 passed, 2 skipped" in r.stdout, r.stdout + r.stderr
     assert out.read_text().splitlines() == ["test_a.py::test_unit_needs_build", "test_b.py"], out.read_text()
-    (s / "test_b.py").write_text("def test_unit_x(): pass\\n")          # the repo has what the zip lacked
-    (s / "test_a.py").write_text("def test_unit_runs(): pass\\ndef test_unit_needs_build(): pass\\n")
+    (s / "test_b.py").write_text("def test_unit_x(): pass\n")          # the repo has what the zip lacked
+    (s / "test_a.py").write_text("def test_unit_runs(): pass\ndef test_unit_needs_build(): pass\n")
     r = py(BASE_ONLY_IDS=str(out))
     assert r.returncode == 0 and "2 passed, 1 deselected" in r.stdout, r.stdout + r.stderr

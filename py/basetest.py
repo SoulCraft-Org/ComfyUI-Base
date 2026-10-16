@@ -243,7 +243,7 @@ def pytest_collection_modifyitems(config, items):
     # every test in it. Node ids are relative to the suite's rootdir, so the zip's and the repo's are the same.
     only = config.stash.get(_ONLY_IDS, "")
     if only:
-        want = {ln.strip() for ln in open(only, encoding="utf-8") if ln.strip()}
+        want = {ln.strip() for ln in Path(only).read_text(encoding="utf-8").splitlines() if ln.strip()}
         keep = [i for i in items if i.nodeid in want or i.nodeid.split("::")[0] in want]
         dropped = [i for i in items if i not in keep]
         if dropped:
