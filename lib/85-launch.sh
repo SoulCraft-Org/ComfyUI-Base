@@ -136,7 +136,7 @@ _base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHIN
 # The base's one default is OMP_NUM_THREADS from the container's CPU QUOTA (_base_cpu_quota), never the host's count.
 BASE_LAUNCH_ENV_KEYS="OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS"
 BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING"
-# 3.16.0: and the attention order a node pack reads when it loads (Generate-AI's Render Speed: off, cudnn or fa4), a
+# 3.18.0: and the attention order a node pack reads when it loads (Generate-AI's Render Speed: off, cudnn or fa4), a
 # one-word flag like the rest: which exact attention kernel runs first, never a path or a library to load
 BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS RENDER_SPEED_ATTENTION"
 _base_launch_env_ok(){ # KEY=value → 0 when it is an entry the contract above allows

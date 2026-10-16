@@ -1736,7 +1736,7 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
         out = capsys.readouterr().out
         assert "free now in: EU-RO-1, US-CA-2" in out and "STOP: US-NE-1 has no NVIDIA B200 free" in out, out
         assert [p for p in srv.posts if p != "/graphql"] == []
-        # neither a new size nor an existing volume, and (3.16.0) no fresh pod either: refused before any call bills
+        # neither a new size nor an existing volume, and (3.18.0) no fresh pod either: refused before any call bills
         with pytest.raises(podctl.PodctlError):
             _create(podctl, srv, pub, "--no-fresh")
         # the first data centre with stock, a new volume there, the pod on it
@@ -1830,7 +1830,7 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         {"id": "EU-RO-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B200", "stockStatus": "Low", "available": True}]},
         {"id": "EUR-IS-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B300 SXM6 AC", "stockStatus": "Low", "available": True},
                                                {"gpuTypeId": "NVIDIA B300 SXM6 AC MIG 1g.34gb", "stockStatus": "High", "available": True}]}]}
-    assert podctl.RunPodProvider.default_gpus[:2] == ("NVIDIA B200", "NVIDIA B300 SXM6 AC")   # 3.16.0: then the next tier
+    assert podctl.RunPodProvider.default_gpus[:2] == ("NVIDIA B200", "NVIDIA B300 SXM6 AC")   # 3.18.0: then the next tier
     srv = FakeRunPod(_pod(), volumes={"isvol": {"id": "isvol", "size": 500, "dataCenterId": "EUR-IS-1"}}, gql=stock)
     def create(*argv, image="someone/comfy:cu128"):
         prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
@@ -1865,7 +1865,7 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
 
 
 def test_unit_runpod_create_order_goes_past_b300_and_says_what_each_gpu_means():
-    """3.16.0 (Paul, 2026-10-16: rendering speed first, his order): B200, B300, H200, H100, RTX PRO 6000, RunPod's exact
+    """3.18.0 (Paul, 2026-10-16: rendering speed first, his order): B200, B300, H200, H100, RTX PRO 6000, RunPod's exact
     ids (the SXM H100 and H200, the PRO 6000 Server Edition, never a MIG slice), and a note for each GPU past the B200."""
     podctl = _load()
     order = podctl.RunPodProvider.default_gpus
@@ -1878,7 +1878,7 @@ def test_unit_runpod_create_order_goes_past_b300_and_says_what_each_gpu_means():
 
 
 def test_unit_runpod_create_goes_fresh_where_the_gpu_is_when_the_volume_is_elsewhere(tmp_path, capsys):
-    """3.16.0: the GPU order comes first. The named volume sits where only a B300 is free and a B200 is free elsewhere:
+    """3.18.0: the GPU order comes first. The named volume sits where only a B300 is free and a B200 is free elsewhere:
     the pod is the B200, fresh, on a pod volume (no network volume made or mounted, the public ports and key as ever).
     --pod-gb sizes it; --no-fresh is 3.14.0's rule (the B300 on the volume, with its note); with the B200 sold out the
     B300 on the volume is the pick anyway."""
@@ -1923,7 +1923,7 @@ def test_unit_runpod_create_goes_fresh_where_the_gpu_is_when_the_volume_is_elsew
 
 
 def test_unit_balance_is_projected_past_the_lag_and_guard_stops_running_pods_at_the_floor(tmp_path, capsys):
-    """3.16.0: RunPod's balance trails its spend (2026-10-16: a $5 stop rule let it reach -$1.24 and the pods were
+    """3.18.0: RunPod's balance trails its spend (2026-10-16: a $5 stop rule let it reach -$1.24 and the pods were
     removed). balance() reads GraphQL myself; the projection takes off --lag-min of the spend; guard says what it
     would stop without --yes (exit 3), stops every running pod with it, and is quiet above the floor (exit 0)."""
     podctl = _load()

@@ -2673,7 +2673,7 @@ def test_unit_launch_env_is_a_contract_not_a_free_for_all():
     variable the base owns, no shell expansion. A key set twice, or anything else, refuses the package's declarations."""
     good = ["OMP_NUM_THREADS=16", "MKL_NUM_THREADS=8", "CT2_VERBOSE=1", "CT2_USE_EXPERIMENTAL_PACKED_GEMM=1",
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512", "TOKENIZERS_PARALLELISM=false",
-            "RENDER_SPEED_ATTENTION=cudnn"]                                          # 3.16.0: a pack's attention order, one word
+            "RENDER_SPEED_ATTENTION=cudnn"]                                          # 3.18.0: a pack's attention order, one word
     bad = ["PATH=/usr/bin", "RENDER_SPEED_ATTENTION=/x", "RENDER_SPEED=cudnn", "LD_PRELOAD=libx.so", "LD_LIBRARY_PATH=/x", "PYTHONPATH=/x", "HF_HOME=/x", "HF_TOKEN=hf_x",
            "VHS_FORCE_FFMPEG_PATH=/x", "COMFY_BASE_STATE=/x", "OMP_NUM_THREADS=", "OMP_NUM_THREADS=$(id)", "OMP_NUM_THREADS=1 2",
            "OMP_NUM_THREADS=/tmp", "OMP_NUM_THREADS=`id`", "ct2_verbose=1", "CT2_=1x;", "OMP_NUM_THREADS", "=1"]

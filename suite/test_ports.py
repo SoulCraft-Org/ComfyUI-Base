@@ -701,7 +701,7 @@ def test_unit_create_reuses_the_named_network_volume_where_the_gpu_is_free(tmp_p
         body = [b for p, b in srv.bodies if p == "/pods"][-1]
         assert body["networkVolumeId"] == "vmine" and body["dataCenterIds"] == ["US-CA-2"] and "/networkvolumes" not in srv.posts
         assert "vmine (comfy-base-data) in US-CA-2: reused" in capsys.readouterr().out
-        # the named volume only where the GPU is sold out, and no --data-gb: 3.16.0, a fresh pod where the GPU is (no
+        # the named volume only where the GPU is sold out, and no --data-gb: 3.18.0, a fresh pod where the GPU is (no
         # network volume made); with --no-fresh, 3.14.0's STOP, nothing billed
         srv.volumes["vmine"]["dataCenterId"] = "US-NE-1"; srv.posts.clear()
         assert run() in (None, 0)

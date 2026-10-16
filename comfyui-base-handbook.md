@@ -291,7 +291,7 @@ create reads it live):
   `h264_nvenc` save fails there; encode on the CPU (`libx264`). "RTX" features (RTX Video Super Resolution) name an
   RTX GPU, which these are not.
 
-**Past B200 and B300, and no volume needed (3.16.0, Paul, 2026-10-16: rendering speed first).** `podctl create` with no
+**Past B200 and B300, and no volume needed (3.18.0, Paul, 2026-10-16: rendering speed first).** `podctl create` with no
 `--gpu` asks for `NVIDIA B200`, `NVIDIA B300 SXM6 AC`, then `NVIDIA H200`, `NVIDIA H100 80GB HBM3` and `NVIDIA RTX PRO 6000
 Blackwell Server Edition` (Paul's order; `DEFAULT_GPUS`, `hosts/runpod/provider.py`). The GPU order comes first: for each GPU in turn, the network volume `--volume-name` where
 that GPU is free, else a **fresh pod** in the first data centre that has it, on a pod volume of `--pod-gb` (default 400),
@@ -450,7 +450,7 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   validated list to `state/launch.d/<PKG_ID>.env` (removed when the package stops declaring one) and every launch, the
   install's restart and every boot alike, reads the whole folder (`lib/85-launch.sh`, `_base_launch_env`). Allowed keys:
   `OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS
-  TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING RENDER_SPEED_ATTENTION` (3.16.0: the
+  TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING RENDER_SPEED_ATTENTION` (3.18.0: the
   attention order a node pack reads at startup, `off`, `cudnn` or `fa4`) and CTranslate2's `CT2_*`;
   a value is one word of `[A-Za-z0-9_.,:+-]`. Anything else (a path, a library, a token, a variable the base owns such
   as `HF_HOME`) refuses the package's declarations before anything downloads, and a key set twice does too.
@@ -808,7 +808,7 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
-- 3.16.0: the GPU order past B200 and B300, no volume needed, and the balance projected (Paul, 2026-10-16: rendering
+- 3.18.0: the GPU order past B200 and B300, no volume needed, and the balance projected (Paul, 2026-10-16: rendering
   speed first). `podctl create` with no `--gpu` asks for B200, B300, H200, H100, then the RTX PRO 6000 Server Edition
   (Paul's order), and takes the first GPU with stock: on the reusable network volume where that GPU is free, else as a
   FRESH public pod on a pod volume (`--pod-gb`, default 400) in the first data centre that has it, models downloaded

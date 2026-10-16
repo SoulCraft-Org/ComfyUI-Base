@@ -803,13 +803,13 @@ PRIVATE_PORTS = ["22/tcp"]                               # 3.7.4 --private: sshd
 CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
 # 3.8.0: with no --gpu, `create` asks for these in order (the video packages' GPU_PREFER, py/gpu_fit.py): B200 first,
 # then B300. "NVIDIA B300 SXM6 AC MIG 1g.34gb" is a 34 GB slice of a B300 and is never on this list.
-# 3.16.0 (Paul, 2026-10-16: rendering speed first, his order): then Hopper and the RTX PRO 6000, so a sold-out B200 and
+# 3.18.0 (Paul, 2026-10-16: rendering speed first, his order): then Hopper and the RTX PRO 6000, so a sold-out B200 and
 # B300 still give a pod, fastest first: H200 (141 GB), H100 SXM (80 GB), then the PRO 6000 (96 GB). The ids are
 # RunPod's (GraphQL gpuTypes, 2026-10-16): the SXM H100 (not the NVL or PCIe one), the SXM H200 (not the NVL one), the
 # PRO 6000 Server Edition (not the Workstation or Max-Q one), and never a MIG slice.
 DEFAULT_GPUS = ("NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA H200", "NVIDIA H100 80GB HBM3",
                 "NVIDIA RTX PRO 6000 Blackwell Server Edition")
-# 3.16.0: what `create` says when it picks one of these, before anything bills. Hardware facts, nothing about a package.
+# 3.18.0: what `create` says when it picks one of these, before anything bills. Hardware facts, nothing about a package.
 # INT8: NVIDIA's HGX table lists HGX B300 at 3 POPS of INT8 tensor throughput (8 GPUs, sparse) against 72 for HGX B200,
 # with FP8 equal on both (nvidia.com/en-us/data-center/hgx, read 2026-10-16): about 0.19 POPS dense per B300.
 # nvfp4: ComfyUI computes it natively only on compute capability 10 and newer (model_management.supports_nvfp4_compute).
@@ -821,7 +821,7 @@ GPU_NOTES = {
     "NVIDIA H100 80GB HBM3": "sm_90 (Hopper), 80 GB: ComfyUI emulates nvfp4 weights here, and the big models may not all "
                              "stay loaded at once",
 }
-# 3.16.0: the pod volume of a fresh pod (no network volume where the GPU is): the models download again, in parallel and
+# 3.18.0: the pod volume of a fresh pod (no network volume where the GPU is): the models download again, in parallel and
 # pinned (lib/50-models.sh), so it only needs to hold one install. --pod-gb overrides it.
 FRESH_POD_GB = 400
 # The base installs a cu130 torch whatever the image was built for, so a host below CUDA 13.0 (a pre-580 driver) fails at
@@ -833,7 +833,7 @@ BALANCE_QUERY = "query { myself { clientBalance currentSpendPerHr spendLimit } }
 
 
 def balance(api):
-    """3.16.0: the account's prepaid balance and what it spends now: {"amount", "currency", "spend_per_hr", "spend_limit"}
+    """3.18.0: the account's prepaid balance and what it spends now: {"amount", "currency", "spend_per_hr", "spend_limit"}
     (GraphQL myself; REST v1 has no balance call). RunPod updates clientBalance behind the spend, so a caller that acts
     on it projects it forward (podctl balance, podctl guard)."""
     me = api.graphql(BALANCE_QUERY).get("myself") or {}
@@ -925,7 +925,7 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
     the three: no http port, so nothing to name, and the boot makes its token on the pod volume.
     3.14.0 link: the pod's own BASE_LINK_TOKEN, the key every proxied link but the terminal's needs (a private pod has none
     to lock: its ports are on loopback).
-    3.16.0 pod_gb: a PUBLIC pod on a POD VOLUME of that size instead of a network volume (a fresh pod where the GPU is
+    3.18.0 pod_gb: a PUBLIC pod on a POD VOLUME of that size instead of a network volume (a fresh pod where the GPU is
     and no network volume is): the same ports, names, tokens and key as a network-volume pod."""
     body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
@@ -960,7 +960,7 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     pod (sold out between the stock check and the create) takes a volume THIS call made with it, so nothing is left
     billing; an existing volume is never deleted. With wait: until sshd answers, then `Host runpod` -> the new pod.
     Returns the pod id. Prints names and counts, never the key.
-    3.16.0 pod_gb: no network volume at all: the pod gets a pod volume of that size (models download fresh)."""
+    3.18.0 pod_gb: no network volume at all: the pod gets a pod volume of that size (models download fresh)."""
     import time
     sleep = sleep or time.sleep
     if not image:
@@ -1125,8 +1125,8 @@ class RunPodProvider(Provider):
     key_path = pathlib.Path.home() / ".ssh" / "id_ed25519"
     experimental = False
     default_gpus = DEFAULT_GPUS                 # 3.8.0: `create` with no --gpu tries these, in order
-    gpu_notes = GPU_NOTES                       # 3.16.0: said when `create` picks one
-    fresh_pod_gb = FRESH_POD_GB                 # 3.16.0: a fresh pod's volume where no network volume is
+    gpu_notes = GPU_NOTES                       # 3.18.0: said when `create` picks one
+    fresh_pod_gb = FRESH_POD_GB                 # 3.18.0: a fresh pod's volume where no network volume is
 
     def __init__(self, api=None):
         self.api = api or Api(load_api_key())

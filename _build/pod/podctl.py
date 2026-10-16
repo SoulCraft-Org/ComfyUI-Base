@@ -72,7 +72,7 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "create_body", "create",
            "save_port_names", "names_template", "template_state", "http_ports", "jupyter_token", "proxy_url",   # 3.9.0
            "link_token", "named_volumes", "DEFAULT_VOLUME_NAME",                                               # 3.14.0
-           "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB"):                                           # 3.16.0
+           "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB"):                                           # 3.18.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -1972,7 +1972,7 @@ def _offered(prov, *names):
         raise PodctlError("%s: not offered by host %s" % (", ".join(missing), getattr(prov, "name", "?")))
 
 
-# 3.16.0: RunPod's clientBalance is updated behind the spend (on 2026-10-16 a $5 stop rule let it reach -$1.24 and
+# 3.18.0: RunPod's clientBalance is updated behind the spend (on 2026-10-16 a $5 stop rule let it reach -$1.24 and
 # RunPod removed the pods), so what is acted on is the balance minus the spend of the last BALANCE_LAG_MIN minutes.
 BALANCE_LAG_MIN = 30
 GUARD_FLOOR = 5.0
@@ -2003,7 +2003,7 @@ def cmd_balance(prov, args):
 
 
 def cmd_guard(prov, args):
-    """3.16.0: stop every running pod once the projected balance is at --floor or below. A pod without a network volume
+    """3.18.0: stop every running pod once the projected balance is at --floor or below. A pod without a network volume
     is TERMINATED at a $0 balance (RunPod's billing docs), with its models and outputs; a stopped one only waits. Without
     --yes it says what it would stop. Exit 0 above the floor (or nothing running), 3 at or below it, 1 on an error."""
     _offered(prov, "balance", "stop", "pods", "facts")
@@ -2072,7 +2072,7 @@ def cmd_create(prov, args):
         loc = vloc
     elif private and not args.data_gb:
         raise PodctlError("--data-gb N (a new volume) or --volume <id> (an existing one)")
-    # 3.16.0 (Paul, 2026-10-16: rendering speed first): with neither --volume nor --data-gb, a public pod no longer
+    # 3.18.0 (Paul, 2026-10-16: rendering speed first): with neither --volume nor --data-gb, a public pod no longer
     # waits for the GPU where the named volume is. The GPU order comes first: the reusable volume where that GPU is
     # free, else a FRESH pod (a pod volume of --pod-gb, models downloaded again, in parallel and pinned) in the first
     # data centre that has it. --no-fresh is 3.14.0's rule: only where the volume is.
@@ -2085,7 +2085,7 @@ def cmd_create(prov, args):
     if not volume and not args.data_gb and loc and loc not in reuse and not can_fresh:
         raise PodctlError("no network volume called %s in %s (it is in: %s): pass --data-gb N for a new one there, or drop "
                           "--location" % (vname, loc, ", ".join(sorted(reuse)) or "nowhere"))
-    # 3.8.0: --gpu names one type; without it the host's default order (RunPod: B200, then B300; 3.16.0: then the next
+    # 3.8.0: --gpu names one type; without it the host's default order (RunPod: B200, then B300; 3.18.0: then the next
     # tier) is tried, and the first with stock where the pod must go (the --location, the volume's data centre, else
     # anywhere) is the one created
     defaulted, fresh = not args.gpu, False
@@ -2096,7 +2096,7 @@ def cmd_create(prov, args):
     takes_volume = "volume" in inspect.signature(prov.availability).parameters
     for gpu in gpus:
         # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one;
-        # 3.16.0: a fresh pod makes none (and a reusable volume's data centre takes them), so then every one counts
+        # 3.18.0: a fresh pod makes none (and a reusable volume's data centre takes them), so then every one counts
         locs = (prov.availability(gpu, spot=args.spot, volume=not private and not can_fresh) if takes_volume
                 else prov.availability(gpu, spot=args.spot))
         print("stock   %s%s free now in: %s" % (gpu, spot, ", ".join(locs) if locs else "no location"))
@@ -2110,7 +2110,7 @@ def cmd_create(prov, args):
         if locs and (not loc or loc in locs) and (args.data_gb or volume):
             args.gpu, loc = gpu, loc or locs[0]
             break
-        if locs and (not loc or loc in locs) and can_fresh:   # 3.16.0: no reusable volume where this GPU is free
+        if locs and (not loc or loc in locs) and can_fresh:   # 3.18.0: no reusable volume where this GPU is free
             args.gpu, loc, fresh = gpu, loc or locs[0], True
             break
     else:
@@ -2264,7 +2264,7 @@ def build_parser():
     # ---- 3.1.0: a buyer's machine
     p = sub.add_parser("balance", help="the account's prepaid balance, and (RunPod) what it spends and the balance projected past RunPod's lag")
     p.add_argument("--lag-min", dest="lag_min", type=float, default=BALANCE_LAG_MIN, help="minutes of spend not booked yet (default %d)" % BALANCE_LAG_MIN)
-    p = sub.add_parser("guard", help="stop every running pod once the projected balance is at --floor or below (3.16.0); "
+    p = sub.add_parser("guard", help="stop every running pod once the projected balance is at --floor or below (3.18.0); "
                                      "without --yes it says what it would stop; exit 3 at the floor")
     p.add_argument("--floor", type=float, default=GUARD_FLOOR, help="the balance to stop at (default %.0f)" % GUARD_FLOOR)
     p.add_argument("--lag-min", dest="lag_min", type=float, default=BALANCE_LAG_MIN, help="minutes of spend not booked yet (default %d)" % BALANCE_LAG_MIN)
@@ -2282,7 +2282,7 @@ def build_parser():
     p.add_argument("--volume-name", dest="volume_name", help="RunPod: the network volume a public pod reuses, by name, in a data "
                    "centre with the GPU free, so models download once; made there (of --data-gb) when none exists (default comfy-base-data)")
     p.add_argument("--pod-gb", dest="pod_gb", type=int, help="RunPod: the pod volume of a FRESH pod, made where the GPU is free "
-                   "and no network volume is (3.16.0; default %d); models download again" % _runpod.FRESH_POD_GB)
+                   "and no network volume is (3.18.0; default %d); models download again" % _runpod.FRESH_POD_GB)
     p.add_argument("--no-fresh", dest="no_fresh", action="store_true", help="RunPod: never a fresh pod: only where the network "
                    "volume is, or a new one of --data-gb (3.14.0's rule)")
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")

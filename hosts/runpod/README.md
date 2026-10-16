@@ -31,7 +31,7 @@ folder's `provider.py` is the RunPod half of the driver, moved here verbatim in 
 The video packages are tuned for **B200** (`NVIDIA B200`, `sm_100`, 180 GB) first and **B300** (`NVIDIA B300 SXM6 AC`,
 `sm_103`, 288 GB) second; a package declares that with `GPU_PREFER="B200 B300"` and the base warns, never stops, on
 anything below (`py/gpu_fit.py`, the handbook's §1.1). `podctl create` asks for them in that order when no `--gpu` is given,
-then (3.16.0) `NVIDIA H200`, `NVIDIA H100 80GB HBM3` and `NVIDIA RTX PRO 6000 Blackwell Server Edition`, the
+then (3.18.0) `NVIDIA H200`, `NVIDIA H100 80GB HBM3` and `NVIDIA RTX PRO 6000 Blackwell Server Edition`, the
 first GPU with stock winning: on the
 reusable network volume where it is free, else as a fresh pod on a pod volume (`--pod-gb`, default 400) wherever it is
 (models download again; `--no-fresh` waits for the volume instead). On a B300 its note says to load fp8 weights: INT8 is
@@ -142,11 +142,11 @@ e.g. **Video Replacer App** (8189). How, from first-party sources (read 2026-10-
     uv run "_build/pod/podctl.py" pods                          # every pod: id, name, image, status, public ip, port 22
     uv run "_build/pod/podctl.py" create --name <n> --image <img> [--data-gb 500] [--gpu <type>] [--location <dc>] [--volume <id> | --volume-name <n> | --private] [--pod-gb N | --no-fresh]
                                                                 # stock check (B200, B300, H200, H100, RTX PRO 6000 unless --gpu); a PUBLIC Secure Cloud pod on the network volume
-                                                                # where that GPU is free, else (3.16.0) a fresh pod on a pod volume where it is;
+                                                                # where that GPU is free, else (3.18.0) a fresh pod on a pod volume where it is;
                                                                 # comfy-base-data (reused where the GPU is free, else made of --data-gb), named links locked by
                                                                 # the pod's key; --private: a pod volume, ssh only, ComfyUI through podctl tunnel
-    uv run "_build/pod/podctl.py" balance [--lag-min 30]        # 3.16.0: the balance, the spend per hour, the balance projected past RunPod's lag
-    uv run "_build/pod/podctl.py" guard --floor 5 [--yes]       # 3.16.0: stop every running pod once the projection is at the floor (exit 3 there)
+    uv run "_build/pod/podctl.py" balance [--lag-min 30]        # 3.18.0: the balance, the spend per hour, the balance projected past RunPod's lag
+    uv run "_build/pod/podctl.py" guard --floor 5 [--yes]       # 3.18.0: stop every running pod once the projection is at the floor (exit 3 there)
     uv run "_build/pod/podctl.py" status <pod>                  # facts; env NAMES, never values; the named links (each with its key or token); the GPU verdict
     uv run "_build/pod/podctl.py" ensure <pod>                  # 22/tcp, PUBLIC_KEY, the boot guard, Host runpod
     uv run "_build/pod/podctl.py" install <pod> --base --pkg <dir>...   # upload, extract, --check, run (everything newest), poll, logs, pack records

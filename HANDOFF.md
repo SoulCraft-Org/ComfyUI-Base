@@ -137,7 +137,7 @@ may stay: a base before 3.9.0 never reads the array): `APP_PORTS=("8189|video-re
 and the template name it, and the machine serves the app at that port's root. The app needs no change: it already
 reaches ComfyUI through `new URL("../../", HERE)` and names no top-level file `ws upload view history queue interrupt`.
 
-## 5. The GPU order past B200 and B300, no volume needed, and the balance projected (3.16.0)   (2026-10-16, no pod used)
+## 6. The GPU order past B200 and B300, no volume needed, and the balance projected (3.18.0)   (2026-10-16, no pod used)
 
 **Why.** Paul, 2026-10-16: rendering speed first. A B200 and a B300 sold out, or the B200 only where the network volume
 is not (on 2026-10-16 the volume was in EU-RO-1, which then had only RTX PRO 6000s and smaller), left `podctl create`
