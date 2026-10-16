@@ -151,13 +151,16 @@ def loopback(peer):
     return a.is_loopback
 
 
+OPEN = object()   # 3.19.1: the secret that opens every link (--open: the pod did not opt into BASE_LINK_LOCK=1)
+
+
 def authorize(secret, method, path, headers, peer):
     """The key's verdict on one request → ("open", target) | ("set", location) | ("deny", None).
 
     open: forward it, to `target` (the key taken out of the query when it rode there). set: a GET or HEAD that carried
     the key: answer with the cookie and a redirect to `location`, the same URL without it. deny: the 401 page. With no
     secret at all every request from outside is denied: a public bind is never open for want of a key."""
-    if loopback(peer):
+    if secret is OPEN or loopback(peer):
         return "open", path
     if not secret:
         return "deny", None
@@ -362,6 +365,8 @@ def main(argv=None):
     ap.add_argument("--upstream", default="127.0.0.1:8188", help="where ComfyUI answers (default 127.0.0.1:8188)")
     ap.add_argument("--listen", default="127.0.0.1", help="the bind address (BASE_LISTEN: 0.0.0.0 on RunPod)")
     ap.add_argument("--front", type=int, help="ComfyUI's own port: serve it, behind the key, on each non-loopback address (ComfyUI keeps 127.0.0.1)")
+    ap.add_argument("--open", action="store_true", help="every link opens without the key (3.19.1: the default on a pod; "
+                    "boot.sh drops it when the pod sets BASE_LINK_LOCK=1)")
     ap.add_argument("--front-listen", action="append", help="the addresses for --front (repeatable); default: every non-loopback one")
     ap.add_argument("--list", action="store_true", help="print the rows it would serve, one `port|slug|name` per line, and exit")
     a = ap.parse_args(argv)
@@ -379,9 +384,10 @@ def main(argv=None):
     if not rows and not front:
         print("app_proxy: no app ports declared: nothing to serve")
         return 0
-    secret = os.environ.get("BASE_LINK_TOKEN", "").strip() or None
+    secret = OPEN if a.open else (os.environ.get("BASE_LINK_TOKEN", "").strip() or None)
     if public(a.listen):
-        print("app_proxy: %s" % ("every link needs the key (BASE_LINK_TOKEN)" if secret else
+        print("app_proxy: %s" % ("every link opens on one click (--open; BASE_LINK_LOCK=1 locks them)" if secret is OPEN else
+                                 "every link needs the key (BASE_LINK_TOKEN)" if secret else
                                  "no BASE_LINK_TOKEN: every request from outside this machine is refused"), flush=True)
     h, _, p = a.upstream.rpartition(":")
     upstream = (h or "127.0.0.1", int(p))

@@ -92,9 +92,22 @@ boot_jupyter(){ # JupyterLab from the base's tools venv; the token rides the env
   # token. Now somebody does: podctl status, jupyter and tunnel read it over ssh, and on RunPod's public bind the boot
   # writes ONE line naming it to the CONTAINER log (RunPod's Logs tab, the pod owner's), which is how a pod from the
   # public template, with no ssh key, gets its terminal. Never to the boot log, which is a file on the volume.
+  # 3.19.1 (Paul, 2026-10-17: "can you fix this so I can click the links?"): on a public bind the terminal is OPEN unless
+  # the pod opts into the lock (BASE_LINK_LOCK=1, boot_link_locked). RunPod's proxy passes nothing that names the pod's
+  # owner, so any login is one more step on the Connect tab's link, and the order is speed, simplicity, privacy, then
+  # security that costs no step. A loopback bind (a --private pod, a VM, reached through the tunnel) keeps its token:
+  # the tunnel's link carries it, so it costs no click there.
   local jl="$BOOT_HOME/tools/bin/jupyter-lab" tok="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}" made="" own=1
   local listen="${BASE_LISTEN:-127.0.0.1}"
   if [ ! -x "$jl" ]; then echo "boot: no JupyterLab in $BOOT_HOME/tools (the base install builds it) — port 8888 stays dark"; return 0; fi
+  # an operator's own JUPYTER_PASSWORD (podctl never sets one) is a choice they made, and is kept
+  if boot_public && ! boot_link_locked && [ -z "${JUPYTER_PASSWORD:-}" ]; then
+    mkdir -p "$BOOT_HOME/state/logs"
+    env -u JUPYTER_TOKEN -u JUPYTER_PASSWORD nohup "$jl" --ip "$listen" --port 8888 --allow-root --no-browser --ServerApp.allow_origin='*' \
+      --IdentityProvider.token= --notebook-dir "${BOOT_VOLUME:-$(dirname "$BOOT_HOME")}" >> "$BOOT_HOME/state/logs/jupyter.log" 2>&1 &
+    echo "boot: JupyterLab starting on 8888 (the Jupyter Terminal, bound to $listen, open: its Connect link needs no token; BASE_LINK_LOCK=1 locks it)"
+    return 0
+  fi
   # read the saved one FIRST, so this does not depend on boot_tokens having run: a second boot must reuse the
   # token, never append a new line. My own test caught it doing exactly that.
   local tf="$BOOT_HOME/state/tokens.env"
@@ -208,6 +221,11 @@ boot_pid1_env(){ # <NAME> → the pod's own environment (PID 1's): `boot.sh --ap
   [ -r "$f" ] && tr '\0' '\n' < "$f" 2>/dev/null | sed -n "s/^$1=//p" | head -1
   return 0
 }
+boot_link_locked(){ # 3.19.1: 0 when the pod opted into the key (BASE_LINK_LOCK=1: its env, else PID 1's); links are open otherwise
+  local v="${BASE_LINK_LOCK:-}"
+  [ -n "$v" ] || v="$(boot_pid1_env BASE_LINK_LOCK)"
+  [ "$v" = 1 ]
+}
 boot_public(){ # 0 when BASE_LISTEN reaches beyond the machine (the key is then required on every link)
   case "${BASE_LISTEN:-127.0.0.1}" in 127.*|localhost|::1|'') return 1 ;; *) return 0 ;; esac
 }
@@ -264,7 +282,7 @@ boot_apps(){ # 3.9.0: each customer app at the root of its own port (state/apps.
   # 3.14.0: on a public bind the same process is ComfyUI's front too (--front: ComfyUI's port on the machine's other
   # addresses, ComfyUI itself on 127.0.0.1), and every link it serves needs the key (boot_link_token). So on a public
   # bind it runs even when no package declares an app: without it ComfyUI would not be reachable from outside at all.
-  local py proxy="$BOOT_HOME/py/app_proxy.py" port="${PORT:-}" rows n front=()
+  local py proxy="$BOOT_HOME/py/app_proxy.py" port="${PORT:-}" rows n front=() opn=()
   if [ -z "$port" ] && [ -f "$BOOT_HOME/state/boot.env" ]; then port="$(sed -n "s/^PORT='\{0,1\}\([0-9]*\).*/\1/p" "$BOOT_HOME/state/boot.env" | head -1)"; fi
   port="${port:-8188}"
   boot_apps_stop
@@ -276,13 +294,14 @@ boot_apps(){ # 3.9.0: each customer app at the root of its own port (state/apps.
     if [ -n "${BOOT_FRONT_LISTEN:-}" ]; then front=(--front "$port" --front-listen "$BOOT_FRONT_LISTEN")   # the suite's stand-in for the machine's addresses
     elif [ -z "${BOOT_ROOT:-}" ]; then front=(--front "$port")
     else echo "boot: a fake pod (BOOT_ROOT): ComfyUI's front is not started on this machine's own addresses"; fi
-    if [ "${#front[@]}" -gt 0 ]; then boot_link_token; fi
+    # 3.19.1: the key only when the pod opted in; otherwise every link opens on one click (--open)
+    if boot_link_locked; then if [ "${#front[@]}" -gt 0 ]; then boot_link_token; fi; else opn=(--open); fi
   fi
   if [ "${n:-0}" = 0 ] && [ "${#front[@]}" = 0 ]; then echo "boot: app ports: none declared (no package ships a customer app)"; return 0; fi
   mkdir -p "$BOOT_HOME/state/logs"
-  nohup "$py" "$proxy" --state "$BOOT_HOME/state" --upstream "127.0.0.1:$port" --listen "${BASE_LISTEN:-127.0.0.1}" ${front[@]+"${front[@]}"} >> "$BOOT_HOME/state/logs/app_proxy.log" 2>&1 &
+  nohup "$py" "$proxy" --state "$BOOT_HOME/state" --upstream "127.0.0.1:$port" --listen "${BASE_LISTEN:-127.0.0.1}" ${front[@]+"${front[@]}"} ${opn[@]+"${opn[@]}"} >> "$BOOT_HOME/state/logs/app_proxy.log" 2>&1 &
   if [ "${#front[@]}" -gt 0 ]; then
-    echo "boot: ComfyUI's port $port: the key's front on this machine's addresses (ComfyUI itself on 127.0.0.1)$( [ "${BOOT_LINK_MADE:-0}" = 1 ] && echo ' · key generated, saved to state/tokens.env')"
+    echo "boot: ComfyUI's port $port: $(boot_link_locked && echo "the key's front" || echo "the front, open (BASE_LINK_LOCK=1 locks it)") on this machine's addresses (ComfyUI itself on 127.0.0.1)$( [ "${BOOT_LINK_MADE:-0}" = 1 ] && echo ' · key generated, saved to state/tokens.env')"
   fi
   if [ "${n:-0}" = 0 ]; then echo "boot: app ports: none declared (no package ships a customer app)"; fi
   printf '%s\n' "$rows" | while IFS='|' read -r p s nm; do

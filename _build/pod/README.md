@@ -67,7 +67,8 @@ delight first (easy, simple: named links in the Connect tab), then secure, then 
 click. So a plain `create` makes the network-volume pod above, with ComfyUI, the Jupyter Terminal and each app named in
 the Connect tab, and every one of those links locked:
 
-- **The key.** `create` puts a fresh per-pod `BASE_LINK_TOKEN` in the pod's env beside `JUPYTER_TOKEN`, and prints
+- **Open by default (3.19.1).** Since 3.19.1 the links are OPEN by default: one click on the Connect tab opens ComfyUI, each app and the Jupyter Terminal (no key, no token), because RunPod's proxy passes nothing that names the pod's owner (its docs: the service "becomes publicly accessible"; "implement proper authentication in your application"), so any login is a step. The key below, and JupyterLab's token on the public bind, are the opt-in: `BASE_LINK_LOCK=1` in the pod's env (`podctl create --lock`).
+- **The key (opt-in, `--lock`).** `create --lock` puts a fresh per-pod `BASE_LINK_TOKEN` in the pod's env beside `JUPYTER_TOKEN`, and prints
   every link ready to click: ComfyUI and each app as `https://<pod>-<port>.proxy.runpod.net/?token=<key>`, the terminal
   as `…-8888…/lab?token=<jupyter token>`. On the machine `py/app_proxy.py` answers the key with a cookie (HttpOnly,
   Secure, SameSite=Lax, that host only) and a redirect to the same URL without it, so after that one click the
