@@ -1759,10 +1759,13 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
     assert vol == {"name": "comfy-base-data", "size": 500, "dataCenterId": "EU-RO-1"}     # 3.14.0: the name the next create reuses
     assert body["cloudType"] == "SECURE" and body["dataCenterIds"] == ["EU-RO-1"] and body["networkVolumeId"] == "newvol1"
     assert body["volumeMountPath"] == "/workspace" and body["ports"] == ["8188/http", "8888/http", "22/tcp"]
-    # 3.9.0: and the pod's own JupyterLab token; 3.14.0: and the key to its links (test_ports has the names and the key)
-    assert set(body["env"]) == {"PUBLIC_KEY", "JUPYTER_TOKEN", "BASE_LINK_TOKEN"} and body["env"]["PUBLIC_KEY"] == "ssh-ed25519 AAAAMAC mac@key"
-    tok_lines = [l for l in out.splitlines() if body["env"]["JUPYTER_TOKEN"] in l]       # printed once: the ready terminal link
-    assert len(tok_lines) == 1 and "Jupyter Terminal" in tok_lines[0] and "-8888.proxy.runpod.net/lab?token=" in tok_lines[0], out
+    # 3.19.1: open by default: no token and no key in the env, and the printed links are the Connect tab's own
+    # (test_ports has --lock, the names and the key)
+    assert set(body["env"]) == {"PUBLIC_KEY"} and body["env"]["PUBLIC_KEY"] == "ssh-ed25519 AAAAMAC mac@key"
+    import urllib.parse
+    host = lambda l: urllib.parse.urlsplit(l.split()[-1]).hostname or ""     # a parsed host, never a substring (CodeQL)
+    jl = [l for l in out.splitlines() if "Jupyter Terminal" in l and host(l).endswith(".proxy.runpod.net")]
+    assert len(jl) == 1 and jl[0].split()[-1] == "https://newpod0000001-8888.proxy.runpod.net/lab" and "token=" not in out, out
     assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["gpuCount"] == 1
     assert body["allowedCudaVersions"] == ["13.0"] and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
     assert "templateId" not in body and body["interruptible"] is False   # this fake has no templates
@@ -1907,7 +1910,7 @@ def test_unit_runpod_create_goes_fresh_where_the_gpu_is_when_the_volume_is_elsew
         out, body = capsys.readouterr().out, pods()[-1]
         assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["dataCenterIds"] == ["US-CA-2"], body
         assert "networkVolumeId" not in body and body["volumeInGb"] == 400 and body["volumeMountPath"] == "/workspace"
-        assert "8188/http" in body["ports"] and body["env"]["BASE_LINK_TOKEN"] and "BASE_LISTEN" not in body["env"]
+        assert "8188/http" in body["ports"] and "BASE_LINK_TOKEN" not in body["env"] and "BASE_LISTEN" not in body["env"]
         assert "/networkvolumes" not in srv.posts, srv.posts
         assert "volume  none: a fresh pod in US-CA-2 on a 400 GB pod volume (comfy-base-data is only in EUR-IS-1)" in out, out
         assert "pod volume 400 GB at /workspace" in out and "podctl guard" in out, out
@@ -2073,7 +2076,11 @@ def test_unit_runpod_create_is_public_unless_private(tmp_path, capsys):
         body = srv.bodies[-1][1]
         assert srv.posts == ["/graphql", "/networkvolumes", "/pods"] and "8188/http" in body["ports"], (srv.posts, body)
         assert body["cloudType"] == "SECURE" and body["gpuTypeIds"] == ["NVIDIA B200"] and "BASE_LISTEN" not in body["env"]
-        assert body["env"]["BASE_LINK_TOKEN"] and "?token=%s" % body["env"]["BASE_LINK_TOKEN"] in capsys.readouterr().out
+        assert "BASE_LINK_TOKEN" not in body["env"] and "token=" not in capsys.readouterr().out      # 3.19.1: open by default
+        assert create("--data-gb", "300", "--lock") in (None, 0)                                     # the opt-in
+        body = srv.bodies[-1][1]
+        assert body["env"]["BASE_LINK_LOCK"] == "1" and body["env"]["BASE_LINK_TOKEN"] and body["env"]["JUPYTER_TOKEN"]
+        assert "?token=%s" % body["env"]["BASE_LINK_TOKEN"] in capsys.readouterr().out
         with pytest.raises(podctl.PodctlError) as e:
             create("--private", "--volume", "oldvol")
         assert "network volume" in str(e.value) and "drop --private" in str(e.value) and "--data-gb" in str(e.value)

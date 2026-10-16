@@ -339,7 +339,8 @@ def test_unit_jupyter_generates_one_token_keeps_it_private_and_never_goes_tokenl
     (pub / "comfy-base" / "state").mkdir()
     jl2 = pub / "comfy-base" / "tools" / "bin" / "jupyter-lab"; jl2.write_text("#!/bin/sh\nexit 0\n"); jl2.chmod(0o755)
     e = {k: v for k, v in os.environ.items() if k not in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD")}
-    e.update(BOOT_HOME=str(pub / "comfy-base"), BASE_LISTEN="0.0.0.0", BASE_HOST="runpod", RUNPOD_POD_ID="podabc")
+    e.update(BOOT_HOME=str(pub / "comfy-base"), BASE_LISTEN="0.0.0.0", BASE_HOST="runpod", RUNPOD_POD_ID="podabc",
+             BASE_LINK_LOCK="1")                                   # 3.19.1: the token on a public bind is the lock's (opt-in)
     console = tmp_path / "console.log"
     r3 = subprocess.run(["bash", "-c", 'source "%s/lib/boot.sh"; boot_jupyter 3>"%s"' % (BASE, console)],
                         capture_output=True, text=True, env=e, cwd=str(tmp_path))

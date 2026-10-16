@@ -125,7 +125,8 @@ e.g. **Video Replacer App** (8189). How, from first-party sources (read 2026-10-
   the token out of RunPod's env (stored in the clear): once ssh answers, `create` hands it to the pod volume through
   ssh's stdin and prints the same names as the localhost links `podctl tunnel` opens. Never tokenless: the URL is public
   and the terminal is root.
-- **Every other link is locked by the pod's key, at no extra click (3.14.0).** `create` also puts a fresh
+- **Open by default (3.19.1).** Since 3.19.1 the links are OPEN by default: one click on the Connect tab opens ComfyUI, each app and the Jupyter Terminal (no key, no token), because RunPod's proxy passes nothing that names the pod's owner (its docs: the service "becomes publicly accessible"; "implement proper authentication in your application"), so any login is a step. The key below, and JupyterLab's token on the public bind, are the opt-in: `BASE_LINK_LOCK=1` in the pod's env (`podctl create --lock`).
+- **With `--lock`, every other link is locked by the pod's key (3.14.0).** `create --lock` also puts a fresh
   `BASE_LINK_TOKEN` in the env, and every link it prints but the terminal's carries it once: `…-8188.proxy.runpod.net/?token=<key>`.
   On the pod, `py/app_proxy.py` stands in front of ComfyUI's 8188 (on the container's own addresses; ComfyUI itself
   listens on 127.0.0.1) and of every app port. The key in the query is traded for a cookie (`base_link`: HttpOnly,

@@ -486,7 +486,7 @@ def links_lines(names, url_for, token=None, prefix="links", link=None):
         if url is None:
             continue
         if port == 8888:
-            url = url.rstrip("/") + ("/lab?token=%s" % token if token else "/lab   (token: podctl jupyter <pod>)")
+            url = url.rstrip("/") + ("/lab?token=%s" % token if token else "/lab")   # 3.19.1: open unless the pod is locked
         elif link:
             url = url.rstrip("/") + "/?token=%s" % link
         lines.append("%-8s %-*s  %s" % (prefix, w, name, url))
@@ -2140,7 +2140,7 @@ def cmd_create(prov, args):
             loc, int(fresh_gb), ("%s is only in %s" % (vname, ", ".join(sorted(reuse)))) if reuse else "no %s to reuse" % vname))
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
     extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private),
-                               ("pod_gb", int(fresh_gb) if fresh else None)) if v}
+                               ("pod_gb", int(fresh_gb) if fresh else None), ("lock", bool(getattr(args, "lock", False)))) if v}
     if not private and not volume and not fresh and "volume_name" in inspect.signature(prov.create_machine).parameters:
         extra["volume_name"] = vname                    # 3.14.0: the new volume gets the name the next create reuses
     takes = inspect.signature(prov.create_machine).parameters
@@ -2291,6 +2291,9 @@ def build_parser():
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
+    p.add_argument("--lock", action="store_true", help="RunPod (3.19.1): lock every Connect link with the pod's own key "
+                   "(BASE_LINK_LOCK=1; the printed links carry it once, then a cookie) and JupyterLab with a token. Without "
+                   "it the links open on one click, as RunPod's proxy URLs do")
     p.add_argument("--private", action="store_true", help="RunPod, opt-in: a pod volume of --data-gb, NOT encrypted (RunPod's API "
                    "cannot ask for that; only the console's Encrypt volume box can), ports 22/tcp only (no proxy URL), ComfyUI, "
                    "JupyterLab and the apps on loopback: podctl tunnel names them")

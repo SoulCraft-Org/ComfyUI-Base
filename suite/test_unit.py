@@ -2113,7 +2113,8 @@ def test_unit_boot_sh_never_starts_jupyter_tokenless_and_no_sshd_without_a_key(t
     fake_pod(tmp_path, STUB, layout="official")
     assert run_script(STUB / "stub-script.sh", fake_root=tmp_path).returncode == 0
     bin_, log = _boot_stubs(tmp_path)
-    r, blog = _run_boot_sh(tmp_path, bin_)                       # PUBLIC_KEY set by the helper, no JUPYTER_*
+    # 3.19.1: on RunPod's public bind this holds for a LOCKED pod (BASE_LINK_LOCK=1); an open one is test_ports'
+    r, blog = _run_boot_sh(tmp_path, bin_, {"BASE_LINK_LOCK": "1"})   # PUBLIC_KEY set by the helper, no JUPYTER_*
     tf = tmp_path / "comfy-base" / "state" / "tokens.env"
     tok = [l.split("=", 1)[1] for l in tf.read_text().splitlines() if l.startswith("JUPYTER_TOKEN=")][-1]
     assert r.returncode == 0 and "JupyterLab starting on 8888" in blog and "token generated" in blog, blog
@@ -2122,8 +2123,9 @@ def test_unit_boot_sh_never_starts_jupyter_tokenless_and_no_sshd_without_a_key(t
     assert tok not in blog, "the generated token was written to the boot log on the volume"
     assert ("Jupyter Terminal token: %s" % tok) in r.stdout and "fakepod-8888.proxy.runpod.net/lab?token=" in r.stdout, r.stdout
     assert "python main.py" in log.read_text()                    # ComfyUI still comes up
-    src = (BASE / "lib" / "boot.sh").read_text()
-    assert "IdentityProvider.token=''" not in code_only(src)      # the tokenless line is gone from the code, not just unreachable
+    src = code_only((BASE / "lib" / "boot.sh").read_text())
+    # 3.19.1: the one tokenless start is the open public bind, behind `boot_public && ! boot_link_locked`, and never on loopback
+    assert src.count("--IdentityProvider.token=") == 1 and "boot_public && ! boot_link_locked" in src
     # no PUBLIC_KEY: no sshd at all (a listener nobody can log in to is a port with no purpose)
     (tmp_path / "sshd.running").unlink(missing_ok=True); log.write_text("")
     r, blog = _run_boot_sh(tmp_path, bin_, {"PUBLIC_KEY": ""})
