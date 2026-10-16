@@ -394,7 +394,113 @@ _base_sage_covers(){ # <key> <prefix> <sm token, e.g. 12-0> → 0 when <key> is 
   case "_${list}_" in *"_${tok}_"*) return 0;; esac
   return 1
 }
-base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 built from source for THIS GPU's sm (no PyPI wheel has
+base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention installed for THIS GPU (below), then PROVEN on it
+  # 3.7.5: "imports" was the whole proof, and a B200 (sm_100) imported a correct sm_100a build whose sageattn() raised
+  # `Unsupported CUDA architecture: sm100` at the first sampling step: upstream dispatches sm80/86/89/90/120/121 only.
+  _base_sage_install
+  if [ "$BASE_DRY" = "1" ] || [ "$BASE_NO_NET" = "1" ]; then return 0; fi
+  if ! "$PY" -c "import sageattention" >/dev/null 2>&1; then return 0; fi     # the installer already failed it by name
+  base_sage_proof
+  case "$BASE_SAGE_VERDICT" in
+    ok)      ok "Sage: OK -> sageattention ${BASE_SAGE_VERSION:-?} RUNS on ${BASE_GPU_SM:-this GPU} under KJ's \"auto\" (a tiny tensor, checked against PyTorch attention)" ;;
+    only)    warn "Sage on ${BASE_GPU_SM:-this GPU}: KJ's \"auto\" (and --use-sage-attention) FAILS here: $(_base_sage_mode_detail auto). $(_base_sage_only_line)" ;;
+    none)    err "sageattention imports but NO mode runs on ${BASE_GPU_SM:-this GPU}: a Sage patch node would fail at the first sampling step"
+             BASE_FAILED+=("SageAttention: imports, but no mode runs on ${BASE_GPU_SM:-this GPU} (bash <script> sage lists why)") ;;
+    nogpu)   note "Sage proof not run: no CUDA device visible here (an image build); the machine it serves proves it" ;;
+    *)       warn "the Sage proof gave no verdict ($(_base_sage_mode_detail setup)): whether Sage RUNS on this GPU is unknown" ;;
+  esac
+  return 0
+}
+
+BASE_SAGE_VERDICT=""; BASE_SAGE_USE=""; BASE_SAGE_VERSION=""; BASE_SAGE_OUT=""
+base_sage_proof(){ # [--fresh] → BASE_SAGE_VERDICT (ok|only|none|nogpu|noimport|unknown), BASE_SAGE_USE, BASE_SAGE_OUT
+  # py/sage_probe.py calls every KJ mode on a 1x2x256x64 tensor for a second or two. Its answer is kept per GPU (a shared
+  # store's one venv serves a B200 and a B300 alike) and reused while the build's stamp is the same, so `sage`, hygiene
+  # and a re-run never start a second GPU process beside ComfyUI to learn what is already known.
+  local pf head out kept=0
+  pf="$(_base_sage_proof_file)"; head="$(_base_sage_proof_head)"
+  if [ "${1:-}" != "--fresh" ] && out="$(_base_sage_cached)"; then kept=1
+  else out="$(_base_timeout 600 "$PY" "$BASE_DIR/py/sage_probe.py" 2>/dev/null | grep '^SAGE_' || true)"; fi
+  BASE_SAGE_OUT="$out"
+  BASE_SAGE_VERDICT="$(printf '%s\n' "$out" | sed -n 's/^SAGE_PROOF verdict=\([a-z]*\).*/\1/p' | head -1)"; BASE_SAGE_VERDICT="${BASE_SAGE_VERDICT:-unknown}"
+  BASE_SAGE_USE="$(printf '%s\n' "$out" | sed -n 's/^SAGE_PROOF .* use=\([^ ]*\).*/\1/p' | head -1)"
+  BASE_SAGE_VERSION="$(printf '%s\n' "$out" | sed -n 's/^SAGE_PROOF .* version=\([^ ]*\).*/\1/p' | head -1)"
+  [ "$BASE_SAGE_VERSION" = "-" ] && BASE_SAGE_VERSION="" || true
+  case "$BASE_SAGE_VERDICT" in ok|only|none)                       # only a real verdict is kept; nogpu/unknown ask again
+    if [ "$kept" = 0 ] && mkdir -p "$(dirname "$pf")" 2>/dev/null; then
+      printf '%s\n%s\n' "$head" "$out" > "$pf" 2>/dev/null || true
+      _base_sage_json > "${pf%.proof}.json" 2>/dev/null || true
+    fi ;;
+  esac
+  return 0
+}
+base_sage_mode(){ # → the value for KJ's sage_attention widget on THIS GPU, from the kept proof: auto | <mode> | disabled
+  # (exit 1, nothing printed: no proof kept for this build on this GPU yet). The same answer, as data a node can read, is
+  # $VENV/.comfy-base-sage/<sm>.json (sys.prefix inside ComfyUI): {"sm", "build", "verdict", "mode", "runs", "fails", …}.
+  local out v
+  out="$(_base_sage_cached)" || return 1
+  v="$(printf '%s\n' "$out" | sed -n 's/^SAGE_PROOF verdict=\([a-z]*\).*/\1/p' | head -1)"
+  case "$v" in
+    ok)   echo auto ;;
+    only) printf '%s\n' "$out" | sed -n 's/^SAGE_PROOF .* use=\([^ ]*\).*/\1/p' | head -1 ;;
+    *)    echo disabled ;;
+  esac
+}
+_base_sage_json(){ # the last proof (BASE_SAGE_*), as one JSON object; every value is a token the probe printed, so no escaping
+  local mode runs fails
+  case "$BASE_SAGE_VERDICT" in ok) mode=auto;; only) mode="$BASE_SAGE_USE";; *) mode=disabled;; esac
+  runs="$(printf '%s\n' "$BASE_SAGE_OUT" | awk '$1=="SAGE_MODE" && $3=="ok" {printf "%s\"%s\"", (n++ ? ", " : ""), $2}')"
+  fails="$(printf '%s\n' "$BASE_SAGE_OUT" | awk '$1=="SAGE_MODE" && $3!="ok" {printf "%s\"%s\"", (n++ ? ", " : ""), $2}')"
+  printf '{"schema": 1, "sm": "%s", "build": "%s", "verdict": "%s", "mode": "%s", "version": "%s", "runs": [%s], "fails": [%s], "base": "%s", "at": "%s"}\n' \
+    "${BASE_GPU_SM:-}" "$(cat "$VENV/.comfy-base-sageattention" 2>/dev/null)" "$BASE_SAGE_VERDICT" "$mode" "${BASE_SAGE_VERSION:-}" \
+    "$runs" "$fails" "${BASE_VERSION:-}" "$(_base_ts 2>/dev/null || date -u +%FT%TZ)"
+}
+_base_sage_proof_file(){ echo "$VENV/.comfy-base-sage/${BASE_GPU_SM:-nogpu}.proof"; }
+_base_sage_proof_head(){ echo "key=$(cat "$VENV/.comfy-base-sageattention" 2>/dev/null) sm=${BASE_GPU_SM:-}"; }
+_base_sage_cached(){ # prints the kept proof and returns 0 only when it was made for this very build on this very GPU
+  local pf; pf="$(_base_sage_proof_file)"
+  [ -f "$pf" ] && [ "$(head -1 "$pf")" = "$(_base_sage_proof_head)" ] || return 1
+  sed 1d "$pf"
+}
+_base_sage_patch_setup(){ # <setup.py> — upstream's arch table (main d1a57a5) stops at 10.0/12.x: a B300 (10.3) built NO qattn kernel
+  # (the capability fell through to `continue`, so only _fused was compiled). The sm80/sm89 kernels are mma.sync, which
+  # every sm_8x+ part runs, so 10.3 joins 10.0's row as sm_103a; whether they then RUN is the proof's question, not ours.
+  # Idempotent, and a no-op once upstream has its own 10.3 row.
+  local f="$1"
+  grep -q 'startswith("10.3")' "$f" && return 0
+  grep -q 'num = "100a"' "$f" || return 0
+  awk '{ print }
+       /num = "100a"/ && !done { ind = $0; sub(/[^ ].*$/, "", ind); up = substr(ind, 5)
+         print up "elif capability.startswith(\"10.3\"):"; print ind "HAS_SM100 = True"; print ind "num = \"103a\""; done = 1 }' \
+    "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+_base_sage_mode_detail(){ # <mode> → why that mode failed (or its detail), from the last proof
+  local d; d="$(printf '%s\n' "$BASE_SAGE_OUT" | sed -n "s/^SAGE_MODE $1 [a-z]* //p" | head -1)"; echo "${d:-no detail}"
+}
+_base_sage_only_line(){ # the plain sentence for verdict=only: which modes run, and the one to set
+  local runs; runs="$(printf '%s\n' "$BASE_SAGE_OUT" | awk '$1=="SAGE_MODE" && $3=="ok" {print $2}' | paste -sd, - | sed 's/,/, /g')"
+  if [ "$runs" = "sageattn_qk_int8_pv_fp16_triton" ]; then
+    echo "Only the Triton mode works on this GPU: set the Sage node's mode to sageattn_qk_int8_pv_fp16_triton, never \"auto\"."
+  else
+    echo "The modes that run: $runs. Set the Sage node's mode to $BASE_SAGE_USE, never \"auto\"."
+  fi
+}
+base_sage_check(){ # `bash <script> sage`: does SageAttention RUN here? exit 0 auto runs · 3 only a named mode runs · 1 it does not
+  if [ -z "${PY:-}" ] || ! "$PY" -c "import sageattention" >/dev/null 2>&1; then
+    echo "Sage: not importable in ${VENV:-the venv} — run: bash \"$(basename "${PKG_SCRIPT:-$0}")\"   (it builds SageAttention from its newest source for this GPU)"; return 1
+  fi
+  base_sage_proof "$@"
+  case "$BASE_SAGE_VERDICT" in
+    ok)    echo "Sage: OK -> ${BASE_SAGE_VERSION:-sageattention} runs on ${BASE_GPU_SM:-this GPU} under \"auto\" — the Sage toggle may go ON"; return 0 ;;
+    only)  echo "Sage: \"auto\" FAILS on ${BASE_GPU_SM:-this GPU} ($(_base_sage_mode_detail auto)). $(_base_sage_only_line)"
+           printf '%s\n' "$BASE_SAGE_OUT" | awk '$1=="SAGE_MODE" {printf "  %-34s %s\n", $2, $3}'; return 3 ;;
+    none)  echo "Sage: imports, but NO mode runs on ${BASE_GPU_SM:-this GPU} — keep the Sage toggle OFF"
+           printf '%s\n' "$BASE_SAGE_OUT" | awk '$1=="SAGE_MODE" {$1=""; print " "$0}'; return 1 ;;
+    nogpu) echo "Sage: imports; no CUDA device visible here, so whether it runs is unproven"; return 1 ;;
+    *)     echo "Sage: imports; the proof gave no verdict ($(_base_sage_mode_detail setup)) — whether it runs is unproven"; return 1 ;;
+  esac
+}
+_base_sage_install(){ # SageAttention 2 built from source for THIS GPU's sm (no PyPI wheel has
   # sm_100/sm_120 kernels; 1.0.6 crashes there). SAGE_REF names a BRANCH or tag (default main); 3.0.0 retired SAGE_WHEEL and a
   # 40-hex SAGE_REF, both of which held it below its newest. It is rebuilt whenever the full cache key (the resolved commit,
   # Python, torch, sm) differs from the one stamped beside the install, so a reused venv follows main like a fresh one.
@@ -488,7 +594,8 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
       err "could not clone SageAttention ($ref)"; BASE_FAILED+=("SageAttention: clone failed"); return 0
     fi
     sed -i.bak 's/-std=c++17/-std=c++20/g' "$src/setup.py" && rm -f "$src/setup.py.bak"
-    note "SageAttention $(git -C "$src" rev-parse --short HEAD 2>/dev/null) — setup.py patched: -std=c++17 → -std=c++20 (torch ≥ 2.14 headers)"
+    _base_sage_patch_setup "$src/setup.py"
+    note "SageAttention $(git -C "$src" rev-parse --short HEAD 2>/dev/null) — setup.py patched: -std=c++17 → -std=c++20 (torch ≥ 2.14 headers), 10.3 builds as sm_103a"
     echo "  building SageAttention from source for ${SAGE_ARCHS:-$BASE_GPU_SM} (TORCH_CUDA_ARCH_LIST=$cc, MAX_JOBS=${MAX_JOBS:-32}; 10–20 min, a heartbeat prints while it runs)"
     # built as a WHEEL, not installed straight in: the wheel is the artefact the next venv rebuild reuses
     mkdir -p "$cache/$key"

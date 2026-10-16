@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.7.4.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.7.5.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -292,7 +292,8 @@ A package zip is `<name>-<host>.zip`, the host being its brand's `brand.toml` (�
 brand above it). It is flat and extracts into its own folder (`podctl install` does this): two packages both ship
 `suite.py` and `pytest.ini`, and flat extraction let the second overwrite the first's (2.0.17).
 Same six forms everywhere: install · `--check` · `--latest` (3.0.0: the same as a plain install; kept for old callers) ·
-`test [tier]` · `rescue` · `help`, plus the package's own `PKG_COMMANDS`. `BASE_RESTART=1` makes the summary's smoke,
+`test [tier]` · `rescue` · `sage` (3.7.5: does SageAttention RUN here; it answers before a package's own `sage` row) ·
+`help`, plus the package's own `PKG_COMMANDS`. `BASE_RESTART=1` makes the summary's smoke,
 combos and suite run against the server this run installed.
 
 ## 4. The package contract
@@ -373,7 +374,15 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
 - Helpers a hook may use: `ok miss err note warn hdr would todo`, `base_mkdir`, `base_run <cmd> <args>…` (dry-run aware: runs the command, or prints it under `--check`; 3.7.2: the
   install pipeline is `base_install`, so a hook that calls `base_run` no longer re-enters the whole install),
   `_base_yaml_register <section> <key> <path>`, `base_build_sageattention` (SageAttention 2 from source for this GPU's sm,
-  dry-run aware; `SAGE_REF` names a branch or tag, default main; rebuilt whenever its full cache key moves; 2.0.22, 3.0.0), `$COMFY $CN $M $VENV $PY $PKG_DIR $BASE_STATE`.
+  dry-run aware; `SAGE_REF` names a branch or tag, default main; rebuilt whenever its full cache key moves; 2.0.22, 3.0.0;
+  3.7.5: then PROVEN, `py/sage_probe.py` calling every KJ Patch Sage Attention mode on a tiny tensor against PyTorch
+  attention, kept beside the build's stamp; "Sage: OK" means `auto` runs. On sm_100 upstream's `sageattn()` has no
+  dispatch (it raises `Unsupported CUDA architecture: sm100`; SM100 support was withdrawn in 2025-12, thu-ml/SageAttention#322,
+  and SageAttention3 refuses sm_100, #346), so the run warns and names the mode that runs, and hygiene drops
+  `--use-sage-attention`. Upstream's arch table has no 10.3 (B300 got no qattn kernel); the build adds it as
+  sm_103a. The proof is kept per GPU, as data: `base_sage_mode` prints the KJ `sage_attention` value for this GPU
+  (`auto`, the named mode, or `disabled`), and `$VENV/.comfy-base-sage/<sm>.json` (`sys.prefix` inside ComfyUI) holds
+  `{"sm", "build", "verdict", "mode", "runs", "fails", "version"}`), `$COMFY $CN $M $VENV $PY $PKG_DIR $BASE_STATE`.
   A hook that changed something the running server must reload appends its reason to `PKG_RESTART_WHY` (an array);
   the run's restart hand-off then restarts the server (`BASE_RESTART=1`) or prints the launch line with those reasons,
   never a green summary on a stale server.
@@ -591,6 +600,14 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.7.5: SageAttention is proven by RUNNING it. A B200 (sm_100, 2026-10-16) imported a correct sm_100a build and died
+  at the first sampling step: upstream's `sageattn()` (KJ's "auto", ComfyUI's `--use-sage-attention`) dispatches
+  sm80/86/89/90/120/121 only. Upstream withdrew SM100 in 2025-12 (#322) and SageAttention3 refuses sm_100 (#346).
+  `py/sage_probe.py` calls every KJ mode on a tiny tensor against PyTorch attention; "Sage: OK" means `auto` runs,
+  otherwise the run warns and names the mode that does (Triton first), and no mode at all fails the run. The proof
+  is kept per GPU as `$VENV/.comfy-base-sage/<sm>.json` (and `base_sage_mode`), `sage` is the base's own command,
+  hygiene drops `--use-sage-attention` where `auto` fails, and 10.3 (B300) builds the qattn kernels as sm_103a.
+  Exercised on this Mac against fakes and a fake probe; not run on a B200 or B300.
 - 3.7.4: `podctl create --private` (RunPod), for work that must not be reachable from a URL: an encrypted pod volume of
   `--data-gb` (RunPod encrypts only a pod's volume disk, never a network volume, so `--volume` is refused), `22/tcp` the
   only port (no proxy URL, no JupyterLab), and `BASE_LISTEN=127.0.0.1` in the pod's env so ComfyUI binds loopback;

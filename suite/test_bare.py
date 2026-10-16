@@ -124,7 +124,7 @@ def test_bare_a_toolkit_that_links_cublas_is_accepted(tmp_path):
 def test_bare_no_source_build_starts_when_the_toolchain_cannot_finish_it():
     """Seven minutes of nvcc to reach a link error the probe can predict in two seconds."""
     src = PACKS_SH.read_text(encoding="utf-8")
-    body = src[src.index("base_build_sageattention()"):]
+    body = src[src.index("_base_sage_install()"):]             # 3.7.5: base_build_sageattention = this install, then the proof
     body = body[:body.index("\n}\n")]
     assert "base_cuda_toolchain" in body, "the SageAttention build does not consult the toolchain probe"
     guard = body.index("base_cuda_toolchain")

@@ -229,8 +229,8 @@ _base_pkg_command(){ # <name> [args] — a package's extra subcommand (PKG_COMMA
   done
   return 1
 }
-_base_usage(){ echo "usage: bash \"$(basename "${PKG_SCRIPT:-$0}")\" [--check | preflight | --latest | test [tier] | rescue | help$(_base_pkg_command_names)]" >&2; }
-_base_pkg_command_names(){ local row; for row in ${PKG_COMMANDS[@]+"${PKG_COMMANDS[@]}"}; do printf ' | %s' "${row%%|*}"; done; }
+_base_usage(){ echo "usage: bash \"$(basename "${PKG_SCRIPT:-$0}")\" [--check | preflight | --latest | test [tier] | rescue | sage | help$(_base_pkg_command_names)]" >&2; }
+_base_pkg_command_names(){ local row; for row in ${PKG_COMMANDS[@]+"${PKG_COMMANDS[@]}"}; do [ "${row%%|*}" = sage ] || printf ' | %s' "${row%%|*}"; done; }   # sage: the base's own since 3.7.5
 base_help(){
   local s; s="$(basename "${PKG_SCRIPT:-$0}")"
   local npacks nmodels; npacks="$(( ${#BASE_PACKS[@]} + ${#PACKS[@]} ))"; nmodels="${#MODELS[@]}"
@@ -244,10 +244,11 @@ ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION}  ·  runs on ComfyUI Ba
   bash "$s" --latest       the same as a plain run (3.0.0: every run takes everything to its newest)
   bash "$s" test [tier]    run the package's suite (tiers: its pytest.ini markers); auto-detects the repo testbed
   bash "$s" rescue         repair a venv that cannot boot after a pod restart (never runs the interpreter it repairs)
+  bash "$s" sage           does SageAttention RUN on this GPU, mode by mode? exit 0 "auto" runs, 3 only the named mode does
   bash "$s" help
 HLP
   local row name fn help
-  for row in ${PKG_COMMANDS[@]+"${PKG_COMMANDS[@]}"}; do IFS='|' read -r name fn help <<< "$row"; printf '  bash "%s" %-14s %s\n' "$s" "$name" "$help"; done
+  for row in ${PKG_COMMANDS[@]+"${PKG_COMMANDS[@]}"}; do IFS='|' read -r name fn help <<< "$row"; [ "$name" = sage ] && continue; printf '  bash "%s" %-14s %s\n' "$s" "$name" "$help"; done
   cat <<HLP
 
   env: BASE_RESTART=1 (actually restart ComfyUI; default prints the launch line) · BASE_YES=1 (unattended: yes to deletion)
@@ -374,6 +375,7 @@ base_main(){ # the six forms every package shares, plus the package's own PKG_CO
     runtime-apply)   shift; base_runtime_apply "$@"; exit $? ;;                # 3.1.0: a buyer's machine
     runtime-capture) shift; base_runtime_capture "$@"; exit $? ;;
     fetch-later)     base_fetch_later; exit $? ;;
+    sage)      shift; base_env_setup; base_discover quiet || true; base_sage_check "$@" && exit 0; exit $? ;;   # 3.7.5: does Sage RUN here (a package's own `sage` row is not reached)
     *)         if ! _base_pkg_command "$@"; then _base_usage; exit 2; fi ;;
   esac
 }

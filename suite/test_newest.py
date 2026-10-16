@@ -902,3 +902,171 @@ def test_unit_the_cublas_probe_compiles_once_per_toolkit_on_a_machine(tmp_path):
     (cuda / "lib64" / "libcublas.so.13").unlink()                                   # the library went (a restarted container)
     r = _bash(f'BASE_STATE="{st}"; CUDACXX="{cuda}/bin/nvcc"; base_cuda_toolchain')
     assert log.read_text().count("compile") == 2, log.read_text()                   # a changed toolkit is probed again
+
+
+# ---------------------------------------------------------------- 3.7.5: Sage is proven by RUNNING it, mode by mode
+
+B200_PROOF = """SAGE_PROOF verdict=only sm=sm100 use=sageattn_qk_int8_pv_fp16_triton version=2.2.0
+SAGE_MODE auto fail ValueError: Unsupported CUDA architecture: sm100
+SAGE_MODE sageattn_qk_int8_pv_fp16_cuda fail RuntimeError: no kernel image is available for execution on the device
+SAGE_MODE sageattn_qk_int8_pv_fp16_triton ok cos=0.9998
+SAGE_MODE sageattn_qk_int8_pv_fp8_cuda fail RuntimeError: no kernel image is available for execution on the device
+SAGE_MODE sageattn_qk_int8_pv_fp8_cuda++ fail RuntimeError: no kernel image is available for execution on the device
+SAGE_MODE sageattn3 fail sageattn3 not installed
+SAGE_MODE sageattn3_per_block_mean fail sageattn3 not installed"""
+
+
+def _sage_probe_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("sage_probe", BASE / "py" / "sage_probe.py"); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    return m
+
+
+def test_unit_the_sage_probe_judges_auto_first_then_names_the_mode_that_runs():
+    """A B200 (2026-10-16) imported a correct sm_100a build and died at the first step: upstream's sageattn(), which KJ's
+    "auto" calls, has no sm100 branch. The probe calls every KJ mode; an exception is a failed mode, never a broken probe."""
+    m = _sage_probe_module()
+
+    def b200(mode):
+        if mode == "auto":
+            raise ValueError("Unsupported CUDA architecture: sm100")
+        if mode == "sageattn_qk_int8_pv_fp16_triton":
+            return True, "cos=0.9998"
+        if mode == "sageattn_qk_int8_pv_fp8_cuda":
+            return False, "cos=0.4100"                                  # it ran, and disagreed with PyTorch: not counted
+        raise RuntimeError("no kernel image is available for execution on the device")
+    res = m.probe(b200)
+    assert list(res) == list(m.MODES) and res["auto"] == (False, "ValueError: Unsupported CUDA architecture: sm100")
+    assert m.verdict(res) == ("only", "sageattn_qk_int8_pv_fp16_triton")
+    out = m.report(*m.verdict(res)[:1], "sm100", m.verdict(res)[1], "2.2.0", res).splitlines()
+    assert out[0] == "SAGE_PROOF verdict=only sm=sm100 use=sageattn_qk_int8_pv_fp16_triton version=2.2.0"
+    assert "SAGE_MODE sageattn_qk_int8_pv_fp8_cuda fail cos=0.4100" in out and len(out) == 1 + len(m.MODES)
+    assert m.verdict({"auto": (True, "cos=0.9999")}) == ("ok", "auto")
+    assert m.verdict({"sageattn_qk_int8_pv_fp16_cuda": (True, ""), "sageattn_qk_int8_pv_fp8_cuda": (True, "")}) == ("only", "sageattn_qk_int8_pv_fp16_cuda")
+    assert m.verdict(m.probe(lambda mode: (_ for _ in ()).throw(RuntimeError("x")))) == ("none", "-")
+
+
+def test_unit_the_sage_probe_says_noimport_and_nogpu_instead_of_crashing(tmp_path):
+    probe = str(BASE / "py" / "sage_probe.py")
+    r = subprocess.run([sys.executable, probe], capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(tmp_path / "empty")})
+    assert r.returncode == 0 and r.stdout.startswith("SAGE_PROOF verdict=noimport "), r.stdout + r.stderr
+    site = tmp_path / "site"; (site / "torch" / "nn").mkdir(parents=True); (site / "sageattention").mkdir()
+    (site / "sageattention" / "__init__.py").write_text("def sageattn(*a, **k):\n    raise ValueError('never called')\n")
+    (site / "torch" / "__init__.py").write_text("class cuda:\n    @staticmethod\n    def is_available():\n        return False\n")
+    (site / "torch" / "nn" / "__init__.py").write_text(""); (site / "torch" / "nn" / "functional.py").write_text("")
+    r = subprocess.run([sys.executable, probe], capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(site)})
+    assert r.returncode == 0 and r.stdout.strip() == "SAGE_PROOF verdict=nogpu sm=- use=- version=-", r.stdout + r.stderr
+
+
+def _sage_venv(tmp_path, proof, count=None):
+    """A venv whose python imports sageattention and answers sage_probe.py with <proof> (and counts the probes)."""
+    v = tmp_path / "venv"; (v / "bin").mkdir(parents=True, exist_ok=True); py = v / "bin" / "python"
+    pf = tmp_path / "proof.txt"; pf.write_text(proof + "\n")
+    cnt = f'echo x >> "{count}"; ' if count else ""
+    py.write_text(f'#!/bin/bash\ncase "$*" in *sage_probe.py*) {cnt}cat "{pf}";; *"import sageattention"*) exit 0;; *) exit 0;; esac\n'); py.chmod(0o755)
+    gitbin = tmp_path / "gitbin"; gitbin.mkdir(exist_ok=True)
+    (gitbin / "git").write_text('#!/bin/bash\n[ "$1" = ls-remote ] && { echo "abcdef1234567890abcdef1234567890abcdef12\trefs/heads/main"; exit 0; }\nexec /usr/bin/git "$@"\n'); (gitbin / "git").chmod(0o755)
+    (v / ".comfy-base-sageattention").write_text("sageattention-abcdef123456-cp-torch0-sm_100\n")
+    env = {"PATH": f"{gitbin}:{os.environ['PATH']}", "HOME": str(tmp_path / "home")}
+    base = f'VENV="{v}"; PY="{py}"; BASE_STATE="{tmp_path}"; BASE_DRY=0; BASE_NO_NET=0; BASE_GPU_SM=sm_100; '
+    return v, pf, env, base
+
+
+def test_unit_a_b200_build_that_imports_but_fails_auto_says_plainly_only_triton_works(tmp_path):
+    """The build is kept (it is correct, and Triton runs on it), the run is not failed, and the report says what to set."""
+    count = tmp_path / "probes"
+    v, pf, env, base = _sage_venv(tmp_path, B200_PROOF, count)
+    r = _bash(base + 'base_build_sageattention; echo F=${#BASE_FAILED[@]} W=${#BASE_WARN[@]}; printf "%s\\n" "${BASE_WARN[@]}"', env=env)
+    assert "already built from SageAttention abcdef123456" in r.stdout and "F=0 W=1" in r.stdout, r.stdout + r.stderr
+    assert 'KJ\'s "auto" (and --use-sage-attention) FAILS here: ValueError: Unsupported CUDA architecture: sm100' in r.stdout, r.stdout
+    assert "Only the Triton mode works on this GPU: set the Sage node's mode to sageattn_qk_int8_pv_fp16_triton" in r.stdout, r.stdout
+    assert "Sage: OK" not in r.stdout, r.stdout
+    kept = (v / ".comfy-base-sage" / "sm_100.proof").read_text().splitlines()
+    assert kept[0] == "key=sageattention-abcdef123456-cp-torch0-sm_100 sm=sm_100" and kept[1].startswith("SAGE_PROOF verdict=only"), kept
+    # the same answer as data a package (or a node, at sys.prefix) reads: the KJ widget value for THIS GPU
+    data = json.loads((v / ".comfy-base-sage" / "sm_100.json").read_text())
+    assert data["mode"] == "sageattn_qk_int8_pv_fp16_triton" and data["verdict"] == "only" and data["sm"] == "sm_100", data
+    assert data["runs"] == ["sageattn_qk_int8_pv_fp16_triton"] and data["fails"][0] == "auto" and data["build"].endswith("sm_100"), data
+    r = _bash(base + 'base_sage_mode; echo RC=$?; BASE_GPU_SM=sm_103; base_sage_mode; echo RC=$?', env=env)
+    assert r.stdout.split() == ["sageattn_qk_int8_pv_fp16_triton", "RC=0", "RC=1"], r.stdout + r.stderr
+    # `sage` reads the kept proof (no second GPU process beside ComfyUI) and exits 3: a named mode runs, "auto" does not
+    r = _bash(base + 'base_sage_check && echo RC=0 || echo RC=$?', env=env)
+    assert "RC=3" in r.stdout and 'Sage: "auto" FAILS on sm_100' in r.stdout and "Only the Triton mode works" in r.stdout, r.stdout + r.stderr
+    assert re.search(r"sageattn_qk_int8_pv_fp16_triton\s+ok", r.stdout) and re.search(r"auto\s+fail", r.stdout), r.stdout
+    assert count.read_text().count("x") == 1, "the kept proof was not reused"
+    # another GPU (or a rebuild) asks again; --fresh always does
+    _bash(base + 'BASE_GPU_SM=sm_120; base_sage_check || true', env=env)
+    _bash(base + 'base_sage_check --fresh || true', env=env)
+    assert count.read_text().count("x") == 3
+
+
+def test_unit_sage_ok_only_when_auto_runs_and_none_fails_the_run(tmp_path):
+    v, pf, env, base = _sage_venv(tmp_path, "SAGE_PROOF verdict=ok sm=sm120 use=auto version=2.2.0\nSAGE_MODE auto ok cos=0.9999")
+    (v / ".comfy-base-sageattention").write_text("sageattention-abcdef123456-cp-torch0-sm_120\n")
+    r = _bash(base + 'BASE_GPU_SM=sm_120; base_build_sageattention; echo F=${#BASE_FAILED[@]} W=${#BASE_WARN[@]}; base_sage_check; echo RC=$?', env=env)
+    assert "Sage: OK -> sageattention 2.2.0 RUNS on sm_120" in r.stdout and "F=0 W=0" in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
+    assert json.loads((v / ".comfy-base-sage" / "sm_120.json").read_text())["mode"] == "auto"
+    (v / ".comfy-base-sageattention").write_text("sageattention-abcdef123456-cp-torch0-sm_100\n")
+    pf.write_text("SAGE_PROOF verdict=none sm=sm100 use=- version=2.2.0\nSAGE_MODE auto fail ValueError: Unsupported CUDA architecture: sm100\n")
+    r = _bash(base + 'base_build_sageattention; echo F=${#BASE_FAILED[@]}; printf "%s\\n" "${BASE_FAILED[@]}"', env=env)
+    assert "F=1" in r.stdout and "imports, but no mode runs on sm_100" in r.stdout, r.stdout + r.stderr
+    # a probe that prints nothing (it broke) is said to be unknown, never OK, and keeps nothing
+    assert json.loads((v / ".comfy-base-sage" / "sm_100.json").read_text())["mode"] == "disabled"
+    (v / ".comfy-base-sage" / "sm_100.proof").unlink(); (v / ".comfy-base-sage" / "sm_100.json").unlink(); pf.write_text("")
+    r = _bash(base + 'base_build_sageattention; echo F=${#BASE_FAILED[@]} W=${#BASE_WARN[@]}', env=env)
+    assert "the Sage proof gave no verdict" in r.stdout and "F=0 W=1" in r.stdout and "Sage: OK" not in r.stdout, r.stdout
+    assert not (v / ".comfy-base-sage" / "sm_100.proof").exists() and not (v / ".comfy-base-sage" / "sm_100.json").exists()
+
+
+def test_unit_the_sage_command_is_the_bases_and_hygiene_drops_the_flag_where_auto_fails(tmp_path):
+    """`bash <script> sage` was each package's import check, which said OK on the B200. It is the base's proof now; and
+    ComfyUI's --use-sage-attention calls the same sageattn() (caught, then PyTorch attention on every call)."""
+    src = (BASE / "lib" / "95-summary.sh").read_text()
+    assert 'sage)      shift; base_env_setup; base_discover quiet || true; base_sage_check "$@" && exit 0; exit $? ;;' in src
+    pkg = tmp_path / "pkg"; pkg.mkdir(); script = pkg / "p-script.sh"
+    script.write_text(f'PKG_COMMANDS=( "sage|pkg_cmd_sage|import only" "hello|pkg_hello|hi" )\npkg_cmd_sage(){{ echo "Sage: OK -> imports"; exit 0; }}\n'
+                      f'source "{BASE}/base.sh"\nbase_main "$@"\n')
+    r = subprocess.run(["bash", str(script), "help"], capture_output=True, text=True)
+    assert r.stdout.count(" sage ") == 1 and "hello" in r.stdout, r.stdout + r.stderr
+    c = tmp_path / "ComfyUI"; (c / "models").mkdir(parents=True); (c / "main.py").write_text("")
+    (tmp_path / "runpod-slim").mkdir(); (tmp_path / "runpod-slim" / "comfyui_args.txt").write_text("--use-sage-attention\n")
+    vb = c / ".venv-cu130" / "bin"; vb.mkdir(parents=True); pf = tmp_path / "proof.txt"; pf.write_text(B200_PROOF + "\n")
+    (vb / "python").write_text(f'#!/bin/bash\ncase "$*" in *sage_probe.py*) cat "{pf}";; *) exit 0;; esac\n'); (vb / "python").chmod(0o755)
+    env = {"BASE_FAKE_ROOT": str(tmp_path)}
+    r = _bash('base_env_setup; base_discover quiet; base_sage_proof; base_hygiene', env=env)
+    args = tmp_path / "comfy-base" / "state" / "comfyui_args.txt"
+    assert "--use-sage-attention" not in args.read_text() and "sageattn() fails on" in r.stdout, args.read_text() + r.stdout + r.stderr
+
+
+UPSTREAM_ARCH_TABLE = """    for capability in compute_capabilities:
+        if capability.startswith("9.0"):
+            HAS_SM90 = True
+            num = "90a"
+        elif capability.startswith("10.0"):
+            HAS_SM100 = True
+            num = "100a"
+        elif capability.startswith("12.0"):
+            HAS_SM120 = True
+            num = "120a"
+        else:
+            continue
+        NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
+"""
+
+
+def test_unit_a_b300_builds_the_qattn_kernels_as_sm_103a(tmp_path):
+    """Upstream's arch table (thu-ml/SageAttention main d1a57a5) has no 10.3: TORCH_CUDA_ARCH_LIST=10.3 fell to `continue`
+    and a B300 got no qattn kernel at all. 10.3 joins 10.0's row as sm_103a, once, and never over upstream's own row."""
+    f = tmp_path / "setup.py"; f.write_text(UPSTREAM_ARCH_TABLE)
+    _bash(f'_base_sage_patch_setup "{f}"; _base_sage_patch_setup "{f}"')
+    body = f.read_text()
+    assert body.count('startswith("10.3")') == 1 and 'num = "103a"' in body, body
+    ns = {"NVCC_FLAGS": [], "compute_capabilities": {"10.3"}, "HAS_SM90": False, "HAS_SM100": False, "HAS_SM120": False}
+    exec(textwrap.dedent(body), ns)
+    assert ns["HAS_SM100"] and ns["NVCC_FLAGS"] == ["-gencode", "arch=compute_103a,code=sm_103a"], ns["NVCC_FLAGS"]
+    ns = {"NVCC_FLAGS": [], "compute_capabilities": {"10.0"}, "HAS_SM90": False, "HAS_SM100": False, "HAS_SM120": False}
+    exec(textwrap.dedent(body), ns); assert ns["NVCC_FLAGS"] == ["-gencode", "arch=compute_100a,code=sm_100a"]
+    own = UPSTREAM_ARCH_TABLE.replace('        elif capability.startswith("12.0")', '        elif capability.startswith("10.3"):\n            num = "103f"\n        elif capability.startswith("12.0")')
+    f.write_text(own); _bash(f'_base_sage_patch_setup "{f}"'); assert f.read_text() == own
+    src = (BASE / "lib" / "40-packs.sh").read_text()
+    assert '_base_sage_patch_setup "$src/setup.py"' in src[src.index("_base_sage_install()"):src.index("base_consolidate()")]

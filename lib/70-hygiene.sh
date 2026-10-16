@@ -230,8 +230,12 @@ base_hygiene(){
   for name in ${HYGIENE_ARGS_REMOVE[@]+"${HYGIENE_ARGS_REMOVE[@]}"}; do _base_args_remove "$name" "removed by ${PKG_NAME:-the package}"; done
   # the template ships --use-sage-attention; with no sageattention in the venv ComfyUI dies at start (and some
   # models render noise with it). Keep it only when a package's hook installed the module into this venv.
+  # 3.7.5: and only when the last proof did not see sageattn() (the flag's own call) fail on this GPU: ComfyUI catches that
+  # error and falls back to PyTorch attention on every call, so the flag buys nothing there but an error per step.
   if [ -x "$PY" ] && "$PY" -c "import sageattention" >/dev/null 2>&1; then
-    if [ -f "$ARGS_FILE" ] && grep -q -- '--use-sage-attention' "$ARGS_FILE"; then ok "args: --use-sage-attention kept (sageattention imports in the venv)"; fi
+    local sv; sv="$(_base_sage_cached | sed -n 's/^SAGE_PROOF verdict=\([a-z]*\).*/\1/p')" || true
+    if [ "$sv" = "only" ] || [ "$sv" = "none" ]; then _base_args_remove --use-sage-attention "sageattn() fails on ${BASE_GPU_SM:-this GPU} (bash <script> sage)"
+    elif [ -f "$ARGS_FILE" ] && grep -q -- '--use-sage-attention' "$ARGS_FILE"; then ok "args: --use-sage-attention kept (sageattention imports in the venv)"; fi
   else _base_args_remove --use-sage-attention "sageattention is not importable in $VENV"; fi
   _base_manager_security
   if declare -F pkg_hygiene >/dev/null; then pkg_hygiene; fi
