@@ -65,6 +65,10 @@ class FakeRunPod:
         self.pod_override = {}                            # 3.7.4: what RunPod adds or changes on the created pod (volumeEncrypted)
         self.pod_drop = ()                                # 3.7.4: keys the created pod's answer leaves out
         self.rest = rest                                  # 3.9.0: (method, path, body) -> (code, body) | None, before the defaults
+        self.resets = 0                                   # 3.10.1: a PATCH resets the pod: lastStartedAt moves
+        self.move_port_on_reset = False                   # 3.10.1: and RunPod maps 22/tcp to a new port
+        self.stale_reads = 0                              # 3.10.1: reads that still answer with the pod as it was before the PATCH
+        self._stale = []
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -86,6 +90,8 @@ class FakeRunPod:
                 srv.last_auth = self._auth(); srv.last_ua = self.headers.get("User-Agent", "")
                 srv.gets.append(self.path)
                 path = self.path.split("?")[0]            # 3.7.3: every pod read carries includeMachine/includeNetworkVolume
+                if path == "/pods/" + srv.pod["id"] and srv._stale:
+                    return self._send(200, srv._stale.pop())
                 if srv.rest:
                     res = srv.rest("GET", path, None)
                     if res is not None:
@@ -102,9 +108,15 @@ class FakeRunPod:
                 n = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(n) or b"{}")
                 srv.patches.append(body)
+                old = json.loads(json.dumps(srv.pod))
                 srv.pod.update(body)
+                srv.resets += 1
+                srv.pod["lastStartedAt"] = "2026-10-16 09:00:%02d.000 +0000 UTC" % srv.resets
+                srv._stale = [old] * srv.stale_reads
                 if "ports" in body:                       # RunPod maps a newly exposed tcp port on the reset
                     srv.pod["portMappings"] = srv.mapping_when_running()
+                if srv.move_port_on_reset and (srv.pod.get("portMappings") or {}).get("22"):
+                    srv.pod["portMappings"] = {"22": 15270 + srv.resets}
                 if srv.on_patch:
                     srv.on_patch(body)
                 self._send(200, srv.pod)
@@ -428,7 +440,7 @@ def test_unit_podctl_ensure_patches_ports_key_and_start_command_in_that_order_an
         api = podctl.Api("k", base_url=fake.url)
         out = podctl.ensure(api, "fakepod0000001", pubkey=mac_key, ssh_config=cfg, bootstrap="BOOTSTRAP",
                             image_config=lambda ref: {"entrypoint": HM_CONFIG["Entrypoint"], "cmd": HM_CONFIG["Cmd"]},
-                            banner=lambda host, port: state["sshd"], sleep=lambda s: None, ssh_check=lambda: "pod-hostname")
+                            banner=lambda host, port: state["sshd"], sleep=lambda s: None, ssh_check=lambda: "pod-hostname", probe=lambda u: 200)
         assert [list(p) for p in fake.patches] == [["ports"], ["env"], ["dockerStartCmd"]]
         assert fake.patches[0]["ports"] == ["8188/http", "8888/http", "22/tcp"]
         assert fake.patches[1]["env"]["PUBLIC_KEY"] == mac_key and fake.patches[1]["env"]["some_api_token"] == "abc-secret"
@@ -441,7 +453,7 @@ def test_unit_podctl_ensure_patches_ports_key_and_start_command_in_that_order_an
         n = len(fake.patches)
         podctl.ensure(api, "fakepod0000001", pubkey=mac_key, ssh_config=cfg, bootstrap="BOOTSTRAP",
                       image_config=lambda ref: (_ for _ in ()).throw(AssertionError("not consulted when ssh answers")),
-                      banner=lambda host, port: True, sleep=lambda s: None, ssh_check=lambda: "pod-hostname")
+                      banner=lambda host, port: True, sleep=lambda s: None, ssh_check=lambda: "pod-hostname", probe=lambda u: 200)
         assert len(fake.patches) == n
     finally:
         fake.close()
@@ -464,7 +476,7 @@ def test_unit_podctl_ensure_installs_the_boot_override_even_when_sshd_already_an
         podctl.ensure(api, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg,
                       bootstrap="BOOTSTRAP",
                       image_config=lambda ref: {"entrypoint": HM_CONFIG["Entrypoint"], "cmd": HM_CONFIG["Cmd"]},
-                      banner=lambda h, p: True, sleep=lambda s: None, ssh_check=lambda: "pod-hostname")
+                      banner=lambda h, p: True, sleep=lambda s: None, ssh_check=lambda: "pod-hostname", probe=lambda u: 200)
         wrote = [q for q in fake.patches if "dockerStartCmd" in q or "dockerEntrypoint" in q]
         assert wrote, "sshd answering must not stop the base's boot being made PID 1"
         line = " ".join(wrote[-1].get("dockerStartCmd") or wrote[-1].get("dockerEntrypoint"))
@@ -485,14 +497,14 @@ def test_unit_podctl_ensure_refuses_an_unreadable_image_without_entry(tmp_path):
         def boom(ref): raise podctl.PodctlError("registry said no")
         with pytest.raises(podctl.PodctlError) as ei:
             podctl.ensure(api, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
-                          image_config=boom, banner=lambda h, p: False, sleep=lambda s: None, ssh_check=lambda: "x")
+                          image_config=boom, banner=lambda h, p: False, sleep=lambda s: None, ssh_check=lambda: "x", probe=lambda u: 200)
         assert "--entry" in str(ei.value) and "registry said no" in str(ei.value)
         assert fake.patches == []                    # nothing changed on a pod we cannot wrap
         # with --entry the operator supplies the image's own command and ensure proceeds
         state = {"sshd": False}
         fake.on_patch = lambda body: state.update(sshd=True) if "dockerStartCmd" in body else None
         podctl.ensure(api, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
-                      image_config=boom, entry=["/start_script.sh"], banner=lambda h, p: state["sshd"], sleep=lambda s: None, ssh_check=lambda: "x")
+                      image_config=boom, entry=["/start_script.sh"], banner=lambda h, p: state["sshd"], sleep=lambda s: None, ssh_check=lambda: "x", probe=lambda u: 200)
         assert fake.patches[-1]["dockerStartCmd"][2].endswith("; B; exec /start_script.sh")
     finally:
         fake.close()
@@ -1995,3 +2007,116 @@ def test_unit_install_keeps_a_private_pods_loopback_listen():
     assert podctl.install_run_env(a, {"env": {}}) == {} and podctl.install_run_env(a, None) == {}
     a = podctl.build_parser().parse_args(["install", "pod1", "--pkg", "x", "--env", "BASE_LISTEN=0.0.0.0"])
     assert podctl.install_run_env(a, pod) == {"BASE_LISTEN": "0.0.0.0"}
+
+
+# ---------------------------------------------------------------- 3.10.1: ensure and a fresh pod's resets
+
+def test_unit_ensure_waits_for_the_images_first_boot_and_follows_the_ssh_port_a_reset_moves(tmp_path):
+    """Two defects of 2026-10-16. (1) ensure reset a fresh pod in the middle of its image's first boot (runpod/comfyui
+    copies ComfyUI and its venv onto the volume then), leaving no venv: a crash loop, ssh never up. (2) After its own reset
+    the API still answered with the OLD pod for a while, so ensure polled the old ssh port (20424) while RunPod had moved
+    22/tcp (36944), and never finished. Now: no reset until the image's ComfyUI answers through the proxy; the reset is
+    followed by lastStartedAt; sshd is looked for on the port the pod has NOW, re-read on every try."""
+    podctl = _load()
+    fake = FakeRunPod(_pod(ports=["8188/http", "8888/http", "22/tcp"], portMappings={"22": 15270}, lastStartedAt="2026-10-16 08:59:00.000 +0000 UTC",
+                           imageName="runpod/comfyui:1.4.7-cuda13.0",
+                           env={"PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}))
+    fake.move_port_on_reset = True; fake.stale_reads = 3
+    cfg = tmp_path / "ssh_config"; cfg.write_text(SSH_CONFIG, encoding="utf-8")
+    clock = {"t": 1000.0}
+    answers = iter([502, 502, 502, 200])                     # the image's ComfyUI comes up on the fourth look
+    probed, knocked, said = [], [], []
+
+    def probe(url):
+        probed.append((url, len(fake.patches))); return next(answers)
+
+    def banner(h, p):
+        knocked.append(p); return p != 15270                  # the old port never answers again after the reset
+
+    def sleep(s):
+        clock["t"] += s
+    try:
+        api = podctl.Api("k", base_url=fake.url)
+        out = podctl.ensure(api, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
+                            image_config=lambda ref: {"entrypoint": [], "cmd": ["/start.sh"]}, banner=banner, sleep=sleep,
+                            ssh_check=lambda: "h", log=said.append, probe=probe, now=lambda: clock["t"])
+    finally:
+        fake.close()
+    assert [u for u, _ in probed] == ["https://fakepod0000001-8188.proxy.runpod.net/"] * 4 and all(n == 0 for _, n in probed), probed
+    assert len(fake.patches) == 1 and "dockerStartCmd" in fake.patches[0]
+    assert "Port 15271" in cfg.read_text() and "15271" in out, (cfg.read_text(), out)
+    assert any("still in its first boot" in s for s in said) and any("first boot is done" in s for s in said), said
+    # a pod the base's boot already owns is never held for a first boot; an image that never answers is waited for, then reset
+    fake2 = FakeRunPod(_pod(ports=["8188/http", "22/tcp"], portMappings={"22": 15270}, imageName="runpod/comfyui:1.4.7-cuda13.0",
+                            env={"PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}))
+    try:
+        api2 = podctl.Api("k", base_url=fake2.url); said2 = []; clock["t"] = 0.0
+        podctl.ensure(api2, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
+                      image_config=lambda ref: {"entrypoint": [], "cmd": ["/start.sh"]}, banner=lambda h, p: True, sleep=sleep,
+                      ssh_check=lambda: "h", log=said2.append, probe=lambda u: None, now=lambda: clock["t"])
+        assert any("has not finished after 900 s" in s for s in said2) and len(fake2.patches) == 1, said2
+        n = len(fake2.patches)
+        podctl.ensure(api2, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
+                      image_config=lambda ref: {"entrypoint": [], "cmd": ["/start.sh"]}, banner=lambda h, p: True, sleep=sleep,
+                      ssh_check=lambda: "h", probe=lambda u: (_ for _ in ()).throw(AssertionError("asked again")), now=lambda: clock["t"])
+        assert len(fake2.patches) == n
+    finally:
+        fake2.close()
+    # an image without ComfyUI of its own (runpod/base) is never asked on 8188: three minutes after it started will do
+    base_img = {"ports": ["8188/http", "22/tcp"], "imageName": "runpod/base:1.4.0-cuda1300-ubuntu2404", "lastStartedAt": "2026-10-16 09:00:00 +0000 UTC"}
+    t = lambda hms: (lambda: podctl._runpod.started_at({"lastStartedAt": "2026-10-16 %s +0000 UTC" % hms}))
+    assert podctl._runpod.first_boot_done(base_img, lambda u: (_ for _ in ()).throw(AssertionError("asked")), t("09:03:00")) is True
+    assert podctl._runpod.first_boot_done(base_img, None, t("09:01:00")) is False
+    # no 8188/http: three minutes after the pod started is its first boot done
+    assert podctl._runpod.first_boot_done({"ports": ["22/tcp"], "lastStartedAt": "2026-10-16 09:00:00.000 +0000 UTC"}, None,
+                                          lambda: podctl._runpod.started_at({"lastStartedAt": "2026-10-16 09:02:59.000 +0000 UTC"})) is False
+    assert podctl._runpod.first_boot_done({"ports": ["22/tcp"], "lastStartedAt": "2026-10-16 09:00:00 +0000 UTC"}, None,
+                                          lambda: podctl._runpod.started_at({"lastStartedAt": "2026-10-16 09:03:00.000 +0000 UTC"})) is True
+    assert podctl._runpod.first_boot_done({"ports": ["22/tcp"]}, None, lambda: 0) is True
+
+
+def test_unit_install_says_a_package_folder_must_be_named_after_its_package(tmp_path):
+    """2026-10-16: a package copied into a folder called `vr` stopped on "vr has no zip (vr-runpod.zip): build it first",
+    a zip that cannot exist under that name. The STOP now says what is wrong and the name the folder must have."""
+    import types
+    podctl = _load()
+    d = tmp_path / "vr"; d.mkdir(); (d / "video-replacer-minimax-h3-script.sh").write_text("PKG_NAME=x\n")
+    said = []
+    assert podctl.install("pod1", [d], types.SimpleNamespace(say=said.append), every=1, timeout=5) == 1
+    assert said == ["STOP: the folder vr is not named after its package: a package folder's name is its package's name, the stem "
+                    "of <name>-script.sh and of its zip, and vr has no vr-script.sh (it holds video-replacer-minimax-h3-script.sh: "
+                    "rename the folder to video-replacer-minimax-h3)"], said
+    e = tmp_path / "empty"; e.mkdir(); said.clear()
+    assert podctl.install("pod1", [e], types.SimpleNamespace(say=said.append)) == 1 and said[0].endswith("empty has no empty-script.sh"), said
+
+
+def test_unit_create_offers_only_data_centres_a_pod_and_its_volume_can_be_made_in(tmp_path, capsys):
+    """Two create defects install-speed hit on 2026-10-16, both before billing. (1) The stock view names data centres
+    REST v1 POST /pods refuses with a schema 400 (PodCreateInput.dataCenterIds' enum has 30 ids and lacks US-NE-1, a B200
+    location). (2) It picked a data centre that takes no network volume (POST /networkvolumes: 500 "does not support
+    network volumes"). Now the candidates are the ones in the live enum, and with a network volume those whose
+    storageSupport is true; each one left out is named, and the next one is used."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    b200 = [{"gpuTypeId": "NVIDIA B200", "stockStatus": "High", "available": True}]
+    gql = {"dataCenters": [{"id": "US-NE-1", "storageSupport": True, "gpuAvailability": b200},
+                           {"id": "US-NC-1", "storageSupport": False, "gpuAvailability": b200},
+                           {"id": "EU-RO-1", "storageSupport": True, "gpuAvailability": b200}]}
+    schema = {"components": {"schemas": {"PodCreateInput": {"properties": {"dataCenterIds": {"type": "array", "items": {
+        "type": "string", "enum": ["EU-RO-1", "US-NC-1", "US-CA-2"]}}}}}}}
+    srv = FakeRunPod(_pod(), gql=gql, rest=lambda m, p, b: (200, schema) if (m, p) == ("GET", "/openapi.json") else None)
+    try:
+        assert _create(podctl, srv, pub, "--data-gb", "100") in (None, 0)
+        out = capsys.readouterr().out
+        assert "free now in: EU-RO-1" in out and [b for p, b in srv.bodies if p == "/pods"][-1]["dataCenterIds"] == ["EU-RO-1"]
+        assert "also free in US-NE-1, left out: RunPod's create API does not take this data centre" in out
+        assert "also free in US-NC-1, left out: no network volumes here" in out, out
+        assert [b for p, b in srv.bodies if p == "/networkvolumes"][-1]["dataCenterId"] == "EU-RO-1"
+        # a private pod wants no network volume: US-NC-1 is fine for it, US-NE-1 still is not
+        assert _create(podctl, srv, pub, "--data-gb", "100", "--private") in (None, 0)
+        assert [b for p, b in srv.bodies if p == "/pods"][-1]["dataCenterIds"] == ["US-NC-1"]
+        assert srv.gets.count("/openapi.json") == 1                          # read once per run
+    finally:
+        srv.close()
+    # an unreadable schema falls back to the list read on 2026-10-16
+    assert "US-NE-1" not in podctl._runpod.CREATE_DCS and len(podctl._runpod.CREATE_DCS) == 30 and "EU-RO-1" in podctl._runpod.CREATE_DCS

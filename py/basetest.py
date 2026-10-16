@@ -379,7 +379,10 @@ def boot_fake_pod(root, bin_, extra_env=None):
     for k in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD"):
         env.pop(k, None)
     env.update(extra_env or {})
-    r = subprocess.run(["bash", str(root / "comfy-base" / "boot.sh")], capture_output=True, text=True, env=env, timeout=120)
+    try:
+        r = subprocess.run(["bash", str(root / "comfy-base" / "boot.sh")], capture_output=True, text=True, env=env, timeout=120)
+    finally:                                     # 3.10.1: a forwarder the boot started outlives BOOT_ONCE; never leave it listening
+        subprocess.run(["pkill", "-f", "app_proxy\\.py --state %s/comfy-base/state" % root], capture_output=True)
     logs = sorted((root / "comfy-base" / "state" / "logs").glob("boot_*.log"))
     return r, (logs[-1].read_text() if logs else "")
 
