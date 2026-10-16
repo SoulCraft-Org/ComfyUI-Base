@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.7.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.7.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -367,7 +367,8 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   and refreshes its dropdowns as files land). Every other run ignores the list, and treats a stand-in it meets as
   absent.
 - The workflow beside the script must carry `extra.<WF_VERSION_KEY> == PKG_VERSION`; the run refuses a mismatch.
-- Helpers a hook may use: `ok miss err note warn hdr would todo`, `base_mkdir`, `base_run` (dry-run aware),
+- Helpers a hook may use: `ok miss err note warn hdr would todo`, `base_mkdir`, `base_run <cmd> <args>…` (dry-run aware: runs the command, or prints it under `--check`; 3.7.2: the
+  install pipeline is `base_install`, so a hook that calls `base_run` no longer re-enters the whole install),
   `_base_yaml_register <section> <key> <path>`, `base_build_sageattention` (SageAttention 2 from source for this GPU's sm,
   dry-run aware; `SAGE_REF` names a branch or tag, default main; rebuilt whenever its full cache key moves; 2.0.22, 3.0.0), `$COMFY $CN $M $VENV $PY $PKG_DIR $BASE_STATE`.
   A hook that changed something the running server must reload appends its reason to `PKG_RESTART_WHY` (an array);
@@ -587,6 +588,14 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.7.2: no shell function is defined twice. `base.sh` sources `lib/[0-9][0-9]-*.sh` in order into one shell, so a name
+  defined in two files is silently the later one: 00-env's §4 hook helper `base_run` was shadowed by 95-summary's
+  install pipeline of the same name, and a hook that called it (`base_run cp …`, as §4 says) re-entered the whole
+  install without end. The pipeline is now `base_install`; `base_run` is the dry-run aware helper §4 always described,
+  so a hook written to the handbook is correct as written. 30-venv's one-line `_base_all_reqfiles`, always replaced
+  by 40-packs's full one, is gone. The unit tier now fails on any name defined twice in one shell (`base.sh` + the
+  numbered lib files; `boot.sh` alone), and checks that `base_run` runs its command, or prints it under `--check`,
+  after the whole library is sourced. Exercised on this Mac (unit tier and `verify.sh`); not on a pod.
 - 3.7.1: the testbed's Python is the newest torch ships for. uv listed CPython 3.15 on 2026-10-15 before torch had a
   cp315 wheel, and `testbed.sh --server` took the newest listed minor and died in the torch install ("No solution
   found"). The minors are now tried newest first and the first one the torch family resolves on wins (a cached

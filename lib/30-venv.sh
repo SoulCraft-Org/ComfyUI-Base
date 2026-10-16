@@ -19,9 +19,8 @@ _base_dir_bytes(){ # <dir> → its size in bytes. 3.5.0: remembered by path and 
 }
 _base_pip(){ "$PY" -m pip "$@"; }      # never bare pip: pip on PATH belongs to whatever interpreter start.sh did not use
 _base_uvpip(){ uv pip install --python "$PY" "$@"; }   # uv is faster and hardlinks out of a same-filesystem cache; the interpreter is named, never inferred
-# Every requirements file the venv must satisfy. 40-packs.sh replaces this with the full list (ComfyUI,
-# baked packs, this package's packs, every ledger-installed package's packs); the stub keeps 30 self-contained.
-_base_all_reqfiles(){ if [ -f "$COMFY/requirements.txt" ]; then echo "$COMFY/requirements.txt"; fi; }
+# Every requirements file the venv must satisfy is _base_all_reqfiles, in 40-packs.sh (3.7.2: the one-line fallback that
+# stood here was always replaced by it, since base.sh sources every lib/ file before any stage runs).
 
 _base_bootstrap_venv(){ # $BASE_HOME/tools-bootstrap, made with the system python's own venv module, only to fetch uv from PyPI.
   # The system interpreter is never written to (PEP 668 refuses that on Ubuntu 24.04 images, and it is container disk

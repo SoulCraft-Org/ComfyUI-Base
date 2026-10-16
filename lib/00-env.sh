@@ -56,7 +56,7 @@
 #                        with none, every machine keeps its own library on its own volume, as before 2.4.0.
 # BASE_NO_SUITE=1        2.1.0: the package's suite does not run at the end of the install (a baked image's first boot:
 #                        the suite ran when the image was built; a customer's first boot is not the place for pytest)
-# BASE_SEED=1            2.1.0: a baked image's seed build (a brand's image generator): toolchain and packs only; base_run
+# BASE_SEED=1            2.1.0: a baked image's seed build (a brand's image generator): toolchain and packs only; base_install
 #                        stops after the ledger (no models, no restart, no smoke, no suite). SAGE_ARCHS="9.0;12.0" builds
 #                        SageAttention for those architectures with no GPU present.
 # BASE_RUNTIME=<manifest>  3.1.0: a BUYER's machine (Paul, 2026-09-25). The install runs from the proven runtime that
@@ -202,7 +202,7 @@ _base_fs_is_pool(){
   return 1
 }
 base_mkdir(){ if [ "$BASE_DRY" = "1" ]; then would "mkdir -p $*"; else mkdir -p "$@"; fi; }
-base_run(){ if [ "$BASE_DRY" = "1" ]; then would "$*"; else "$@"; fi; }   # a dry-run aware command for hooks
+base_run(){ if [ "$BASE_DRY" = "1" ]; then would "$*"; else "$@"; fi; }   # a dry-run aware command for hooks (handbook §4); the pipeline is base_install (3.7.2)
 
 # ---------------------------------------------------------------- prompts (exactly two in a normal run: tokens, deletion)
 _base_confirm(){ # _base_confirm "<question>" → 0 = yes.  Default N; BASE_YES=1 → yes; no TTY → No.

@@ -85,6 +85,37 @@ def test_unit_sourcing_defines_the_contract_helpers():
     assert "v=" in r.stdout
 
 
+_FN_DEF = re.compile(r"(?:^\s*|[;&|({]\s*|\b(?:then|else|do)\s+)(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{")
+
+
+def test_unit_no_function_is_defined_twice_in_one_shell():
+    """3.7.2: base.sh sources lib/[0-9][0-9]-*.sh in order into ONE shell, so a name defined in two files is silently the
+    later one. 00-env's hook helper base_run was shadowed by 95-summary's install pipeline of the same name, and a hook
+    that called the helper re-entered the whole install without end. boot.sh is its own shell and is checked alone."""
+    shells = {"base.sh + lib/[0-9][0-9]-*.sh": [BASE / "base.sh", *sorted((BASE / "lib").glob("[0-9][0-9]-*.sh"))],
+              "lib/boot.sh": [BASE / "lib" / "boot.sh"]}
+    for shell, files in shells.items():
+        where = {}
+        for p in files:
+            for i, ln in enumerate(_src(p).splitlines(), 1):   # not code_only(): it drops lines, and the message names lines
+                if ln.lstrip().startswith("#"):
+                    continue
+                for m in _FN_DEF.finditer(re.sub(r"\s{2,}#.*$", "", ln)):
+                    where.setdefault(m.group(1), []).append("%s:%d" % (p.name, i))
+        twice = {f: w for f, w in where.items() if len(w) > 1}
+        assert len(where) >= 5, "%s: the definition pattern found only %d functions; it has stopped matching" % (shell, len(where))
+        assert not twice, "%s defines these names more than once (the later file wins): %s" % (shell, twice)
+
+
+def test_unit_base_run_is_the_hook_helper_after_the_whole_library_is_sourced():
+    """3.7.2: the §4 hook helper survives every lib/ file being sourced: it runs its command, or under --check prints it."""
+    r = _bash('declare -F base_install >/dev/null || { echo "no base_install"; exit 1; }; '
+              'case "$(declare -f base_run)" in *base_init*) echo "base_run is the pipeline"; exit 1 ;; esac; '
+              'base_run echo ran-it; BASE_DRY=1 base_run echo skipped-it')
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ran-it" in r.stdout and "would echo skipped-it" in r.stdout, r.stdout + r.stderr
+
+
 def test_unit_every_trap_has_a_handler():
     src = code_only("\n".join(_src(p) for p in LIB))
     found = 0
@@ -2341,7 +2372,7 @@ def test_unit_latest_is_a_plain_run_and_nothing_is_left_to_settle():
     """3.0.0: every run takes everything to its newest, so `--latest` is the same as a plain run and there is no "off its
     pins" warning to settle any more: the packs are always at their HEAD and their records are printed every run."""
     src = code_only((BASE / "lib" / "95-summary.sh").read_text())
-    assert "--latest)  base_run" in src and "_base_warn_settle" not in src and "BASE_LATEST=1" not in src
+    assert "--latest)  base_install" in src and "_base_warn_settle" not in src and "BASE_LATEST=1" not in src
     assert "BASE_LATEST" not in code_only((BASE / "lib" / "40-packs.sh").read_text())
 
 
@@ -2767,7 +2798,7 @@ def test_unit_the_mcp_stage_is_optional_and_never_fails_a_run():
 def test_unit_the_mcp_stage_runs_after_the_packs_and_before_the_import_check():
     """The venv and the packs have to exist; the models do not, and MCP needs none of them."""
     src = (BASE / "lib" / "95-summary.sh").read_text()
-    run = src[src.index("base_run(){"):]
+    run = src[src.index("base_install(){"):]
     run = run[:run.index("\n}")]
     assert "base_mcp" in run, "base_mcp is never called"
     assert run.index("base_packs pip") < run.index("base_mcp") < run.index("base_venv_latest") < run.index("base_import_check"), run

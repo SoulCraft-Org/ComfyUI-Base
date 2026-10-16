@@ -1,4 +1,4 @@
-# 95-summary.sh — the pipeline (base_run), the dispatcher (base_main), the suite runner (base_test), the summary,
+# 95-summary.sh — the pipeline (base_install), the dispatcher (base_main), the suite runner (base_test), the summary,
 # and base_cli for `bash base.sh <command>`.
 
 _base_base_min_gate(){ # a package written against a newer base than this one is refused, both versions named
@@ -67,7 +67,7 @@ base_require_workflow(){ # the workflow beside the script must carry this script
   ok "workflow $WF_NAME (extra.$key = $have)"
 }
 
-base_run(){ # the install, in the order the spec fixes; hooks run where a package declares them
+base_install(){ # the install, in the order the spec fixes; hooks run where a package declares them
   base_init
   # 3.0.0: the OS and the NVIDIA driver at their newest FIRST: they are the machine's, not the store's, so this runs
   # before the store's lock, and before the driver gate so an upgrade can lift a driver below DRIVER_MIN. A new driver
@@ -364,10 +364,10 @@ base_main(){ # the six forms every package shares, plus the package's own PKG_CO
   if [ "${BASE_DECLARE_ONLY:-0}" = "1" ]; then _base_declare_dump; return $?; fi
   _base_install_traps
   case "${1:-}" in
-    "")        base_run ;;
-    --check)   BASE_DRY=1; base_run ;;
+    "")        base_install ;;
+    --check)   BASE_DRY=1; base_install ;;
     preflight) base_preflight ;;        # 3.2.0: podctl's pre-pass, in seconds: only what would stop the real run first
-    --latest)  base_run ;;             # 3.0.0: every run takes everything to its newest; kept so older callers still work
+    --latest)  base_install ;;             # 3.0.0: every run takes everything to its newest; kept so older callers still work
     test)      shift; base_env_setup; base_discover quiet || true; _base_use_testbed; base_test "${1:-}"; exit "$BASE_TEST_RC" ;;
     rescue)    base_env_setup; _base_logging; if ! base_discover; then exit 3; fi; base_rescue; exit "${BASE_RESCUE_RC:-0}" ;;
     help|-h|--help) base_help ;;

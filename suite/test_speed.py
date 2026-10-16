@@ -206,9 +206,9 @@ def test_unit_files_a_hook_adds_to_an_own_pack_survive_a_run_where_the_pack_did_
 
 def test_unit_own_packs_are_mirrored_before_the_hooks_that_may_add_to_them():
     # the order that keeps a hook's additions: mirror (which empties a changed pack) first, then pkg_pre_models and
-    # pkg_post_models, which may write into the pack again. Both branches of base_run (runtime and normal).
+    # pkg_post_models, which may write into the pack again. Both branches of base_install (runtime and normal).
     body = (BASE / "lib" / "95-summary.sh").read_text(encoding="utf-8")
-    run = body[body.index("base_run(){"):body.index("_base_use_testbed(){")]
+    run = body[body.index("base_install(){"):body.index("_base_use_testbed(){")]
     mirrors = [i for i in range(len(run)) if run.startswith("base_own_packs ||", i)]
     assert len(mirrors) == 2, mirrors
     assert max(mirrors) < run.index("_base_hook pkg_pre_models") < run.index("_base_hook pkg_post_models")
