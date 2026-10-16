@@ -148,3 +148,15 @@ def test_unit_objinfo_leaves_input_files_and_self_validated_inputs_to_the_node(t
     pkg = tmp_path / "pkg"; (pkg / "_build").mkdir(parents=True)
     (pkg / "_build" / "objinfo-self-validated.txt").write_text("# the node's VALIDATE_INPUTS\nAttn.attention   # CPU lists pytorch only\n")
     assert oi.self_validated(pkg) == {"Attn.attention"}
+
+
+def test_unit_the_testbed_takes_cpu_torch_on_linux_and_leaves_the_pod_alone():
+    """3.18.2 (error log row 108): on Linux PyPI's torch is the CUDA build, a 7 GB venv every CI gate downloaded again;
+    the testbed never sees a GPU. The CPU index on Linux only, set before the torch install, and never in the pod's venv."""
+    tb = BASE / "testbed.sh"
+    if not tb.exists():
+        pytest.skip("no testbed.sh (not a repo checkout)")
+    src = tb.read_text()
+    i = src.index('if [ "$(uname -s)" = Linux ]; then export UV_TORCH_BACKEND=cpu; fi')
+    assert i < src.index("torch torchvision torchaudio >/dev/null"), "the backend must be set before the torch install"
+    assert "UV_TORCH_BACKEND=cpu" not in (BASE / "lib" / "30-venv.sh").read_text(), "the pod's venv picks its own backend"
