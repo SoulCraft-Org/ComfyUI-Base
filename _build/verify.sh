@@ -72,7 +72,7 @@ for d in "${items[@]}"; do
     if [ "$d" = "$BASE" ]; then ( cd "$BASE" && bash base.sh test ) > /tmp/verify-$$.log 2>&1
     else ( cd "$d" && COMFY_BASE="$BASE" bash "$name-script.sh" test ) > /tmp/verify-$$.log 2>&1; fi
     s=$?; echo "  suite $(grep -E 'passed|failed' /tmp/verify-$$.log | tail -1 | sed 's/^ *//')"
-    [ $s -eq 0 ] || { echo "  FROM THE REPO: FAILED, the failing test(s):"; grep -E "_{5,} test_|^E " /tmp/verify-$$.log | head -12 | sed 's/^/    /'; rc=1; }
+    [ $s -eq 0 ] || { echo "  FROM THE REPO: FAILED, the failing test(s):"; grep -E -A2 "_{5,} (ERROR at [a-z]+ of )?test_|^E " /tmp/verify-$$.log | grep -v '^--$' | head -16 | sed 's/^/    /'; rc=1; }   # an ERROR (setup/teardown) is named too
   fi
   # 3. from the zip — exactly what the pod and podctl's gate run
   if [ "$nosuite" = 1 ]; then
@@ -86,7 +86,7 @@ for d in "${items[@]}"; do
         && ( cd "$t/$name" && COMFY_BASE="$BASE" bash "$name-script.sh" test ) > /tmp/verifyz-$$.log 2>&1
     fi
     z=$?; echo "  zip   $(grep -E 'passed|failed' /tmp/verifyz-$$.log | tail -1 | sed 's/^ *//')"
-    [ $z -eq 0 ] || { echo "  FROM THE ZIP: FAILED, this is what the pod would have said"; sed -n '/FAILURES/,$p' /tmp/verifyz-$$.log | head -20; rc=1; }
+    [ $z -eq 0 ] || { echo "  FROM THE ZIP: FAILED, this is what the pod would have said"; awk '/= (ERRORS|FAILURES) =/{p=1} p' /tmp/verifyz-$$.log | head -24; rc=1; }   # errors (setup/teardown) too
     rm -rf "$t"
   fi
 done

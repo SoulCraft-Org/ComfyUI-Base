@@ -99,11 +99,18 @@ _base_run_warm_bg(){ # the volume's venv, uv Python and code read 64 files at a 
 }
 _base_run_prewarm(){ # 3.15.0: a head start, in the background, beside other work: the copy (or, without one, the warm read).
   # The boot calls it before sshd and JupyterLab; an install calls it once its venv is final. The start that follows
-  # waits for it on the copy's lock and finds it current, or walks again only what changed meanwhile.
-  [ "$(_base_run_mode)" != off ] || { _base_run_warm_bg; return 0; }
+  # waits for it on the copy's lock and finds it current, or walks again only what changed meanwhile. ONE process
+  # (run_local.py prewarm), never a forked shell: a bash subshell shows its parent's whole command line to ps.
+  local mode tool lib="${BASE_DIR:-${BOOT_HOME:-}}/py/run_local.py" st log
+  mode="$(_base_run_mode)"
+  [ "$mode" != off ] || { _base_run_warm_bg; return 0; }
   [ -n "${COMFY:-}" ] && [ -n "${VENV:-}" ] || return 0
-  local st log; st="$(_base_run_state)"; log="${st:-/tmp}/logs/run-local.log"; mkdir -p "$(dirname "$log")" 2>/dev/null || true
-  ( echo "$(date -u +%H:%M:%S) head start"; _base_run_here; echo "$(date -u +%H:%M:%S) head start done: ${BASE_RUN_VERDICT:-?}" ) >> "$log" 2>&1 &
+  [ -f "$lib" ] && tool="$(_base_run_tool_py)" || return 0
+  st="$(_base_run_state)"; log="${st:-/tmp}/logs/run-local.log"; mkdir -p "$(dirname "$log")" 2>/dev/null || true
+  nohup "$tool" "$lib" prewarm --root "$(_base_run_root)" --tree "$COMFY" --venv "$VENV" --state "$st" \
+    --python-root "${BASE_HOME:+$BASE_HOME/python}" --jobs "${BASE_RUN_JOBS:-32}" --check-import "${BASE_RUN_CHECK:-torch}" \
+    --warm-jobs "${BASE_WARM_JOBS:-64}" $([ "$mode" = auto ] && echo --auto) >> "$log" 2>&1 &
+  BASE_RUN_PREWARM_PID=$!
   echo "  ComfyUI's code: copying to this machine's disk in the background (pid $!, $log)"
 }
 _base_run_status(){ # one line for `base.sh status`

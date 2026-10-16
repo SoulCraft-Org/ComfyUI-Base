@@ -6,6 +6,9 @@
     run_local.py warm --tree COMFY --venv VENV [--python-root P] [--jobs N] [--big BYTES] [--auto]
                                       read every file the copy would hold, in parallel, so the volume's own page cache
                                       has it: what a start from the VOLUME (no copy) imports then reads from memory
+    run_local.py prewarm <sync's arguments> [--warm-jobs N]
+                                      sync, then the warm read when no copy came of it (no room, an error): the head
+                                      start the boot and an install run in the background, as ONE process
     run_local.py fstype <path>        the filesystem type of the mount holding <path> (/proc/self/mountinfo)
     run_local.py status --root R      the current generation and its numbers
 
@@ -56,7 +59,11 @@ def say(msg):
     print("  " + msg, flush=True)
 
 
+LAST = {"verdict": ""}
+
+
 def verdict(v, tree="-", py="-", secs=0.0, why=""):
+    LAST["verdict"] = v
     print("RUN_LOCAL %s %s %s %.1f%s" % (v, tree, py, secs, (" " + why) if why else ""), flush=True)
 
 
@@ -541,6 +548,20 @@ def warm(a):
     return 0
 
 
+def prewarm(a):
+    """One process, so a background head start is never a forked shell carrying its parent's command line (a bash
+    subshell shows its parent's argv to ps, and the suite's guard against a stray forwarder matched one in CI)."""
+    print("%s head start" % time.strftime("%H:%M:%S"), flush=True)
+    sync(a)
+    v = LAST["verdict"]
+    if v not in ("fresh", "synced", "skip"):                         # skip: the volume is a local disk, nothing to warm
+        a.jobs = a.warm_jobs
+        a.auto = True
+        warm(a)
+    print("%s head start done: %s" % (time.strftime("%H:%M:%S"), v or "?"), flush=True)
+    return 0
+
+
 def status(a):
     cur = current(a.root)
     if not cur:
@@ -553,10 +574,7 @@ def status(a):
     return 0
 
 
-def main(argv):
-    ap = argparse.ArgumentParser(prog="run_local.py")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("sync")
+def _sync_args(s):
     s.add_argument("--root", required=True)
     s.add_argument("--tree", required=True)
     s.add_argument("--venv", required=True)
@@ -567,6 +585,16 @@ def main(argv):
     s.add_argument("--headroom", type=int, default=4 << 30)
     s.add_argument("--auto", action="store_true")
     s.add_argument("--check-import", default="torch")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="run_local.py")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("sync")
+    pw = sub.add_parser("prewarm")
+    pw.add_argument("--warm-jobs", type=int, default=64)
+    for p_ in (s, pw):
+        _sync_args(p_)
     w = sub.add_parser("warm")
     w.add_argument("--tree", required=True)
     w.add_argument("--venv", required=True)
@@ -586,6 +614,8 @@ def main(argv):
         return status(a)
     if a.cmd == "warm":
         return warm(a)
+    if a.cmd == "prewarm":
+        return prewarm(a)
     return sync(a)
 
 

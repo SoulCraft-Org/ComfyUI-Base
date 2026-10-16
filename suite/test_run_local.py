@@ -309,6 +309,21 @@ def test_unit_the_head_start_copies_in_the_background_and_the_start_after_finds_
     assert "head start done: synced" in (state / "logs" / "run-local.log").read_text()
 
 
+def test_unit_every_background_start_is_one_process_never_a_forked_shell():
+    """CI, 2026-10-16: a head start run as `( ... ) &` is a forked bash, and a forked bash shows its parent's whole command
+    line to ps; in a test whose own command line named app_proxy.py and the temp tree, the suite's guard against a stray
+    forwarder saw it and errored the test. Every background start here is `nohup <python> run_local.py ... &`."""
+    src = (BASE / "lib" / "84-run-local.sh").read_text()
+    for fn in ("_base_run_prewarm(){", "_base_run_warm_bg(){"):
+        body = src[src.index(fn):]; body = body[:body.index("\n}\n")]
+        assert ") &" not in body and ")&" not in body, fn
+        assert 'nohup "$tool" "$lib" ' in body, fn
+    assert 'nohup "$tool" "$lib" prewarm ' in src[src.index("_base_run_prewarm(){"):]
+    boot = (BASE / "lib" / "boot.sh").read_text()
+    pw = boot[boot.index("boot_prewarm(){"):]; pw = pw[:pw.index("\n}\n")]
+    assert ") &" not in pw                                      # the boot's own subshell is in the foreground and returns at once
+
+
 def test_unit_the_boot_starts_the_copy_before_sshd_and_jupyterlab():
     src = (BASE / "lib" / "boot.sh").read_text()
     seq = src[src.index("  boot_tcmalloc\n"):src.index("  boot_apps\n", src.index("  boot_tcmalloc\n"))]

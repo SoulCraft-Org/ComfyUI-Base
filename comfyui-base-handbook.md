@@ -797,7 +797,10 @@ for any invocation that somehow arrives without the environment. The suite asser
   judge against a fake server) and its CI. NOT YET RUN ON A POD: RunPod had no credit on 2026-10-16, so the copy, the
   head start and the deferred import check are proven against fakes and real local venvs only, and the before/after
   timings on a network volume follow as soon as there is credit. What keeps that safe: a copy that fails, or a disk too
-  small for it, starts ComfyUI from the volume exactly as before.
+  small for it, starts ComfyUI from the volume exactly as before. Every background start (the head start, the warm read)
+  is one exec'd `run_local.py` process, never a forked shell, which would show its parent's command line to `ps` (CI
+  caught one through 3.10.1's stray-forwarder guard). And `_build/verify.sh` now names a test that ERRORS (setup or
+  teardown), not only one that fails: that CI run said "1 error" and named nothing.
 
 - 3.14.0: delight first, then secure, then private (Paul, 2026-10-16). `podctl create` on RunPod is PUBLIC by default
   again, with ComfyUI, the Jupyter Terminal and each app named in the Connect tab; `--private` is the opt-in (3.8.1's
