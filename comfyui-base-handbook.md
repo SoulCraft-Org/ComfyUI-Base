@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.6.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.6.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -339,9 +339,16 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`, and `pkg_cmd_<name>` per
   `PKG_COMMANDS` row `name|function|help`. A failing hook fails the run. A package whose `pkg_post_venv` compiles
   something (SageAttention) is listed for re-run after any venv rebuild.
-- `PACKS` rows: `dir|url|sha|cnr_id|why`: `sha` is 40 hex, the last-tested record (every run takes the pack to its
-  remote's HEAD); a base pack may not be redeclared; two packages naming one pack from two URLs is an error naming
-  both, and two different records for one pack is a note.
+- `PACKS` rows: `dir|url|sha|cnr_id|why[|branch]`: `sha` is 40 hex, the last-tested record (every run takes the pack to
+  its remote's HEAD); `why` is free text without a `|`; a base pack may not be redeclared; two packages naming one pack
+  from two URLs (or two branches) is an error naming both, and two different records for one pack is a note.
+  `branch` (3.6.1, optional, last so every five-field reader is unchanged) names the branch to track when the remote's
+  HEAD is the wrong one: rgthree publishes a 2023 `dev` as HEAD while its work is on `main`, so its base row ends in
+  `|main`. A row with a branch is cloned at that branch, an existing checkout on any other branch (a pod cloned from the
+  stale HEAD, shallow or not) moves to it and is wired to track it, the fast path asks that branch's tip, and the
+  testbed fetches it; never backwards, edits stashed, exactly as for HEAD. It is a branch, never a pin: a commit, a
+  name with spaces (the tail of a `why` that held a `|`) or a seventh field is refused when the tables are validated.
+  Leave it off unless the remote's HEAD is genuinely stale.
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
   fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
@@ -575,6 +582,23 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.6.1: a pack row may name the branch to track. rgthree/rgthree-comfy's GitHub default branch now points at a stale
+  `dev` (5f940dd, 2023-11-20) while its work is on `main` (2026-10-15 finding, exporting the Video Replacer). Every
+  install follows the remote's HEAD, so a fresh pod or testbed got 2023 rgthree, which does not import on ComfyUI
+  v0.41.x (`execution` has no `recursive_output_delete_if_changed`) and has no Fast Groups Bypasser: every package
+  using rgthree broke. An optional sixth field, `dir|url|sha|cnr_id|why|branch`, names the branch instead (the
+  `url#branch` form was rejected: the consumer's comfybuild reads `url` as a GitHub repository and dockerize compares
+  it as one). The rgthree base row tracks `main`. `_base_pack_sync` widens a single-branch clone's refspec to the branch
+  and moves a checkout on another branch across; `py/pack_heads.py` answers `url#branch` keys with that branch's tip;
+  the clone, the dry-run plan, the printed records (podctl writes the row back whole), `base.sh latest`, `list-packs`
+  (now `dir|url|sha|branch`) and `testbed.sh` (new `--packs`: the node packs alone) honour it. Unit tests run against
+  local remotes whose HEAD is a stale `dev`; the install tier runs it through `base_main`. Not yet run on a pod.
+  Also, because the gate was red on 3.6.0 the same day: uv started listing CPython 3.15 before torch had a cp315 wheel,
+  and with nothing else to resolve against `_base_python_pick` took the newest minor uv listed, so the torch pick (and
+  every dry run on a new pod) failed; the backend pre-pick asked 3.15 only. Both now take the newest minor the torch
+  family resolves on, the rule the pick already followed when there were requirements to resolve. `testbed.sh
+  --server` still picks the newest minor uv lists (a follow-up).
 
 - 3.6.0: packages are found in the workspace shape too. Every cross-package walker assumed a consumer with the base as
   a submodule at `base/comfyui-base` and its packages under `<brand>/packages/<name>/`; the consumers are moving to one

@@ -2,15 +2,21 @@
 # every one to its remote HEAD (3.0.0: always the newest, never backwards), requirements into the venv, an advisory
 # import scan; strays consolidated.
 #
-# Row format (BASE_PACKS and every package's PACKS): dir|url|sha|cnr_id|why
+# Row format (BASE_PACKS and every package's PACKS): dir|url|sha|cnr_id|why[|branch]
 #   dir     the directory name under custom_nodes (also how the pack is located)
 #   sha     the 40-hex LAST-TESTED RECORD: the commit a green run last measured. Printed on every run and written back
 #           by podctl after a green install; never a target. Every run moves the pack to its remote HEAD.
 #   cnr_id  the Comfy Registry id when it differs from dir (empty otherwise)
+#   why     free text, no "|"
+#   branch  (3.6.1, optional) the branch to track when the remote's HEAD is the wrong one: every run then moves the pack
+#           to the newest commit of THIS branch instead (clone, existing checkouts on another branch, the testbed). Only
+#           for a remote whose published HEAD is stale (rgthree's HEAD is a 2023 `dev`, its work is on `main`); a pin
+#           is still never written here. Left off, the remote's HEAD is tracked, as before. Last on purpose: every
+#           reader that takes the first five fields (podctl's pin rows, comfybuild, dockerize) reads the row unchanged.
 
 # The packs most workflows share, declared by the base. A package must not redeclare one of these.
 BASE_PACKS=(
- "rgthree-comfy|https://github.com/rgthree/rgthree-comfy|2c5342a8cb0eaecaabf61435a5f37dd594c510ba||switches, bypassers, any-switch, fast group bypassers/muters, radio panels, Power Lora Loader"
+ "rgthree-comfy|https://github.com/rgthree/rgthree-comfy|2c5342a8cb0eaecaabf61435a5f37dd594c510ba||switches, bypassers, any-switch, fast group bypassers/muters, radio panels, Power Lora Loader|main"
  "ComfyUI-KJNodes|https://github.com/kijai/ComfyUI-KJNodes|57105374f47d0fbb49c9c3926fb981702e0a4b5c|comfyui-kjnodes|SetNode/GetNode routing, resize, patches, video helpers"
  "ComfyUI-VideoHelperSuite|https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite|4d907bee61e92c2e65af3bd6383a4e4d356126d1|comfyui-videohelpersuite|video load/combine, SelectEveryNth, custom formats"
  "cg-use-everywhere|https://github.com/chrisgoringe/cg-use-everywhere|50ae9f8c5d8b9538589663c90a15d4067a02969c||Anything Everywhere broadcast links"
@@ -18,18 +24,22 @@ BASE_PACKS=(
  "ComfyUI-advanced-model-manager|https://github.com/BISAM20/ComfyUI-advanced-model-manager|232997501a9ae6f9fa83f3594d16ca5341ecdbb2|comfyui-advanced-model-manager|the Hugging Face browser (2.1.0): Hub search and downloads into the library's folders via extra_model_paths.yaml, HF_TOKEN from the environment and sent to huggingface.co only (read once at this pin)"
 )
 # There is no image-owned pack list any more: the tree on the volume is the base's. A declared row and an undeclared
-# git checkout both move to their remote HEAD; an undeclared directory with no git source is reported and left alone.
+# git checkout both move to their remote HEAD (a row's branch, when it names one); an undeclared directory with no git source is reported and left alone.
 # Their requirements all go into the venv.
 DEL_DIRS=()
 BASE_PACKS_LATEST_ROWS=()
 
 _base_pack_rows(){ # prints BASE_PACKS then PACKS; validates shape; exit 1 on any violation (message on stderr)
-  local row dir url sha cnr why bad=0 seen=" " base_seen=" "
-  for row in ${BASE_PACKS[@]+"${BASE_PACKS[@]}"}; do IFS='|' read -r dir url sha cnr why <<< "$row"; base_seen="$base_seen$dir "; done
+  local row dir url sha cnr why branch bad=0 seen=" " base_seen=" "
+  for row in ${BASE_PACKS[@]+"${BASE_PACKS[@]}"}; do IFS='|' read -r dir url sha cnr why branch <<< "$row"; base_seen="$base_seen$dir "; done
   for row in ${BASE_PACKS[@]+"${BASE_PACKS[@]}"} ${PACKS[@]+"${PACKS[@]}"}; do
-    IFS='|' read -r dir url sha cnr why <<< "$row"
+    IFS='|' read -r dir url sha cnr why branch <<< "$row"
     if [ -z "$dir" ] || [ -z "$url" ] || ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-      echo "  !! bad PACKS row (want dir|url|sha|cnr_id|why with a 40-hex sha): $row" >&2; bad=1; continue
+      echo "  !! bad PACKS row (want dir|url|sha|cnr_id|why[|branch] with a 40-hex sha): $row" >&2; bad=1; continue
+    fi
+    # a branch name, never a commit (a pin) and never the tail of a why that held a "|"
+    if [ -n "$branch" ] && { ! _base_pack_branch_ok "$branch" || [[ "$branch" =~ ^[0-9a-f]{7,40}$ ]]; }; then
+      echo "  !! bad PACKS row: '$branch' is not a branch name (the sixth field names the branch to track; why may not hold a '|'): $row" >&2; bad=1; continue
     fi
     case "$seen" in *" $dir "*)
       case "$base_seen" in *" $dir "*) echo "  !! $dir is a base pack and may not be redeclared by ${PKG_NAME:-the package}" >&2;;
@@ -39,6 +49,13 @@ _base_pack_rows(){ # prints BASE_PACKS then PACKS; validates shape; exit 1 on an
     seen="$seen$dir "; echo "$row"
   done
   return $bad
+}
+
+_base_pack_branch_ok(){ # <name> → 0 when it is a plausible git branch name (what a sixth field may hold)
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] && [[ "$1" != *..* ]] && [[ "$1" != */ ]] && [[ "$1" != *.lock ]]
+}
+_base_pack_key(){ # <url> [branch] → the key py/pack_heads.py answers under: the url, or url#branch for a tracked branch
+  printf '%s%s' "$1" "${2:+#$2}"
 }
 
 _base_pack_locate(){ # <dir> <url> → prints the checkout dir or nothing
@@ -52,18 +69,30 @@ _base_fake_clone(){ # BASE_NO_NET: the shape of a clone, no network
   local url="$1" dir="$2"
   mkdir -p "$dir/.git"; printf '[remote "origin"]\n\turl = %s\n' "$url" > "$dir/.git/config"; : > "$dir/requirements.txt"
 }
-_base_pack_sync(){ # <dir> <url> → prints git's complaint if the pack could not move, nothing if it did (every run, 3.0.0)
+_base_pack_sync(){ # <dir> <url> [branch] → prints git's complaint if the pack could not move, nothing if it did (every run, 3.0.0)
   # Nothing here reads the repo's existing tracking config: baked clones sit on a branch with no upstream or
   # detached after `clone --branch <tag>`, so the remote, the branch and the upstream are re-established from
-  # the canonical URL and the update is a fast-forward onto the branch the remote publishes as HEAD.
-  local dir="$1" url="$2" rmt="" br="" cur="" out="" fix=""
+  # the canonical URL and the update is a fast-forward onto the branch the remote publishes as HEAD, or (3.6.1) onto
+  # the row's branch when it names one: a checkout on the stale HEAD branch moves across to it.
+  local dir="$1" url="$2" track="${3:-}" rmt="" br="" cur="" out="" fix=""
   rmt="$(_base_git_remote "$dir")" || true
   if [ -z "$rmt" ]; then rmt=origin; _base_git -C "$dir" remote add origin "$url" >/dev/null 2>&1 || true; fix="no remote was configured — origin set to $url"; fi
+  if [ -n "$track" ]; then
+    # a `clone --depth 1` fetches its one branch only (the stale HEAD's): widen the fetch to the tracked one, or the
+    # fetch below never brings it and `--set-upstream-to` refuses a ref no refspec maps
+    if ! _base_git -C "$dir" config --get-all "remote.$rmt.fetch" 2>/dev/null | grep -qE "^\+?refs/heads/(\*|$track):refs/remotes/$rmt/(\*|$track)\$"; then
+      _base_git -C "$dir" remote set-branches --add "$rmt" "$track" >/dev/null 2>&1 || true
+    fi
+  fi
   if [ "$(_base_git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
     _base_git -C "$dir" fetch -q --unshallow --tags --force --prune "$rmt" >/dev/null 2>&1 || true
   fi
   out="$(_base_git -C "$dir" fetch -q --tags --force --prune "$rmt" 2>&1)" || { printf '%s\n' "$out"; return 0; }
-  br="$(_base_git -C "$dir" symbolic-ref -q --short "refs/remotes/$rmt/HEAD" 2>/dev/null | sed "s#^$rmt/##" || true)"
+  br="$track"
+  if [ -n "$br" ] && ! _base_git -C "$dir" rev-parse -q --verify "refs/remotes/$rmt/$br" >/dev/null 2>&1; then
+    echo "$rmt has no branch '$br' (the row's sixth field)"; return 0
+  fi
+  [ -z "$br" ] && br="$(_base_git -C "$dir" symbolic-ref -q --short "refs/remotes/$rmt/HEAD" 2>/dev/null | sed "s#^$rmt/##" || true)"
   if [ -z "$br" ]; then
     _base_git -C "$dir" remote set-head "$rmt" -a >/dev/null 2>&1 || true
     br="$(_base_git -C "$dir" symbolic-ref -q --short "refs/remotes/$rmt/HEAD" 2>/dev/null | sed "s#^$rmt/##" || true)"
@@ -73,7 +102,7 @@ _base_pack_sync(){ # <dir> <url> → prints git's complaint if the pack could no
   cur="$(_base_git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
   if [ "$cur" != "$br" ]; then
     _base_git -C "$dir" checkout -q "$br" >/dev/null 2>&1 || _base_git -C "$dir" checkout -q -b "$br" "$rmt/$br" >/dev/null 2>&1 || true
-    fix="${fix:+$fix; }was on '$cur' — now on $br tracking $rmt/$br"
+    fix="${fix:+$fix; }was on '$cur' — now on $br tracking $rmt/$br${track:+ (the branch its row names)}"
   elif ! _base_git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
     fix="${fix:+$fix; }branch '$br' had no upstream — wired to $rmt/$br"
   fi
@@ -90,8 +119,8 @@ _base_pack_sync(){ # <dir> <url> → prints git's complaint if the pack could no
   fi
   return 0
 }
-_BASE_PACK_HEADS=""   # 3.5.0: the table py/pack_heads.py wrote this run (url, branch, sha per remote that answered)
-_base_pack_heads_probe(){ # <url>... → every remote's HEAD, asked at once; nothing asked in a dry, fake or runtime run
+_BASE_PACK_HEADS=""   # 3.5.0: the table py/pack_heads.py wrote this run (key, branch, sha per remote that answered)
+_base_pack_heads_probe(){ # <url | url#branch>... → every remote's HEAD (or that branch's tip), asked at once; nothing asked in a dry, fake or runtime run
   _BASE_PACK_HEADS=""
   if [ "$BASE_DRY" = "1" ] || [ "$BASE_NO_NET" = "1" ] || _base_runtime_on; then return 0; fi
   [ "$#" -gt 0 ] || return 0
@@ -99,12 +128,13 @@ _base_pack_heads_probe(){ # <url>... → every remote's HEAD, asked at once; not
   printf '%s\n' "$@" | "${SYS_PY:-python3}" "$BASE_DIR/py/pack_heads.py" > "$_BASE_PACK_HEADS" 2>/dev/null || : > "$_BASE_PACK_HEADS"
   return 0
 }
-_base_pack_current(){ # <dir> <url> → 0 when the checkout sits exactly on what that remote publishes as HEAD: same commit, on
-  # that branch, wired to it, not shallow, no local edits. Then there is nothing to fetch. Anything else takes the full
-  # path (_base_pack_move), which fetches, never moves backwards, stashes edits and says what git says.
-  local dir="$1" url="$2" line br sha rmt
+_base_pack_current(){ # <dir> <url> [branch] → 0 when the checkout sits exactly on what that remote publishes as HEAD (or on
+  # the tip of the row's branch): same commit, on that branch, wired to it, not shallow, no local edits. Then there is
+  # nothing to fetch. Anything else takes the full path (_base_pack_move), which fetches, never moves backwards, stashes
+  # edits and says what git says.
+  local dir="$1" url="$2" track="${3:-}" line br sha rmt
   [ -n "$_BASE_PACK_HEADS" ] && [ -s "$_BASE_PACK_HEADS" ] || return 1
-  line="$(awk -F'\t' -v u="$url" '$1==u {print; exit}' "$_BASE_PACK_HEADS")"
+  line="$(awk -F'\t' -v u="$(_base_pack_key "$url" "$track")" '$1==u {print; exit}' "$_BASE_PACK_HEADS")"
   [ -n "$line" ] || return 1
   br="$(printf '%s' "$line" | cut -f2)"; sha="$(printf '%s' "$line" | cut -f3)"
   [ "$(_base_git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$sha" ] || return 1
@@ -130,18 +160,18 @@ _base_pack_stash(){ # <dir> <name> → stashes local edits under a named, restor
   fi
   return 1
 }
-_base_pack_move(){ # <name> <dir> <url> → moves one git checkout to its remote HEAD; records the result
-  local name="$1" dir="$2" url="$3" before after out
+_base_pack_move(){ # <name> <dir> <url> [branch] → moves one git checkout to its remote HEAD (or the branch's tip); records the result
+  local name="$1" dir="$2" url="$3" track="${4:-}" before after out
   if [ -n "$(_base_git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ] && ! _base_pack_stash "$dir" "$name"; then
     miss "$name: local edits could not be stashed: not moved"; PACK_DIRTY+=("$name"); BASE_FAILED+=("pack $name: local edits could not be stashed, not at its newest"); return 0
   fi
   before="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
-  out="$(_base_pack_sync "$dir" "$url")"
+  out="$(_base_pack_sync "$dir" "$url" "$track")"
   after="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
   if [ -n "$out" ]; then
     PACK_PRESENT+=("$name @ $after"); err "$name not at its newest: $(_base_git_diag "$out")"; BASE_FAILED+=("pack $name: could not move to its remote HEAD ($(_base_git_diag "$out"))")
   elif [ "$before" != "$after" ]; then PACK_UPDATED+=("$name $before→$after"); ok "$name $before → $after"
-  else PACK_PRESENT+=("$name @ $after"); ok "$name @ $after (its remote HEAD)"; fi
+  else PACK_PRESENT+=("$name @ $after"); ok "$name @ $after (${track:+the tip of $track, }its remote HEAD)"; fi
   return 0
 }
 _base_pack_reqfile(){ # <dir> → the requirements file a pack wants installed (Frame-Interpolation ships a no-cupy variant)
@@ -188,7 +218,7 @@ _base_pack_imports_report(){ # <name|dir>… → for packs with no requirements 
 }
 
 base_packs(){ # base_packs git | pip
-  local phase="${1:-git}" row name url sha cnr why dir out
+  local phase="${1:-git}" row name url sha cnr why branch dir out
   if [ "$phase" = "git" ]; then
     hdr "NODE PACKS · locate / clone / pin"
     [ "$BASE_DRY" = "1" ] || mkdir -p "$CN" 2>/dev/null || true
@@ -196,17 +226,17 @@ base_packs(){ # base_packs git | pip
     local rows; rows="$(_base_pack_rows)" || { err "the pack tables are invalid (see above)"; BASE_FAILED+=("packs: invalid rows"); return 1; }
     local declared=" " purls=() pu pd
     # 3.5.0: every remote's HEAD, asked at once (declared rows and every checkout already in custom_nodes)
-    while IFS='|' read -r name url sha cnr why; do if [ -n "$url" ]; then purls+=("$url"); fi; done <<< "$rows"
+    while IFS='|' read -r name url sha cnr why branch; do if [ -n "$url" ]; then purls+=("$(_base_pack_key "$url" "$branch")"); fi; done <<< "$rows"
     for pd in "${CN:-/nonexistent}"/*/; do
       if [ -d "$pd/.git" ]; then pu="$(_base_git -C "$pd" remote get-url "$(_base_git_remote "$pd")" 2>/dev/null || true)"; if [ -n "$pu" ]; then purls+=("$pu"); fi; fi
     done
     _base_pack_heads_probe ${purls[@]+"${purls[@]}"}
-    while IFS='|' read -r name url sha cnr why; do
+    while IFS='|' read -r name url sha cnr why branch; do
       [ -n "$name" ] || continue
       dir="$(_base_pack_locate "$name" "$url")"
       # a declared pack that is not a git checkout (a registry install) has no source to move: it goes aside and is cloned
       if [ -n "$dir" ] && ! { [ -d "$dir/.git" ] && _base_git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; }; then
-        if [ "$BASE_DRY" = "1" ]; then would "move $dir aside (not a git checkout) and clone $url at its HEAD"; PACK_DIRS+=("$name|$dir"); continue
+        if [ "$BASE_DRY" = "1" ]; then would "move $dir aside (not a git checkout) and clone $url at ${branch:+the tip of $branch, }its HEAD"; PACK_DIRS+=("$name|$dir"); continue
         elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (not a git checkout; no-net: not moved)"); PACK_DIRS+=("$name|$dir"); continue
         elif _base_runtime_on; then PACK_PRESENT+=("$name (runtime)"); PACK_DIRS+=("$name|$dir"); continue; fi
         local aside; if aside="$(_base_pack_move_aside "$dir")"; then note "$name: not a git checkout: moved aside to $aside so it can be cloned at its newest"; dir=""
@@ -218,29 +248,29 @@ base_packs(){ # base_packs git | pip
       fi
       if [ -z "$dir" ]; then
         todo "$name — $why"
-        if [ "$BASE_DRY" = "1" ]; then would "git clone --depth 1 $url (its HEAD)"; PACK_CLONED+=("$name (would clone)"); continue; fi
+        if [ "$BASE_DRY" = "1" ]; then would "git clone --depth 1 ${branch:+--branch $branch }$url (${branch:+the tip of $branch, }its HEAD)"; PACK_CLONED+=("$name (would clone)"); continue; fi
         if [ "$BASE_NO_NET" = "1" ]; then _base_fake_clone "$url" "$CN/$name"; dir="$CN/$name"; PACK_CLONED+=("$name (fake clone)")
         else
           # git's own exit status is the judge. Piping the clone through `grep -v | tail` made an EMPTY output (a quiet
           # clone on an image that prints no warnings) look like a failure under pipefail — every pack "failed" on a
           # pod where every directory was in place (2026-09-05).
           local cout="" crc=0
-          cout="$(_base_git clone -q --depth 1 "$url" "$CN/$name" 2>&1)" || crc=$?
+          cout="$(_base_git clone -q --depth 1 ${branch:+--branch "$branch"} "$url" "$CN/$name" 2>&1)" || crc=$?
           [ -n "$cout" ] && { printf '%s\n' "$cout" | grep -v 'depth is ignored' | tail -2 || true; }
-          if [ "$crc" = "0" ]; then dir="$CN/$name"; PACK_CLONED+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name cloned at its HEAD"
+          if [ "$crc" = "0" ]; then dir="$CN/$name"; PACK_CLONED+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name cloned at ${branch:+the tip of $branch, }its HEAD"
           else err "clone failed: $name (git exit $crc)"; BASE_FAILED+=("pack: $name clone failed"); continue; fi
         fi
       elif [ "$BASE_DRY" = "1" ]; then
-        would "fetch $name and move it to the HEAD its remote publishes (never backwards; local edits stashed first)"; PACK_PRESENT+=("$name")
+        would "fetch $name and move it to ${branch:+the tip of its branch $branch, }the HEAD its remote publishes (never backwards; local edits stashed first)"; PACK_PRESENT+=("$name")
       elif [ "$BASE_NO_NET" = "1" ]; then PACK_PRESENT+=("$name (no-net: not moved)")
       elif _base_runtime_on; then PACK_PRESENT+=("$name (runtime)")
-      elif _base_pack_current "$dir" "$url"; then
+      elif _base_pack_current "$dir" "$url" "$branch"; then
         PACK_PRESENT+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null) (its remote HEAD; nothing to fetch)"
-      else _base_pack_move "$name" "$dir" "$url"; fi
+      else _base_pack_move "$name" "$dir" "$url" "$branch"; fi
       declared="$declared$(basename "${dir:-$name}") "
       PACK_DIRS+=("$name|$dir")
       if [ -n "$dir" ] && [ "$BASE_DRY" != "1" ]; then
-        BASE_PACKS_LATEST_ROWS+=("$name|$url|$(_base_git -C "$dir" rev-parse HEAD 2>/dev/null || echo "$sha")|$cnr|$why")
+        BASE_PACKS_LATEST_ROWS+=("$name|$url|$(_base_git -C "$dir" rev-parse HEAD 2>/dev/null || echo "$sha")|$cnr|$why${branch:+|$branch}")
       fi
     done <<< "$rows"
     # undeclared git checkouts are software on this machine too: they go to their upstream HEAD the same way
@@ -481,7 +511,7 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention 2 bui
 base_consolidate(){ # what is already installed elsewhere on this pod: strays of ours moved in, the rest reported
   hdr "CONSOLIDATE · what is already installed on this pod"
   local VOLROOT="${BASE_PERSIST_ROOT:-$BASE_VOLUME}"; [ -n "$BASE_FAKE_ROOT" ] && VOLROOT="$BASE_FAKE_ROOT"
-  local d name url sha cnr why other rows
+  local d name url sha cnr why branch other rows
   # ---- other ComfyUI trees: reported, never touched
   local others=()
   while IFS= read -r d; do
@@ -493,7 +523,7 @@ base_consolidate(){ # what is already installed elsewhere on this pod: strays of
   # ---- stray node packs: a pack of ours cloned somewhere other than custom_nodes is invisible to ComfyUI
   local moved=0 dupe=0
   rows="$(_base_pack_rows 2>/dev/null || true)"
-  while IFS='|' read -r name url sha cnr why; do
+  while IFS='|' read -r name url sha cnr why branch; do
     [ -n "$name" ] || continue
     while IFS= read -r d; do
       [ -n "$d" ] || continue
@@ -526,9 +556,11 @@ base_consolidate(){ # what is already installed elsewhere on this pod: strays of
   return 0
 }
 
-base_list_packs(){ # <pkg dir>... → deduplicated dir|url|sha rows (base packs + every package's); exit 1 when one pack names two URLs.
+base_list_packs(){ # <pkg dir>... → deduplicated dir|url|sha|branch rows (base packs + every package's; branch empty unless the row
+  # names one, 3.6.1); exit 1 when one pack names two URLs or two branches.
   # 3.0.0: a row's sha is a last-tested RECORD and every run takes the pack to its HEAD, so two packages whose records
-  # were written on different days is a note, never a conflict. Two URLs for one directory is still a real conflict.
+  # were written on different days is a note, never a conflict. Two URLs (or two tracked branches) for one directory is
+  # still a real conflict: the machine can hold one checkout.
   local d s out rc=0
   out="$(printf '%s\n' "${BASE_PACKS[@]}")"
   for d in "$@"; do
@@ -539,6 +571,6 @@ base_list_packs(){ # <pkg dir>... → deduplicated dir|url|sha rows (base packs 
     local got; got="$(BASE_DECLARE_ONLY=1 bash "$s" | grep '^PACKROW ' | cut -c9- || true)"
     if [ -n "$got" ]; then out="$out"$'\n'"$got"; fi
   done
-  printf '%s\n' "$out" | awk -F'|' 'function u(x){ sub(/\.git$/,"",x); sub(/\/$/,"",x); return tolower(x) } NF>=3 && $1!="" { if ($1 in url) { if (u(url[$1])!=u($2)) { print "  !! " $1 " comes from two URLs: " url[$1] " vs " $2 > "/dev/stderr"; bad=1 } else if (sha[$1]!=$3) { print "  ~ " $1 ": records differ (" substr(sha[$1],1,12) " vs " substr($3,1,12) "); every run takes it to its HEAD" > "/dev/stderr" } } else { url[$1]=$2; sha[$1]=$3; print $1 "|" $2 "|" $3 } } END { exit bad }' || rc=1
+  printf '%s\n' "$out" | awk -F'|' 'function u(x){ sub(/\.git$/,"",x); sub(/\/$/,"",x); return tolower(x) } NF>=3 && $1!="" { b=(NF>=6 ? $6 : ""); if ($1 in url) { if (u(url[$1])!=u($2)) { print "  !! " $1 " comes from two URLs: " url[$1] " vs " $2 > "/dev/stderr"; bad=1 } else if (br[$1]!=b) { print "  !! " $1 " tracks two branches: " (br[$1]=="" ? "its HEAD" : br[$1]) " vs " (b=="" ? "its HEAD" : b) > "/dev/stderr"; bad=1 } else if (sha[$1]!=$3) { print "  ~ " $1 ": records differ (" substr(sha[$1],1,12) " vs " substr($3,1,12) "); every run takes it to its HEAD" > "/dev/stderr" } } else { url[$1]=$2; sha[$1]=$3; br[$1]=b; print $1 "|" $2 "|" $3 "|" b } } END { exit bad }' || rc=1
   return $rc
 }

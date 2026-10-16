@@ -9,6 +9,7 @@
 #  3.0.0: always the newest. ComfyUI at its newest release, every pack at its remote's HEAD, the newest Python uv
 #  provides, torch upgraded, and every requirement installed from one pin-free set (py/reqlift.py), so ComfyUI's
 #  own == pins (its frontend packages) never hold anything below its newest. --latest is accepted and changes nothing.
+#      bash testbed.sh --packs    # the node packs alone, each to its tip (3.6.1); ComfyUI left as it is
 #      bash testbed.sh --stop     # stop the server
 #      bash testbed.sh --status   # what is here and what is running
 #
@@ -110,21 +111,22 @@ derive_vendored(){
 }
 derive_vendored
 
-# PACKS rows are dir|url|sha (sha empty = unpinned). Derived first, EXTRA appended for dirs not yet covered.
+# PACKS rows are dir|url|sha|branch (sha empty = unpinned; branch empty = the remote's HEAD, else the branch a base or
+# package row names to track, 3.6.1). Derived first, EXTRA appended for dirs not yet covered.
 PACKS=()
 _has_pack(){ local r; for r in ${PACKS[@]+"${PACKS[@]}"}; do [ "${r%%|*}" = "$1" ] && return 0; done; return 1; }
 derive_packs() {
-  local dir url sha row
+  local dir url sha branch row
   if [ -f "$BASE_SH" ]; then
-    while IFS='|' read -r dir url sha; do
-      if [ -n "$dir" ] && ! _has_pack "$dir"; then PACKS+=("$dir|$url|$sha"); fi
+    while IFS='|' read -r dir url sha branch; do
+      if [ -n "$dir" ] && ! _has_pack "$dir"; then PACKS+=("$dir|$url|$sha|$branch"); fi
     done < <(bash "$BASE_SH" list-packs ${PKGS[@]+"${PKGS[@]}"} 2>/dev/null || true)
   else
     warn "no ComfyUI Base beside this script — only EXTRA packs are provisioned"
   fi
   for row in ${EXTRA[@]+"${EXTRA[@]}"}; do      # EXTRA may be empty (bash 3.2 + set -u)
     dir="${row%%|*}"
-    if ! _has_pack "$dir"; then PACKS+=("$row|"); fi
+    if ! _has_pack "$dir"; then PACKS+=("$row||"); fi
   done
 }
 derive_packs
@@ -132,6 +134,22 @@ derive_packs
 _latest_tag() {
   git ls-remote --tags --refs https://github.com/comfyanonymous/ComfyUI 2>/dev/null \
     | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+}
+
+provision_packs() { # every derived pack cloned, or moved to the tip of its row's branch, else its remote's HEAD
+  mkdir -p "$CN"
+  local row dir url sha branch
+  for row in ${PACKS[@]+"${PACKS[@]}"}; do          # PACKS may be empty (bash 3.2 + set -u)
+    IFS='|' read -r dir url sha branch <<< "$row"
+    if [ ! -d "$CN/$dir/.git" ]; then
+      if git clone -q --depth 1 ${branch:+--branch "$branch"} "$url" "$CN/$dir" 2>/dev/null; then ok "$dir (cloned)"; else warn "$dir — clone failed ($url)"; continue; fi
+    fi
+    # 3.0.0: what the machines install, the remote's HEAD (the row's sha is only the last-tested record); 3.6.1: the tip
+    # of the row's branch when it names one, so a testbed cloned from a stale HEAD moves across too
+    if git -C "$CN/$dir" fetch -q --depth 1 origin "${branch:-HEAD}" >/dev/null 2>&1 && git -C "$CN/$dir" checkout -q --detach FETCH_HEAD 2>/dev/null; then
+      ok "$dir @ $(git -C "$CN/$dir" rev-parse --short HEAD) (${branch:-HEAD})"
+    else warn "$dir: could not move to ${branch:+the tip of $branch, }its remote's HEAD"; fi
+  done
 }
 
 provision_source() {
@@ -161,18 +179,7 @@ provision_source() {
     git clone -q --depth 1 --branch "$tag" https://github.com/comfyanonymous/ComfyUI "$COMFY"
     ok "ComfyUI $tag"
   fi
-  mkdir -p "$CN"
-  local row dir url sha
-  for row in "${PACKS[@]}"; do
-    IFS='|' read -r dir url sha <<< "$row"
-    if [ ! -d "$CN/$dir/.git" ]; then
-      if git clone -q --depth 1 "$url" "$CN/$dir" 2>/dev/null; then ok "$dir (cloned)"; else warn "$dir — clone failed ($url)"; continue; fi
-    fi
-    # 3.0.0: what the machines install, the remote's HEAD (the row's sha is only the last-tested record)
-    if git -C "$CN/$dir" fetch -q --depth 1 origin HEAD >/dev/null 2>&1 && git -C "$CN/$dir" checkout -q --detach FETCH_HEAD 2>/dev/null; then
-      ok "$dir @ $(git -C "$CN/$dir" rev-parse --short HEAD) (HEAD)"
-    else warn "$dir: could not move to its remote's HEAD"; fi
-  done
+  provision_packs
   # Packages' own vendored packs (no git URL; the pod copies them from the package, the testbed links them
   # so an edit is live on the next server restart). Keep this list in step with each package's VENDORED_PACKS.
   local v
@@ -282,7 +289,8 @@ case "${1:-}" in
   "")        provision_source; status;;
   --latest)  LATEST=1; provision_source; status;;
   --server)  provision_source; provision_server; status;;
+  --packs)   provision_packs; status;;   # 3.6.1: the node packs alone (each to its tip), ComfyUI left as it is
   --stop)    stop_server;;
   --status)  status;;
-  *) echo "usage: bash testbed.sh [--server | --latest | --stop | --status]"; exit 2;;
+  *) echo "usage: bash testbed.sh [--server | --latest | --packs | --stop | --status]"; exit 2;;
 esac

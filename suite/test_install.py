@@ -200,3 +200,38 @@ def test_install_a_second_tree_on_the_volume_is_consolidated_into_the_canonical_
     models_line = [ln for ln in r.stdout.splitlines() if ln.strip().startswith("models ")][-1]
     assert "moved 2" in models_line and "downloaded 0" in models_line, models_line
     assert (second / "main.py").exists()                                                  # never deleted
+
+
+
+def _stub_with_packs(tmp_path, rows):
+    s = tmp_path / "pkg" / "stub-script.sh"
+    s.write_text(s.read_text().replace("PACKS=()", "PACKS=(\n%s\n)" % "\n".join(' "%s"' % r for r in rows), 1))
+    return s
+
+
+def test_install_a_row_branch_is_planned_cloned_and_recorded_by_a_whole_run(tmp_path):
+    """3.6.1, end to end through base_main: a remote whose HEAD is stale (rgthree publishes a 2023 `dev`). The plan clones
+    the row's branch, for the base's rgthree row and for a package's own row; a real run keeps the branch in the record
+    podctl writes back. (The moves themselves are proven against real git remotes in the unit tier.)"""
+    fake_pod(tmp_path, STUB)
+    s = _stub_with_packs(tmp_path, ["StubPack|https://github.com/example/StubPack|" + "a" * 40 + "||the fixture pack|main"])
+    r = run_script(s, "--check", fake_root=tmp_path)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
+    assert "git clone --depth 1 --branch main https://github.com/rgthree/rgthree-comfy" in r.stdout, r.stdout[-3000:]
+    assert "git clone --depth 1 --branch main https://github.com/example/StubPack" in r.stdout, r.stdout[-3000:]
+    assert "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes (its HEAD)" in r.stdout          # no branch: as before
+    r = run_script(s, fake_root=tmp_path)
+    assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-1000:]
+    assert '"StubPack|https://github.com/example/StubPack|' + "a" * 40 + '||the fixture pack|main"' in r.stdout, r.stdout[-3000:]
+    assert '||switches, bypassers, any-switch, fast group bypassers/muters, radio panels, Power Lora Loader|main"' in r.stdout, r.stdout[-3000:]
+    d = run_script(s, env={"BASE_DECLARE_ONLY": "1"}, fake_root=tmp_path)
+    assert "PACKROW StubPack|https://github.com/example/StubPack|" + "a" * 40 + "||the fixture pack|main" in d.stdout, d.stdout + d.stderr
+    pkg = load_package(tmp_path / "pkg")
+    assert {p["dir"]: p["branch"] for p in pkg.packs}["StubPack"] == "main"
+
+
+def test_install_a_sixth_field_that_is_not_a_branch_stops_the_run(tmp_path):
+    fake_pod(tmp_path, STUB)
+    s = _stub_with_packs(tmp_path, ["StubPack|https://github.com/example/StubPack|" + "a" * 40 + "||why|" + "b" * 40])
+    r = run_script(s, "--check", fake_root=tmp_path)
+    assert r.returncode != 0 and "not a branch name" in r.stdout + r.stderr, r.stdout[-3000:] + r.stderr[-1000:]

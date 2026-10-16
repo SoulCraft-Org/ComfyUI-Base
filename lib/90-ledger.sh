@@ -68,12 +68,16 @@ _base_host_status(){ # 2.2.0: which host the driver recorded for this volume (st
 }
 base_latest(){ # every installed package's packs + the base packs: each last-tested record against its remote's HEAD now (read-only)
   hdr "LATEST · last-tested record vs remote HEAD (every install moves each pack to its HEAD)"
-  local row dir url sha rest new m kind path
-  { printf '%s\n' "${BASE_PACKS[@]}" | awk -F'|' '{print "base\t"$1"\t"$3"\t-\t"$2}'
+  local row dir url sha rest new m kind path track
+  { printf '%s\n' "${BASE_PACKS[@]}" | awk -F'|' '{print "base\t"$1"\t"$3"\t-\t"$2"\t"(NF>=6 ? $6 : "")}'
     for m in "${BASE_STATE:-/nonexistent}"/packages/*.manifest; do [ -f "$m" ] && grep '^pack	' "$m" | sed "s/^pack/$(basename "$m" .manifest)/" || true; done
-  } | while IFS=$'\t' read -r kind dir sha path url; do
+  } | while IFS=$'\t' read -r kind dir sha path url track; do
     [ -n "$dir" ] && [ -n "$url" ] && [ "$url" != "-" ] || continue
-    new="$(_base_git ls-remote "$url" HEAD 2>/dev/null | awk '{print $1}' | head -1 || true)"
+    # 3.6.1: a row's tracked branch (base rows) or the branch the checkout is wired to (installed packages: the install
+    # wired it to the row's branch) is what "newest" means, not a stale HEAD the remote publishes
+    if [ -z "$track" ] && [ -d "$path/.git" ]; then track="$(_base_git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null | sed 's#^[^/]*/##' || true)"; fi
+    if [ -n "$track" ]; then new="$(_base_git ls-remote "$url" "refs/heads/$track" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+    else new="$(_base_git ls-remote "$url" HEAD 2>/dev/null | awk '{print $1}' | head -1 || true)"; fi
     if [ -z "$new" ]; then echo "  $dir  (could not reach $url)"; elif [ "$new" = "$sha" ]; then echo "  $dir  $sha  (unchanged)  [$kind]"; else echo "  $dir  $new  <- was $sha  [$kind]"; fi
   done
 }
