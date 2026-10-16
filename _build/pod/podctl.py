@@ -1832,9 +1832,13 @@ def cmd_create(prov, args):
     if not gpus:
         raise PodctlError("--gpu is required on host %s (it has no default GPU order)" % getattr(prov, "name", "?"))
     seen = []
+    takes_volume = "volume" in inspect.signature(prov.availability).parameters
     for gpu in gpus:
-        locs = prov.availability(gpu, spot=args.spot)
+        # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one
+        locs = prov.availability(gpu, spot=args.spot, volume=not private) if takes_volume else prov.availability(gpu, spot=args.spot)
         print("stock   %s%s free now in: %s" % (gpu, spot, ", ".join(locs) if locs else "no location"))
+        for dc, why in getattr(prov, "skipped", None) or []:
+            print("stock   %s%s also free in %s, left out: %s" % (gpu, spot, dc, why))
         seen.append((gpu, locs))
         if locs and (not loc or loc in locs):
             args.gpu, loc = gpu, loc or locs[0]

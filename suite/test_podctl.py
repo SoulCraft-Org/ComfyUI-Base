@@ -2088,3 +2088,35 @@ def test_unit_install_says_a_package_folder_must_be_named_after_its_package(tmp_
                     "rename the folder to video-replacer-minimax-h3)"], said
     e = tmp_path / "empty"; e.mkdir(); said.clear()
     assert podctl.install("pod1", [e], types.SimpleNamespace(say=said.append)) == 1 and said[0].endswith("empty has no empty-script.sh"), said
+
+
+def test_unit_create_offers_only_data_centres_a_pod_and_its_volume_can_be_made_in(tmp_path, capsys):
+    """Two create defects install-speed hit on 2026-10-16, both before billing. (1) The stock view names data centres
+    REST v1 POST /pods refuses with a schema 400 (PodCreateInput.dataCenterIds' enum has 30 ids and lacks US-NE-1, a B200
+    location). (2) It picked a data centre that takes no network volume (POST /networkvolumes: 500 "does not support
+    network volumes"). Now the candidates are the ones in the live enum, and with a network volume those whose
+    storageSupport is true; each one left out is named, and the next one is used."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    b200 = [{"gpuTypeId": "NVIDIA B200", "stockStatus": "High", "available": True}]
+    gql = {"dataCenters": [{"id": "US-NE-1", "storageSupport": True, "gpuAvailability": b200},
+                           {"id": "US-NC-1", "storageSupport": False, "gpuAvailability": b200},
+                           {"id": "EU-RO-1", "storageSupport": True, "gpuAvailability": b200}]}
+    schema = {"components": {"schemas": {"PodCreateInput": {"properties": {"dataCenterIds": {"type": "array", "items": {
+        "type": "string", "enum": ["EU-RO-1", "US-NC-1", "US-CA-2"]}}}}}}}
+    srv = FakeRunPod(_pod(), gql=gql, rest=lambda m, p, b: (200, schema) if (m, p) == ("GET", "/openapi.json") else None)
+    try:
+        assert _create(podctl, srv, pub, "--data-gb", "100") in (None, 0)
+        out = capsys.readouterr().out
+        assert "free now in: EU-RO-1" in out and [b for p, b in srv.bodies if p == "/pods"][-1]["dataCenterIds"] == ["EU-RO-1"]
+        assert "also free in US-NE-1, left out: RunPod's create API does not take this data centre" in out
+        assert "also free in US-NC-1, left out: no network volumes here" in out, out
+        assert [b for p, b in srv.bodies if p == "/networkvolumes"][-1]["dataCenterId"] == "EU-RO-1"
+        # a private pod wants no network volume: US-NC-1 is fine for it, US-NE-1 still is not
+        assert _create(podctl, srv, pub, "--data-gb", "100", "--private") in (None, 0)
+        assert [b for p, b in srv.bodies if p == "/pods"][-1]["dataCenterIds"] == ["US-NC-1"]
+        assert srv.gets.count("/openapi.json") == 1                          # read once per run
+    finally:
+        srv.close()
+    # an unreadable schema falls back to the list read on 2026-10-16
+    assert "US-NE-1" not in podctl._runpod.CREATE_DCS and len(podctl._runpod.CREATE_DCS) == 30 and "EU-RO-1" in podctl._runpod.CREATE_DCS

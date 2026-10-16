@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.10.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.10.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -693,8 +693,13 @@ for any invocation that somehow arrives without the environment. The suite asser
   after the PATCH, and RunPod had moved 22/tcp (20424 to 36944). It now waits for `lastStartedAt` to move and looks for
   sshd on the port the pod has now, re-read on every try. (3) `podctl install` on a package folder not named after its
   package (`vr` for `video-replacer-minimax-h3`) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
-  name must be the package's and names the one to rename it to. Exercised on this Mac against the suite's fake RunPod,
-  which now answers stale reads after a reset and moves the ssh port; not yet on a live pod.
+  name must be the package's and names the one to rename it to. (4) `podctl create` offered data centres a pod cannot be
+  created in: the stock view names more than REST v1 `POST /pods` takes (its `dataCenterIds` enum has 30 ids and lacks
+  US-NE-1, a B200 location: a schema 400), and it picked ones that take no network volume (US-NC-1, US-MO-2, EUR-IS-2:
+  `POST /networkvolumes` 500). The candidates are now those in the live enum (REST v1's own `openapi.json`, read once per
+  run; the 30 ids read on 2026-10-16 when it cannot be read) and, when a network volume is wanted, those whose GraphQL
+  `storageSupport` is true; each one left out is named. Exercised on this Mac against the suite's fake RunPod, which now
+  answers stale reads after a reset and moves the ssh port; (2) also on a live pod (16174 became 19093, followed).
 - 3.10.0: a package can set ComfyUI's launch environment, and ComfyUI starts sized to the container's CPU quota
   (2026-10-16). `LAUNCH_ENV=( "KEY=value" ... )` (§4): an allowlist of thread, tokenizer, allocator and CTranslate2
   (`CT2_*`) variables, each value one word, so no path or secret can reach a file or a log; anything else, or a key set

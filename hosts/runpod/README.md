@@ -65,6 +65,11 @@ nothing there) until three minutes after the pod started, at most 15 minutes, th
 PATCH the API still answers with the old pod) and looks for sshd on the port the pod has NOW, re-read on every try:
 RunPod may map 22/tcp to a new port on a reset (20424 became 36944 on 2026-10-16, and `ensure` polled the old one).
 
+`create`'s stock check (3.10.1) offers only data centres a pod can be created in: those in REST v1 `POST /pods`'
+`dataCenterIds` enum (read from `https://rest.runpod.io/v1/openapi.json` once per run; 30 ids on 2026-10-16, without
+US-NE-1, US-NC-2 or US-PA-1, which the stock view names) and, when a network volume is wanted, those whose GraphQL
+`dataCenters.storageSupport` is true. Each one left out is printed with why.
+
 ## The addresses
 
 - **ssh: `<public ip>:<mapped port>`**, user `root`. The mapped port changes on every start, which is why `start --wait`,

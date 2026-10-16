@@ -745,7 +745,28 @@ def proxy_url(pod, port):
 
 # ---------------------------------------------------------------- 3.7.3: create, from nothing
 
-STOCK_QUERY = "query { dataCenters { id name location gpuAvailability { gpuTypeId stockStatus available } } }"
+STOCK_QUERY = "query { dataCenters { id name location storageSupport gpuAvailability { gpuTypeId stockStatus available } } }"
+# 3.10.1: the data centres REST v1 POST /pods takes: PodCreateInput.dataCenterIds' enum, read from REST v1's own openapi.json
+# on 2026-10-16 (30 ids). The stock view names more (US-NE-1, US-NC-2, US-PA-1, ...), and a create sent there fails on a
+# schema 400. The live schema is read first (create_datacenters); this list is only its fallback.
+CREATE_DCS = ("EU-RO-1", "CA-MTL-1", "EU-SE-1", "US-IL-1", "EUR-IS-1", "EU-CZ-1", "US-TX-3", "EUR-IS-2", "US-KS-2", "US-GA-2",
+              "US-WA-1", "US-TX-1", "CA-MTL-3", "EU-NL-1", "US-TX-4", "US-CA-2", "US-NC-1", "OC-AU-1", "US-DE-1", "EUR-IS-3",
+              "CA-MTL-2", "AP-JP-1", "EUR-NO-1", "EU-FR-1", "US-KS-3", "US-GA-1", "AP-IN-1", "US-MD-1", "US-MO-1", "US-MO-2")
+_CREATE_DCS_READ = {}
+
+
+def create_datacenters(api):
+    """3.10.1: the data centre ids POST /pods accepts, from the live REST v1 schema (GET /openapi.json, read once per run),
+    else CREATE_DCS."""
+    key = getattr(api, "base", "")
+    if key not in _CREATE_DCS_READ:
+        ids = None
+        try:
+            ids = api.get("/openapi.json")["components"]["schemas"]["PodCreateInput"]["properties"]["dataCenterIds"]["items"]["enum"]
+        except Exception:
+            ids = None
+        _CREATE_DCS_READ[key] = tuple(ids) if ids else CREATE_DCS
+    return _CREATE_DCS_READ[key]
 CREATE_PORTS = ["8188/http", "8888/http", "22/tcp"]      # ComfyUI and JupyterLab through the proxy, sshd on a public port
 PRIVATE_PORTS = ["22/tcp"]                               # 3.7.4 --private: sshd only; ComfyUI is reached through `podctl tunnel`
 CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
@@ -757,14 +778,25 @@ DEFAULT_GPUS = ("NVIDIA B200", "NVIDIA B300 SXM6 AC")
 DEFAULT_MIN_CUDA = "13.0"
 
 
-def stock(api, gpu):
+def stock(api, gpu, volume=False, skipped=None):
     """[(data centre id, stock status)] where `gpu` can be rented NOW, in RunPod's order (GraphQL dataCenters; REST v1 has
-    no stock call). `available` is the verdict; stockStatus (Low, Medium, High) is said beside it."""
-    rows = []
+    no stock call). `available` is the verdict; stockStatus (Low, Medium, High) is said beside it.
+    3.10.1: only where a pod can be created: a data centre outside POST /pods' enum (create_datacenters) is left out, and
+    with volume (a network volume is wanted) so is one whose storageSupport is false (POST /networkvolumes answers 500
+    "does not support network volumes" there: US-NC-1, US-MO-2, EUR-IS-2 on 2026-10-16). Each one left out is appended to
+    `skipped` as (id, why)."""
+    rows, allowed = [], set(create_datacenters(api))
     for dc in (api.graphql(STOCK_QUERY).get("dataCenters") or []):
         for g in dc.get("gpuAvailability") or []:
             if g.get("gpuTypeId") == gpu and g.get("available"):
-                rows.append((dc.get("id"), g.get("stockStatus") or "?"))
+                if dc.get("id") not in allowed:
+                    why = "RunPod's create API does not take this data centre"
+                elif volume and dc.get("storageSupport") is False:
+                    why = "no network volumes here"
+                else:
+                    rows.append((dc.get("id"), g.get("stockStatus") or "?")); continue
+                if skipped is not None:
+                    skipped.append((dc.get("id"), why))
     return rows
 
 
@@ -1053,9 +1085,12 @@ class RunPodProvider(Provider):
         return record_volume(self.api, pod, env=env)
 
     # 3.7.3: `podctl create` (the verb Verda already had) and the stock check behind it
-    def availability(self, gpu, spot=False):
-        """The data centres where `gpu` can be rented now, in RunPod's order (spot shares the on-demand stock view)."""
-        return [dc for dc, _ in stock(self.api, gpu)]
+    def availability(self, gpu, spot=False, volume=False):
+        """The data centres where `gpu` can be rented now AND a pod can be created (3.10.1: with volume, one that takes a
+        network volume too), in RunPod's order (spot shares the on-demand stock view). The ones left out, and why, are
+        in self.skipped afterwards."""
+        self.skipped = []
+        return [dc for dc, _ in stock(self.api, gpu, volume=volume, skipped=self.skipped)]
 
     def stock_text(self, gpu):
         rows = stock(self.api, gpu)
