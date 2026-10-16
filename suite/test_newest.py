@@ -174,8 +174,9 @@ def _uv_new_python(tmp_path):
           "python list") printf 'cpython-3.15.0-linux-x86_64-gnu    <download available>\\ncpython-3.14.8-linux-x86_64-gnu    <download available>\\n'; exit 0 ;;
           "pip install") echo "possible values: auto, cpu, cu132, cu130"; exit 0 ;;
           "pip compile")
-            v=""; o=""; prev=""; for a in "$@"; do [ "$prev" = --python-version ] && v="$a"; [ "$prev" = -o ] && o="$a"; prev="$a"; done
-            cat >/dev/null
+            v=""; o=""; prev=""; kind=family; for a in "$@"; do [ "$prev" = --python-version ] && v="$a"; [ "$prev" = -o ] && o="$a"; [ "$a" = --extra-index-url ] && kind=full; prev="$a"; done
+            req="$(cat)"; [ "$req" = torch ] && kind=torch_pick
+            [ -n "${UV_LOG:-}" ] && echo "compile $v $kind" >> "$UV_LOG"
             [ "$v" = 3.15 ] && { echo "hint: You require CPython 3.15 (cp315), but we only found wheels for torch with cp314" >&2; exit 1; }
             [ -n "$o" ] && : > "$o"; echo "torch==2.14.1+cu130"; exit 0 ;;
           "--version"*) echo "uv 0.13.1"; exit 0 ;;
@@ -189,10 +190,26 @@ def test_unit_the_python_pick_is_the_newest_minor_torch_has_a_build_for(tmp_path
     # with no requirement file to resolve against, the pick used to take the newest minor uv listed outright
     env = _uv_new_python(tmp_path)
     r = _bash('base_env_setup; base_discover quiet; PICK=$(_base_python_pick); echo PICK=$PICK', env={"BASE_FAKE_ROOT": str(tmp_path), **env})
-    assert "PICK=3.14" in r.stdout and "trying Python 3.15 ... no (the torch family does not resolve)" in r.stderr, r.stdout + r.stderr
+    assert "PICK=3.14" in r.stdout and "Python 3.15: skipped, the torch family has no wheels for it" in r.stderr, r.stdout + r.stderr
+    assert "trying Python 3.15" not in r.stderr and "trying Python 3.14 ... resolves" in r.stderr, r.stderr
     r = _bash('base_env_setup; base_discover quiet; base_venv; echo RESULT=$BASE_VENV_RESULT BACKEND=$BASE_TORCH_BACKEND',
               env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_DRY": "1", **env})
     assert "failed-pick" not in r.stdout + r.stderr and "target: Python 3.14" in r.stdout and "BACKEND=cu130" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_a_minor_without_torch_family_wheels_costs_one_small_compile_and_nothing_else(tmp_path):
+    """3.9.2 (defect B of the Video Swapper's pod install, 2026-10-16): uv listed CPython 3.15 before torchaudio had a cp315
+    wheel, and a fresh venv lost minutes on it: torch_pick.py stepped down through every CUDA backend for 3.15, then the
+    full derived-set resolve ran for 3.15, and only then did both fall back to 3.14. Now each pick asks only for the family
+    (torch, torchvision, torchaudio) on 3.15 and moves on: no torch_pick and no full resolve ever see 3.15."""
+    env = _uv_new_python(tmp_path); log = tmp_path / "uv.log"; env["UV_LOG"] = str(log)
+    stub = os.path.dirname(env["UV"])                    # base_env_setup puts a host's own uv (~/.local/bin) ahead of PATH: the stand-in goes first again
+    r = _bash('base_env_setup; export PATH="%s:$PATH"; hash -r; base_discover quiet; base_venv; echo RESULT=$BASE_VENV_RESULT BACKEND=$BASE_TORCH_BACKEND' % stub,
+              env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_DRY": "1", **env})
+    assert "target: Python 3.14" in r.stdout and "BACKEND=cu130" in r.stdout, r.stdout + r.stderr
+    calls = log.read_text().splitlines()
+    assert [c for c in calls if c.startswith("compile 3.15")] and all(c == "compile 3.15 family" for c in calls if c.startswith("compile 3.15")), calls
+    assert "compile 3.14 full" in calls and "compile 3.14 torch_pick" in calls, calls
 
 
 def test_unit_no_cuda_or_index_literal_and_no_pin_remains_in_the_library():
@@ -407,6 +424,77 @@ def test_unit_testbed_packs_clone_the_rows_branch_and_move_a_stale_checkout_acro
     assert _git("rev-parse", "HEAD", cwd=cn / "PackY") == b_main, r.stdout                 # moved off the stale HEAD
     assert _git("rev-parse", "HEAD", cwd=cn / "PackZ") == c_dev, r.stdout                  # no branch named: the remote's HEAD
     assert "(main)" in r.stdout and "(HEAD)" in r.stdout, r.stdout
+
+
+def _free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0)); return s.getsockname()[1]
+
+
+def _listen(tmp_path, script, port, wrap=False):
+    """A process listening on 127.0.0.1:<port> until killed, its command line `python3 <script> --cpu --port <port>`;
+    wrap=True runs it under a bash that waits for it (the shape a pid file written before 3.9.2 recorded)."""
+    src = tmp_path / script
+    src.write_text("import socket, sys, time\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                   "s.bind(('127.0.0.1', %d)); s.listen(); print('up', flush=True); time.sleep(600)\n" % port)
+    cmd = [sys.executable, str(src), "--cpu", "--port", str(port)]
+    if wrap:
+        cmd = ["bash", "-c", '"$@"; true', "bash"] + cmd                 # `; true` keeps bash from exec'ing python
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, cwd=tmp_path)
+    assert p.stdout.readline().strip() == "up"
+    return p
+
+
+def _gone(p, timeout=15):
+    try:
+        p.wait(timeout=timeout); return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def _end(p):
+    if p.poll() is None:
+        p.kill(); p.wait()
+    p.stdout.close()
+
+
+def test_unit_testbed_stops_only_the_server_it_started_and_refuses_a_foreign_port(tmp_path):
+    """3.9.2: `testbed.sh --server` stopped whatever listened on its port, and on a Mac shared by several sessions that was
+    another checkout's ComfyUI on 8199 (2026-10-16). Now --stop ends only the pid its own pid file names (or that pid's
+    child, the shape before 3.9.2) while it is still a ComfyUI main.py; a foreign listener is named and left running,
+    also when a stale pid file happens to hold its pid; and --server refuses a held port, pointing at TESTBED_PORT."""
+    if not (BASE / "testbed.sh").exists() or not (BASE / "_build").exists():
+        pytest.skip("testbed.sh is repo tooling, not in the shipped base")
+    here = _testbed_beside(tmp_path, [])
+    pidf = here / ".testbed-server.pid"
+    port = _free_port(); e = {k: v for k, v in os.environ.items() if not k.startswith("BASE_")}; e["TESTBED_PORT"] = str(port)
+    tb = lambda *a: subprocess.run(["bash", str(here / "testbed.sh"), *a], capture_output=True, text=True, env=e, timeout=60)
+    foreign = _listen(tmp_path, "other_checkout_server.py", port)
+    try:
+        pidf.write_text("%d\n" % foreign.pid)                                  # a stale pid file that names the foreign pid
+        r = tb("--stop")
+        assert r.returncode == 0 and foreign.poll() is None, r.stdout + r.stderr
+        assert "not this testbed's server" in r.stdout and not pidf.exists(), r.stdout
+        r = subprocess.run(["bash", "-c", 'source "$1"; refuse_foreign_port; echo started', "bash", str(here / "testbed.sh")],
+                           capture_output=True, text=True, env=e, timeout=60)
+        assert r.returncode == 1 and "started" not in r.stdout and foreign.poll() is None, r.stdout + r.stderr
+        assert ("port %d is already in use by pid %d" % (port, foreign.pid)) in r.stdout and "TESTBED_PORT=" in r.stdout, r.stdout
+    finally:
+        _end(foreign)
+    for wrap in (False, True):
+        port = _free_port(); e["TESTBED_PORT"] = str(port)
+        own = _listen(tmp_path, "main.py", port, wrap=wrap)
+        try:
+            pidf.write_text("%d\n" % own.pid)
+            r = tb("--stop")
+            assert r.returncode == 0 and _gone(own), (wrap, r.stdout + r.stderr)
+            assert "stopped pid" in r.stdout and not pidf.exists() and "not this testbed's" not in r.stdout, r.stdout
+            r = subprocess.run(["bash", "-c", 'source "$1"; refuse_foreign_port; echo free', "bash", str(here / "testbed.sh")],
+                               capture_output=True, text=True, env=e, timeout=60)
+            assert r.returncode == 0 and "free" in r.stdout, r.stdout + r.stderr
+        finally:
+            _end(own)
 
 
 # ---------------------------------------------------------------- C: the lift, the override loop, the import check

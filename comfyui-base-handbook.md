@@ -31,7 +31,8 @@ run once per machine as **step one**; then each workflow package is **step two**
    a newest dependency is named ("needs upgrading upstream") and the install goes on; ComfyUI's own startup failing is
    the one thing rolled back (only the packages that run changed). torch is the newest release on the newest CUDA
    build the machine's driver runs (`uv --torch-backend=auto`), never moved backwards on a shared venv. Python is the
-   newest CPython minor that resolves that set, its newest patch. uv, JupyterLab, SageAttention (rebuilt when main
+   newest CPython minor that resolves that set, its newest patch, among the minors the torch family (torch,
+   torchvision, torchaudio) has wheels for (one small compile each, 3.9.2). uv, JupyterLab, SageAttention (rebuilt when main
    moves), comfy-cli, pytest and huggingface_hub are upgraded every run. The OS packages and the NVIDIA driver
    (NVIDIA's `nvidia-open`) are upgraded first (§0.15). A pick that cannot be made stops the run. A pack row's sha is
    the last-tested record, printed every run and written back by `podctl` after a green install; never a target.
@@ -451,10 +452,14 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
 
 Suites ship as `suite.py` + `pytest.ini` beside the script and load the base's plugin (`-p basetest`), which gives
 `load_package`, `active_loaders`, `manifest_covers_active_loaders`, `brand_families`, `fake_pod` (layouts `official`,
-`community`, `bare`, `volume`), `run_script`, `boot_stubs`, `boot_fake_pod`, `tree_hash`, `code_only` and the per-tier
-table. `bash "<name>-script.sh" test` auto-detects the testbed and its server on 8199, or on the port a running testbed
+`community`, `bare`, `volume`), `run_script`, `boot_stubs`, `boot_fake_pod`, `tree_hash`, `code_only`, `zip_extra` and the
+per-tier table. `fake_pod` puts in `<root>/pkg` what the package's zip unpacks to: its top-level files, its vendored
+packs and every path its script's `ZIP_EXTRA` lists, read as `package.py` reads it (3.9.2: a shipped directory that is
+not a node pack, such as an app's `app/`, was missing; a listed file that is not there is an error). `bash "<name>-script.sh" test` auto-detects the testbed and its server on 8199, or on the port a running testbed
 recorded in `.testbed-server.port` beside `testbed.sh` (2.2.0: `_base_use_testbed` and `verify.sh` both read it, so a
-brand whose testbed runs elsewhere needs no env var); `BASE_NODE_SRC` / `BASE_SERVER` override; the runner hands the
+brand whose testbed runs elsewhere needs no env var). `--server` and `--stop` end only the server this checkout started,
+the pid in `.testbed-server.pid` while it is still a ComfyUI `main.py` (3.9.2); a port another process holds is never
+killed: `--server` stops, naming the holder's pid and a free `TESTBED_PORT`, and `--stop` says it left it running. `BASE_NODE_SRC` / `BASE_SERVER` override; the runner hands the
 suite `BASE_COMFY` and `BASE_VENV`, and `BASE_WORKSPACE` when set (3.6.0: the consumer root `py/pkgdirs.py` walks in the
 workspace shape, so a suite's cross-package checks see the workspace's packages); every other `BASE_*` is scrubbed.
 
@@ -681,6 +686,18 @@ for any invocation that somehow arrives without the environment. The suite asser
   hf_xet fast path (`HF_XET_HIGH_PERFORMANCE`, 32 range gets, no chunk cache) and resumable downloads were already in
   place and are unchanged. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
   real Hub for `hf cache verify` (a flipped byte fails it, exit 1); not on a pod.
+- 3.9.2: three harness fixes (2026-10-16). Two were found porting the Video Replacer 5.1.0 into its own repository.
+  `basetest.fake_pod` copies every path a package's `ZIP_EXTRA` ships (new helper `zip_extra`), so a shipped
+  directory that is not a node pack reaches the fake machine (the Replacer's `app/`, which its install test had copied by
+  hand). `testbed.sh` stops only the server it started: it used to kill whatever listened on `$PORT`, and on a Mac shared
+  by several sessions that was another checkout's ComfyUI on 8199. Ours is the pid `--server` recorded (now python's own
+  pid, not the subshell's), or its child for a pid file written before, and only while its command line is a ComfyUI
+  `main.py`; `--server` on a held port exits 1 naming the holder and a free `TESTBED_PORT`; `--status` says whose server
+  answers. The third came from the Video Swapper's pod install: a fresh venv lost minutes on CPython 3.15, which uv
+  lists before torchaudio ships a cp315 wheel (the backend pre-pick ran `torch_pick.py` for it, stepping down through
+  every CUDA build, then `_base_python_pick` ran the full derived-set resolve for it, before both fell back to 3.14).
+  `_base_family_minors` now asks uv for the torch family alone, per minor, newest first, and both picks start from
+  the newest minor that has it (the testbed has done so since 3.7.1). Unit tests for all three.
 - 3.9.1: `podctl create --private` (the default since 3.8.1) works again, and says plainly that its volume is not
   encrypted. It sent `volumeEncrypted: true`, which REST v1 `POST /pods` refuses ("Extra input keys": the field is on the
   Pod read-back only), so every private create failed before anything was made; and its summary printed "ENCRYPTED pod

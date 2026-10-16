@@ -1627,6 +1627,27 @@ def test_unit_fake_pod_layouts_official_community_bare(tmp_path):
         assert ("IMG=%s" % (root / "image")) in r.stdout if root.name == "hm" else "IMG=none" in r.stdout
 
 
+def test_unit_fake_pod_carries_every_file_zip_extra_ships(tmp_path):
+    """The fake machine's <root>/pkg is what the zip unpacks to: top-level files, vendored packs, and every ZIP_EXTRA path,
+    a directory that is not a node pack included. The Video Replacer's app/ (no __init__.py) was missing, so its install
+    test copied it by hand (2026-10-16). What ZIP_EXTRA does not list stays out, as it does in the zip; a listed file that
+    is not there is an error, never a silent skip."""
+    from basetest import fake_pod, zip_extra
+    pkg = tmp_path / "toy-pkg"; (pkg / "app" / "prompts").mkdir(parents=True); (pkg / "Spaced Dir").mkdir()
+    (pkg / "toy-pkg-script.sh").write_text('#!/usr/bin/env bash\nZIP_EXTRA=( "app/index.html" app/prompts/fast.api.json\n "Spaced Dir/a b.txt" )\n')
+    (pkg / "app" / "index.html").write_text("<p>"); (pkg / "app" / "prompts" / "fast.api.json").write_text("{}")
+    (pkg / "Spaced Dir" / "a b.txt").write_text("x"); (pkg / "app" / "draft.txt").write_text("not shipped")
+    assert zip_extra(pkg) == ["app/index.html", "app/prompts/fast.api.json", "Spaced Dir/a b.txt"]
+    fake_pod(tmp_path / "pod", pkg, layout="bare")
+    got = tmp_path / "pod" / "pkg"
+    assert (got / "app" / "index.html").read_text() == "<p>" and (got / "app" / "prompts" / "fast.api.json").exists()
+    assert (got / "Spaced Dir" / "a b.txt").exists() and (got / "toy-pkg-script.sh").exists()
+    assert not (got / "app" / "draft.txt").exists(), "a file ZIP_EXTRA does not list is not in the zip, so not on the fake machine"
+    (pkg / "app" / "index.html").unlink()
+    with pytest.raises(FileNotFoundError, match="app/index.html"):
+        fake_pod(tmp_path / "pod2", pkg, layout="bare")
+
+
 # ---------------------------------------------------------------- T12: discovery on the volume only (base V2.0.0)
 
 def test_unit_discover_never_adopts_a_container_disk_tree(tmp_path):
@@ -2110,7 +2131,7 @@ def test_unit_python_pick_passes_requirement_files_positionally_and_a_failed_pic
     env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin"}
     r = _bash('base_env_setup; base_discover quiet; _base_ensure_uv; PICK=$(_base_python_pick); echo PICK=$PICK', env=env)
     assert "PICK=3.14" in r.stdout, r.stdout + r.stderr
-    compile_line = [ln for ln in log.read_text().splitlines() if "pip compile" in ln][0]
+    compile_line = [ln for ln in log.read_text().splitlines() if "pip compile" in ln and "--extra-index-url" in ln][0]   # 3.9.2: the family check comes first
     assert " -r " not in compile_line and str(c / "requirements.txt") in compile_line and str(c / "custom_nodes" / "Pack" / "requirements.txt") in compile_line
     # a pick that really cannot resolve: the reason is shown, and the run is FAILED (exit 1), not a silent 0
     log = _uv_stub(tmp_path, fail=True)
