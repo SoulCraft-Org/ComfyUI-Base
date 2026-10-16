@@ -198,6 +198,8 @@ def test_unit_a_first_install_pays_no_dry_run_and_no_second_resolve():
     build = _code("lib/30-venv.sh", "_base_venv_build(){", "\n}\n")
     assert 'if [ "$had" = "0" ]; then' in build and "no venv to protect" in build
     assert 'BASE_DERIVED_DONE="$(_base_derived_fp)"' in build
+    i = build.index('BASE_DERIVED_DONE="$(_base_derived_fp)"')
+    assert build.rindex("base_torch_constraints", 0, i) > build.index("_base_derived_install")   # taken as the packs' step takes it
     pip = _code("lib/40-packs.sh", "# ---- pip half", "_base_pack_imports_report ${probe")
     assert '[ "$(_base_derived_fp)" = "$BASE_DERIVED_DONE" ]' in pip and "not resolved twice" in pip
 
