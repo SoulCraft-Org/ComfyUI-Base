@@ -92,7 +92,7 @@ _base_green_run(){ # the whole run when _base_already_green: the workflow checke
   echo "  install    skipped: this store already holds it, green ($(cat "$f" 2>/dev/null))"
   echo "  restart    $BASE_RESTART_RESULT"
   _base_timings_block; _base_timings_write
-  echo "  log        ${BASE_LOG:-—}"
+  echo "  log        ${BASE_LOG:-none}"
   BASE_SUMMARY_DONE=1
   if [ "${#BASE_FAILED[@]}" -gt 0 ]; then echo -e "${RED}  FAILED     ${#BASE_FAILED[@]}:${NC}"; _base_list "${BASE_FAILED[@]}"; exit 1; fi
   exit 0

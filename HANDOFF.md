@@ -94,6 +94,24 @@ only, a clean start, a start that never answers judged the long way and started 
 - That RunPod's FUSE mount reports a `fuse*` type in `/proc/self/mountinfo` (auto mode keys on it; `BASE_LOCAL_RUN=1`
   forces it if not).
 
+## 4. 3.11.0 measured on RunPod; the first install's packs pip skip fixed (3.15.2)   (2026-10-16, pods and volumes deleted)
+
+**Proven.** Two fresh pods side by side (H100 80GB HBM3, EU-FR-1, bare `runpod/base` CUDA 13 image, a network volume,
+MiniMax H3 Video Continuer 1.0.5, 41.1 GB, `podctl install <pod> --base --pkg … --no-gate --no-suite`), create to the
+workflow served through the public proxy: 3.9.2 2113 s, 3.11.0 1716 s. The downloads (127 s) and the tools venv (112 s)
+ran hidden beside the venv chain; the join waited under a second; BOOT went from 83 s to 1 s. The run also showed the
+packs pip resolve 3.11.0 meant to skip (138 s): fixed here, held by `suite/test_parallel_install.py`.
+
+**Owed (needs pods).**
+- The packs pip skip on a pod (about 130 s expected on a first install).
+- A second pod on a volume already installed GREEN, create to App usable (the "under 3 minutes" target): needs a package
+  whose install ends green (the Continuer 1.0.5 fails its smoke on every base: `LoadImageCrop` not registered).
+- A B300 run showing its venv kept (`sm_103` covered by `sm_100`).
+
+**Found on the way.** The combo check's `cp -p` into `/tmp` prints "preserving permissions … Operation not supported" on
+the bare image. The next serial step worth cutting is the newest pass (467 s here: two forcing rounds, each a full
+re-resolve and install, plus the holders' import probe).
+
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port

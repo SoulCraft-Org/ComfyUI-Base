@@ -308,7 +308,11 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   if [ ! -s "$CONSTRAINTS" ]; then err "no torch in the venv to hold"; BASE_FAILED+=("venv: torch missing after install"); BASE_VENV_RESULT="failed-torch"; _base_venv_rollback || true; return 1; fi
   echo "  constraints: $(wc -l < "$CONSTRAINTS" | tr -d ' ') package(s) of torch's closure held ($(grep -E '^torch==' "$CONSTRAINTS" | head -1))"
   if _base_run_watched "requirements (the derived set, one resolve)" _base_derived_install; then
-    BASE_DERIVED_DONE="$(_base_derived_fp)"        # 3.11.0: the packs' step resolves again only if the set changed since
+    # 3.11.0: the packs' step resolves again only if the set changed since. 3.15.2: its fingerprint is taken the way that step
+    # takes it, constraints read again from the venv first: the install above moves setuptools and the like, and a pod
+    # measured 2026-10-16 resolved the identical set twice (138 s) because this one was taken before
+    base_torch_constraints; _base_reqlift >/dev/null 2>&1 || true
+    BASE_DERIVED_DONE="$(_base_derived_fp)"
   else miss "the derived requirement set failed"; step_fail=1; fi
   # (d) verify inside the venv → stamp, else roll back
   if ! _base_venv_verify "$pymm" || [ "$step_fail" = "1" ]; then

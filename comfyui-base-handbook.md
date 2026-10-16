@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.15.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.15.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -778,6 +778,18 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.15.2: the first install's packs pip skip works, and 3.11.0 is measured on RunPod (2026-10-16). 3.11.0 meant the
+  packs' requirements step to skip the set the venv build had just installed; it resolved it again (138 s on the pod)
+  because the build took its fingerprint before reading the torch constraints from the venv again, and the install had
+  moved setuptools and the like. The build now reads them first, as the packs' step does. Measured before the fix, two
+  fresh pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, the
+  MiniMax H3 Video Continuer 1.0.5 and its 41.1 GB, `--no-gate --no-suite`), wall clock from `podctl create` to the
+  workflow listed through the public proxy: 3.9.2 2113 s, 3.11.0 1716 s (397 s less, 19 %). Stage by stage, 3.9.2 then
+  3.11.0: venv 743 / 689, newest 467 / 467, downloads 226 / hidden (127 s beside the venv chain; the join waited under
+  a second), import check 203 / 144, packs pip 127 / 138 (the defect above), restart 89 / 87, BOOT 83 / 1 (the tools
+  venv's 112 s hidden), packs git 39 / 57 (uv's once-per-run refresh moved before the venv). The existing-volume case is
+  not measured: the Continuer's smoke fails on every base (`LoadImageCrop` not registered), so it never leaves the green
+  verdict the skip needs.
 - 3.15.1: the copy reads from a local twin where it has one (2026-10-16, runpod-template-prebuilt's review). On a
   template pod's first boot every file crossed the network volume twice: the image's seed (`/opt/comfy-seed`) rsynced
   onto the volume, then read back from it for the container-disk copy. `BASE_RUN_TWIN=/opt/comfy-seed=/workspace`
