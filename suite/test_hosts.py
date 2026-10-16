@@ -317,14 +317,30 @@ def test_unit_jupyter_generates_one_token_keeps_it_private_and_never_goes_tokenl
     assert len(again) == 1 and again[0].endswith(saved[0]), again
     # and it binds what BASE_LISTEN says, which is loopback on every host but RunPod
     assert "--ip" in (BASE / "lib" / "boot.sh").read_text()
-    # the generation is gated on that bind: on a PUBLIC one with no credential, 2.1.0's refusal stands. A generated
-    # token would otherwise start a service on a *.proxy.runpod.net URL that nobody asked for.
+    # 3.9.0: and on a PUBLIC bind too. 2.1.0 refused it because nobody had anywhere to read a generated token; now the
+    # podctl verbs read it over ssh and, on RunPod, ONE line on the CONTAINER log (fd 3, the start command's own stdout:
+    # RunPod's Logs tab, the owner's) names it for a pod with no ssh key. Never the boot log on the volume.
     pub = tmp_path / "public"; (pub / "comfy-base" / "tools" / "bin").mkdir(parents=True)
     (pub / "comfy-base" / "state").mkdir()
     jl2 = pub / "comfy-base" / "tools" / "bin" / "jupyter-lab"; jl2.write_text("#!/bin/sh\nexit 0\n"); jl2.chmod(0o755)
     e = {k: v for k, v in os.environ.items() if k not in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD")}
-    e.update(BOOT_HOME=str(pub / "comfy-base"), BASE_LISTEN="0.0.0.0")
-    r3 = subprocess.run(["bash", "-c", 'source "%s/lib/boot.sh"; boot_jupyter' % BASE],
+    e.update(BOOT_HOME=str(pub / "comfy-base"), BASE_LISTEN="0.0.0.0", BASE_HOST="runpod", RUNPOD_POD_ID="podabc")
+    console = tmp_path / "console.log"
+    r3 = subprocess.run(["bash", "-c", 'source "%s/lib/boot.sh"; boot_jupyter 3>"%s"' % (BASE, console)],
                         capture_output=True, text=True, env=e, cwd=str(tmp_path))
-    assert r3.returncode == 0 and "JupyterLab not started" in r3.stdout and "never tokenless" in r3.stdout, r3.stdout
-    assert not (pub / "comfy-base" / "state" / "tokens.env").exists(), "a public bind must not generate a token"
+    ptf = pub / "comfy-base" / "state" / "tokens.env"
+    assert r3.returncode == 0 and "JupyterLab starting on 8888" in r3.stdout and ptf.exists(), r3.stdout + r3.stderr
+    ptok = [l.split("=", 1)[1] for l in ptf.read_text().splitlines() if l.startswith("JUPYTER_TOKEN=")][0]
+    assert oct(ptf.stat().st_mode)[-3:] == "600" and ptok not in r3.stdout + r3.stderr, "never in the boot log"
+    assert console.read_text() == "Jupyter Terminal token: %s   (open https://podabc-8888.proxy.runpod.net/lab?token=%s)\n" % (ptok, ptok)
+    # the pod's OWN token (podctl create sets one per pod) is used and never repeated, not even on the console
+    console.write_text("")
+    e2 = dict(e, JUPYTER_TOKEN="pod-own-token-value")
+    r4 = subprocess.run(["bash", "-c", 'source "%s/lib/boot.sh"; boot_jupyter 3>"%s"' % (BASE, console)],
+                        capture_output=True, text=True, env=e2, cwd=str(tmp_path))
+    assert r4.returncode == 0 and console.read_text() == "" and "pod-own-token-value" not in r4.stdout + r4.stderr
+    # and off RunPod (a VM's journald is not an owner-only page), the console gets nothing at all
+    console.write_text("")
+    r5 = subprocess.run(["bash", "-c", 'source "%s/lib/boot.sh"; boot_jupyter 3>"%s"' % (BASE, console)],
+                        capture_output=True, text=True, env=dict(e, BASE_HOST="vm"), cwd=str(tmp_path))
+    assert r5.returncode == 0 and console.read_text() == ""

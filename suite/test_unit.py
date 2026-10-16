@@ -1850,15 +1850,22 @@ def test_unit_boot_sh_refuses_to_start_a_venv_that_cannot_import_torch_and_says_
 
 def test_unit_boot_sh_never_starts_jupyter_tokenless_and_no_sshd_without_a_key(tmp_path):
     """2.1.0: a stranger's pod from the public template sets neither JUPYTER_TOKEN nor PUBLIC_KEY (RunPod's toggles exist only
-    on official templates, distribution plan blocker 2). The old tokenless start was root on the box; now nothing listens."""
+    on official templates, distribution plan blocker 2). The old tokenless start was root on the box.
+    3.9.0: the terminal is one of the pod's named links now, so the boot GENERATES its token even on RunPod's public bind,
+    and the one place it names it is the container log (the pod's Logs tab, the owner's): never the boot log, never argv."""
     from basetest import fake_pod, run_script
     STUB = _stub()
     fake_pod(tmp_path, STUB, layout="official")
     assert run_script(STUB / "stub-script.sh", fake_root=tmp_path).returncode == 0
     bin_, log = _boot_stubs(tmp_path)
     r, blog = _run_boot_sh(tmp_path, bin_)                       # PUBLIC_KEY set by the helper, no JUPYTER_*
-    assert r.returncode == 0 and "JupyterLab not started" in blog and "never tokenless" in blog, blog
-    assert "jupyter-lab " not in log.read_text() and "--IdentityProvider.token=" not in log.read_text()
+    tf = tmp_path / "comfy-base" / "state" / "tokens.env"
+    tok = [l.split("=", 1)[1] for l in tf.read_text().splitlines() if l.startswith("JUPYTER_TOKEN=")][-1]
+    assert r.returncode == 0 and "JupyterLab starting on 8888" in blog and "token generated" in blog, blog
+    calls = log.read_text()
+    assert ("JUPYTER_TOKEN=%s" % tok) in calls and "--IdentityProvider.token=" not in calls and "--ServerApp.token" not in calls
+    assert tok not in blog, "the generated token was written to the boot log on the volume"
+    assert ("Jupyter Terminal token: %s" % tok) in r.stdout and "fakepod-8888.proxy.runpod.net/lab?token=" in r.stdout, r.stdout
     assert "python main.py" in log.read_text()                    # ComfyUI still comes up
     src = (BASE / "lib" / "boot.sh").read_text()
     assert "IdentityProvider.token=''" not in code_only(src)      # the tokenless line is gone from the code, not just unreachable

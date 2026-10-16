@@ -1,0 +1,506 @@
+"""unit tier: the named ports (3.9.0). py/app_proxy.py (each customer app at the root of its own port), the boot's app
+ports, the install's apps.d rows, and podctl's names: the port-names template on RunPod, the links status prints, the
+tunnel's named localhost links. Everything runs on this Mac against fakes: a raw-socket ComfyUI stand-in, the fake
+RunPod REST/GraphQL server of test_podctl, a fake workspace. Nothing touches the network or a real pod."""
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import pytest
+
+pytestmark = pytest.mark.unit
+BASE = pathlib.Path(__file__).resolve().parents[1]
+PROXY = BASE / "py" / "app_proxy.py"
+sys.path.insert(0, str(BASE / "suite"))
+from test_podctl import FakeRunPod, _load, _pod, B200_STOCK  # noqa: E402  (the one fake RunPod)
+
+
+def _proxy_mod():
+    spec = importlib.util.spec_from_file_location("app_proxy_t", PROXY)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    return m
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("PODCTL_") or k == "BASE_WORKSPACE":
+            monkeypatch.delenv(k, raising=False)
+
+
+# ---------------------------------------------------------------- the forwarder, pure
+
+def test_unit_app_proxy_rows_and_the_path_rule():
+    m = _proxy_mod()
+    assert m.parse_row("8189|video-thing|Video Thing App") == (8189, "video-thing", "Video Thing App")
+    assert m.parse_row("  # a comment") is None and m.parse_row("") is None
+    for bad in ("8188|x|ComfyUI", "8888|x|J", "22|x|s", "80|x|low", "70000|x|high", "8189|Bad_Slug|n", "8189|x|", "8189|x", "p|x|n"):
+        with pytest.raises(ValueError):
+            m.parse_row(bad)
+    # the app's own files and its api go under /apps/<slug>/; ComfyUI's root routes the app calls go through unchanged
+    t = lambda p: m.target(p, "vr")
+    assert t("/") == "/apps/vr/" and t("/app.js") == "/apps/vr/app.js" and t("/prompts/fast.api.json") == "/apps/vr/prompts/fast.api.json"
+    assert t("/api/status") == "/apps/vr/api/status" and t("/api/run") == "/apps/vr/api/run"
+    assert t("/manifest.json?x=1") == "/apps/vr/manifest.json?x=1"
+    for core in ("/ws?clientId=abc", "/upload/image", "/view?filename=a.mp4&type=output", "/history/123", "/history?max_items=40",
+                 "/queue", "/interrupt"):
+        assert t(core) == core, core
+    assert t("/viewer.html") == "/apps/vr/viewer.html" and t("/historyish") == "/apps/vr/historyish"   # whole segments only
+    head, up = m.rewrite_head(b"GET / HTTP/1.1\r\nHost: h:8189\r\nConnection: keep-alive\r\nKeep-Alive: 5\r\n\r\n", lambda l: "GET /apps/vr/ HTTP/1.1")
+    assert head == b"GET /apps/vr/ HTTP/1.1\r\nHost: h:8189\r\nConnection: close\r\n\r\n" and up is False
+    head, up = m.rewrite_head(b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", lambda l: l)
+    assert up is True and head.endswith(b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+
+
+def test_unit_app_proxy_reads_every_package_file_and_keeps_the_first_claim(tmp_path, capsys):
+    m = _proxy_mod()
+    d = tmp_path / "apps.d"; d.mkdir()
+    (d / "a-pkg.list").write_text("8189|alpha|Alpha App\n")
+    (d / "b-pkg.list").write_text("8190|beta|Beta App\n8189|gamma|Gamma\n8888|bad|Bad\n")
+    assert m.read_rows(str(tmp_path)) == [(8189, "alpha", "Alpha App"), (8190, "beta", "Beta App")]
+    err = capsys.readouterr().err
+    assert "port 8189 is claimed by alpha and gamma" in err and "b-pkg.list" in err
+
+
+# ---------------------------------------------------------------- the forwarder, live against a ComfyUI stand-in
+
+class Upstream:
+    """A raw-socket ComfyUI stand-in: records each request head and body, answers 200 with the path it saw, and on an
+    Upgrade answers 101 and echoes every byte back (a websocket's shape, without parsing frames)."""
+
+    def __init__(self):
+        self.sock = socket.socket(); self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0)); self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        self.seen = []
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(c,), daemon=True).start()
+
+    def _one(self, c):
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            b = c.recv(65536)
+            if not b:
+                c.close(); return
+            buf += b
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        text = head.decode("latin-1")
+        n = int((re.search(r"(?im)^content-length:\s*(\d+)", text) or [0, 0])[1])
+        while len(rest) < n:
+            rest += c.recv(65536)
+        self.seen.append((text, rest))
+        if re.search(r"(?im)^upgrade:", text):
+            c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            while True:
+                b = c.recv(65536)
+                if not b:
+                    break
+                c.sendall(b)
+            c.close(); return
+        path = text.split(" ")[1]
+        body = ("saw %s %d" % (path, len(rest))).encode()
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n" % len(body) + body)
+        time.sleep(0.05); c.close()
+
+    def close(self):
+        self.sock.close()
+
+
+def _start_proxy(port, upstream_port, slug="vr"):
+    p = subprocess.Popen([sys.executable, str(PROXY), "--map", "%d=%s" % (port, slug), "--upstream", "127.0.0.1:%d" % upstream_port,
+                          "--listen", "127.0.0.1"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for _ in range(100):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            return p
+        except OSError:
+            time.sleep(0.05)
+    p.kill(); raise AssertionError("the forwarder never listened: %s" % p.communicate(timeout=10)[0])
+
+
+def _raw(port, data, read_until_close=True):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(data)
+    out = b""
+    while True:
+        b = s.recv(65536)
+        if not b:
+            break
+        out += b
+    s.close()
+    return out
+
+
+def test_unit_app_proxy_serves_the_app_at_its_ports_root_and_passes_websockets(tmp_path):
+    up = Upstream(); port = _free_port()
+    proc = _start_proxy(port, up.port)
+    try:
+        r = _raw(port, b"GET /app.js?v=2 HTTP/1.1\r\nHost: pod-8189.proxy.runpod.net\r\nOrigin: https://pod-8189.proxy.runpod.net\r\n"
+                       b"Connection: keep-alive\r\n\r\n")
+        assert r.endswith(b"saw /apps/vr/app.js?v=2 0") and b"Connection: close" in r and b"keep-alive" not in r, r
+        head = up.seen[-1][0]
+        assert head.startswith("GET /apps/vr/app.js?v=2 HTTP/1.1") and "Host: pod-8189.proxy.runpod.net" in head
+        assert "Origin: https://pod-8189.proxy.runpod.net" in head and "Connection: close" in head    # Host and Origin untouched
+        # the app's api, and a ComfyUI root route with a body that is passed through byte for byte
+        assert _raw(port, b"GET /api/status HTTP/1.1\r\nHost: x\r\n\r\n").endswith(b"saw /apps/vr/api/status 0")
+        body = b"x" * 300000
+        r = _raw(port, b"POST /upload/image HTTP/1.1\r\nHost: x\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        assert r.endswith(b"saw /upload/image 300000") and up.seen[-1][1] == body
+        assert _raw(port, b"GET /view?filename=a.mp4&type=output HTTP/1.1\r\nHost: x\r\n\r\n").endswith(b"saw /view?filename=a.mp4&type=output 0")
+        # a websocket: Upgrade kept, 101 through, then both directions are piped unparsed
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        s.sendall(b"GET /ws?clientId=abc HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n\r\n")
+        got = b""
+        while b"\r\n\r\n" not in got:
+            got += s.recv(4096)
+        assert got.startswith(b"HTTP/1.1 101") and b"Connection: Upgrade" in got
+        assert up.seen[-1][0].startswith("GET /ws?clientId=abc HTTP/1.1") and "Connection: Upgrade" in up.seen[-1][0]
+        s.sendall(b"\x81\x05hello"); echo = b""
+        while len(echo) < 7:
+            echo += s.recv(4096)
+        assert echo == b"\x81\x05hello"
+        s.close()
+    finally:
+        proc.terminate(); out = proc.communicate(timeout=10)[0]; up.close()
+    assert ("vr on 127.0.0.1:%d -> 127.0.0.1:%d/apps/vr/" % (port, up.port)) in out, out
+
+
+def test_unit_app_proxy_says_comfyui_is_starting_while_it_does_not_answer(tmp_path):
+    dead = _free_port(); port = _free_port()
+    proc = _start_proxy(port, dead)
+    try:
+        r = _raw(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    finally:
+        proc.terminate(); proc.communicate(timeout=10)
+    assert r.startswith(b"HTTP/1.1 503") and b"ComfyUI is starting" in r and b"http-equiv=refresh" in r, r
+
+
+# ---------------------------------------------------------------- the machine: boot_apps and the install's rows
+
+def _boot_home(tmp_path):
+    home = tmp_path / "comfy-base"; (home / "py").mkdir(parents=True); (home / "state" / "apps.d").mkdir(parents=True)
+    (home / "py" / "app_proxy.py").write_bytes(PROXY.read_bytes())
+    (home / "state" / "boot.env").write_text("PORT='%d'\n" % _free_port())
+    return home
+
+
+def test_unit_boot_apps_starts_one_forwarder_for_every_row_and_restarts_it(tmp_path):
+    """boot.sh starts the forwarder after ComfyUI (and `boot.sh --apps`, which the install runs, restarts it), bound to
+    BASE_LISTEN, ComfyUI's port from boot.env as its upstream; a second call replaces the first, never a second beside it."""
+    home = _boot_home(tmp_path)
+    port = _free_port()
+    (home / "state" / "apps.d" / "my-pkg.list").write_text("%d|my-app|My App\n" % port)
+    env = {**os.environ, "BOOT_HOME": str(home), "BASE_LISTEN": "127.0.0.1", "BASE_HOST": "vm"}
+    boot = BASE / "lib" / "boot.sh"
+    try:
+        r = subprocess.run(["bash", str(boot), "--apps"], capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == 0 and ("boot: app port %d: My App (/apps/my-app/" % port) in r.stdout, r.stdout + r.stderr
+        for _ in range(100):
+            try:
+                resp = _raw(port, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"); break
+            except OSError:
+                time.sleep(0.05)
+        assert resp.startswith(b"HTTP/1.1 503"), resp                       # no ComfyUI behind it in the suite
+        pids = lambda: subprocess.run(["pgrep", "-f", "app_proxy\\.py --state %s/state" % home], capture_output=True, text=True).stdout.split()
+        first = pids(); assert len(first) == 1, first
+        r = subprocess.run(["bash", str(boot), "--apps"], capture_output=True, text=True, env=env, timeout=60)
+        time.sleep(0.5)
+        second = pids(); assert len(second) == 1 and second != first, (first, second)
+        # no rows: nothing listens, and the old forwarder is gone
+        (home / "state" / "apps.d" / "my-pkg.list").unlink()
+        r = subprocess.run(["bash", str(boot), "--apps"], capture_output=True, text=True, env=env, timeout=60)
+        assert "app ports: none declared" in r.stdout and pids() == [], r.stdout
+    finally:
+        subprocess.run(["pkill", "-f", "app_proxy\\.py --state %s/state" % home])
+
+
+def _bash(snippet, env=None):
+    """Source base.sh, THEN set env (base.sh resets BASE_HOME and BASE_STATE as it loads), then run the snippet."""
+    sets = "; ".join("%s=%s" % (k, _sh(v)) for k, v in (env or {}).items())
+    return subprocess.run(["bash", "-c", 'source "%s/base.sh"; %s; %s' % (BASE, sets or "true", snippet)], capture_output=True, text=True)
+
+
+def _sh(v):
+    return "'" + str(v).replace("'", "'\\''") + "'"
+
+
+def test_unit_install_writes_the_packages_app_rows_and_refuses_a_bad_one(tmp_path):
+    """The BOOT stage writes state/apps.d/<package>.list from the package's APP_PORTS (the base declares none), refuses a
+    row that takes a base port or is not port|slug|name, and removes the file when the package stops declaring one."""
+    st = tmp_path / "state"; pkg = tmp_path / "packages" / "my-pkg"; pkg.mkdir(parents=True)
+    env = {"BASE_STATE": str(st), "BASE_HOME": str(tmp_path), "BASE_FAKE_ROOT": str(tmp_path), "PKG_DIR": str(pkg)}
+    r = _bash('BASE_DRY=0; APP_PORTS=("8189|my-app|My App" "8190|other|Other App"); base_boot_apps; echo "FAILED=${#BASE_FAILED[@]}"', env)
+    assert (st / "apps.d" / "my-pkg.list").read_text() == "8189|my-app|My App\n8190|other|Other App\n", r.stdout + r.stderr
+    assert "FAILED=0" in r.stdout and "not (re)started in a fake tree" in r.stdout
+    r = _bash('BASE_DRY=0; APP_PORTS=("8888|jup|Mine"); base_boot_apps; echo "FAILED=${#BASE_FAILED[@]}"', env)
+    assert "FAILED=1" in r.stdout and "8888 is the base's own" in r.stdout + r.stderr
+    assert (st / "apps.d" / "my-pkg.list").read_text().startswith("8189|"), "a refused row leaves the last good file alone"
+    r = _bash('BASE_DRY=0; APP_PORTS=("8191|Bad Slug|x"); base_boot_apps', env)
+    assert "lowercase kebab-case" in r.stdout + r.stderr
+    r = _bash('BASE_DRY=0; base_boot_apps', env)
+    assert not (st / "apps.d" / "my-pkg.list").exists() and "declares none now" in r.stdout
+    r = _bash('BASE_DRY=0; APP_PORTS=("8189|my-app|My App"); PKG_DIR="$BASE_DIR"; base_boot_apps', env)
+    assert not (st / "apps.d").exists() or not list((st / "apps.d").iterdir()), "the base's own run declares no app"
+
+
+# ---------------------------------------------------------------- podctl: the declarations
+
+def _workspace(tmp_path, rows):
+    ws = tmp_path / "ws"
+    for name, text in rows.items():
+        d = ws / name; d.mkdir(parents=True)
+        (d / ("%s-script.sh" % name)).write_text('PKG_NAME="%s"\n%s\nsource "$COMFY_BASE/base.sh"\n' % (name, text))
+    return ws
+
+
+def test_unit_podctl_reads_every_packages_app_ports_and_refuses_a_port_claimed_twice(tmp_path):
+    podctl = _load()
+    ws = _workspace(tmp_path, {"video-thing": 'APP_PORTS=("8189|video-thing|Video Thing App")   # its app',
+                               "image-thing": 'APP_PORTS=(\n  "8190|image-thing|Image Thing App"\n  # "8191|old|Old"\n)',
+                               "plain-thing": "WF_NAME=x.json"})
+    apps = podctl.declared_apps(root=ws)
+    assert apps == [(8189, "video-thing", "Video Thing App", "video-thing"), (8190, "image-thing", "Image Thing App", "image-thing")]
+    assert podctl.port_names(apps) == [(8188, "ComfyUI"), (8888, "Jupyter Terminal"), (8189, "Video Thing App"), (8190, "Image Thing App")]
+    ws2 = _workspace(tmp_path / "two", {"a-one": 'APP_PORTS=("8189|a|A")', "b-two": 'APP_PORTS=("8189|b|B")'})
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.declared_apps(root=ws2)
+    assert "port 8189 is declared twice: a-one (a) and b-two (b)" in str(e.value)
+    ws3 = _workspace(tmp_path / "bad", {"c-three": 'APP_PORTS=("8188|c|C")'})
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.declared_apps(root=ws3)
+    assert "c-three: APP_PORTS" in str(e.value)
+    assert podctl.app_rows_in("APP_PORTS=()\n") == [] and podctl.app_rows_in("X=1\n") == []
+
+
+# ---------------------------------------------------------------- podctl: RunPod's port names, through a template
+
+class TemplateStore:
+    """The template half of a fake RunPod: REST POST/GET /templates and GraphQL myself.podTemplates / saveTemplate,
+    plus the B200 stock answer for create. saveTemplate REPLACES the template, as RunPod's does."""
+
+    def __init__(self):
+        self.templates = {}; self.saved = []
+
+    def rest(self, method, path, body):
+        if path == "/templates" and method == "GET":
+            return 200, [dict(t, ports=t["ports"].split(",")) for t in self.templates.values()]
+        if path == "/templates" and method == "POST":
+            tid = "tpl%03d" % (len(self.templates) + 1)
+            self.templates[tid] = {"id": tid, "name": body["name"], "imageName": body["imageName"], "ports": ",".join(body["ports"]),
+                                   "env": [], "dockerArgs": "", "volumeInGb": 0, "volumeMountPath": body.get("volumeMountPath"),
+                                   "containerDiskInGb": body["containerDiskInGb"], "isPublic": body["isPublic"], "isServerless": False,
+                                   "readme": body.get("readme", ""), "category": body.get("category"), "portsConfig": []}
+            return 200, dict(self.templates[tid], ports=body["ports"])
+        if path.startswith("/templates/") and method == "GET":
+            t = self.templates.get(path.split("/")[2])
+            return (200, dict(t, ports=t["ports"].split(","))) if t else (404, {})
+        return None
+
+    def graphql(self, body):
+        q = body.get("query") or ""
+        if "dataCenters" in q:
+            return B200_STOCK
+        if "podTemplates" in q:
+            return {"myself": {"podTemplates": [dict(t) for t in self.templates.values()]}}
+        if "saveTemplate" in q:
+            inp = body["variables"]["input"]
+            self.saved.append(inp)
+            self.templates[inp["id"]] = dict(inp)
+            return {"saveTemplate": {"id": inp["id"]}}
+        return {}
+
+
+def _fake(pod=None):
+    store = TemplateStore()
+    srv = FakeRunPod(pod or _pod(), gql=store.graphql, rest=store.rest)
+    return srv, store
+
+
+def test_unit_runpod_create_names_every_port_through_a_private_template(tmp_path, capsys, monkeypatch):
+    """REST has no port label; GraphQL's portsConfig lives on templates only. So create makes (once) a private template
+    that carries the names and nothing else, re-sent whole through saveTemplate the way runpodctl does, and puts the
+    pod on it; the pod gets its ports, its own JupyterLab token (never printed), and every other field of its own."""
+    podctl = _load()
+    ws = _workspace(tmp_path, {"video-thing": 'APP_PORTS=("8189|video-thing|Video Thing App")'})
+    monkeypatch.setenv("BASE_WORKSPACE", str(ws))
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    srv, store = _fake()
+    try:
+        prov = podctl.RunPodProvider(api=podctl.Api("rp_key_names", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+        argv = ["--pubkey", str(pub), "create", "--public", "--name", "n1", "--gpu", "NVIDIA B200", "--image", "x/comfy:cu130", "--no-wait", "--data-gb", "100"]
+        assert podctl.cmd_create(prov, podctl.build_parser().parse_args(argv)) in (None, 0)
+        out = capsys.readouterr().out
+        body = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert body["ports"] == ["8188/http", "8888/http", "8189/http", "22/tcp"] and body["templateId"] == "tpl001"
+        tok = body["env"]["JUPYTER_TOKEN"]
+        assert re.fullmatch(r"[0-9a-f]{48}", tok) and body["env"]["PUBLIC_KEY"] == "ssh-ed25519 AAAAMAC mac@key"
+        assert "rp_key_names" not in out
+        # simple first: the ready links, named, the terminal's with its token (the one line that carries it)
+        links = [l.strip() for l in out.splitlines() if l.strip().startswith("links ")]
+        assert [re.split(r"\s{2,}", l)[1:] for l in links] == [
+            ["ComfyUI", "https://newpod0000001-8188.proxy.runpod.net"],
+            ["Jupyter Terminal", "https://newpod0000001-8888.proxy.runpod.net/lab?token=%s" % tok],
+            ["Video Thing App", "https://newpod0000001-8189.proxy.runpod.net"]], out
+        assert [l for l in out.splitlines() if tok in l] == [l for l in out.splitlines() if "Jupyter Terminal" in l and "token=" in l]
+        tmpl = [b for p, b in srv.bodies if p == "/templates"][0]
+        assert tmpl["isPublic"] is False and tmpl["env"] == {} and tmpl["dockerStartCmd"] == [] and tmpl["volumeInGb"] == 0
+        assert tmpl["name"].startswith("comfy-base ports ") and tmpl["ports"] == ["8188/http", "8888/http", "8189/http", "22/tcp"]
+        saved = store.saved[-1]
+        assert saved["portsConfig"] == [{"port": "8188", "name": "ComfyUI"}, {"port": "8888", "name": "Jupyter Terminal"},
+                                        {"port": "8189", "name": "Video Thing App"}]
+        assert saved["ports"] == "8188/http,8888/http,8189/http,22/tcp" and saved["name"] == tmpl["name"] and saved["isPublic"] is False
+        assert "names    8188 ComfyUI · 8888 Jupyter Terminal · 8189 Video Thing App (template tpl001)" in out, out
+        # a second pod with the same names reuses the template: no second POST /templates, no second saveTemplate
+        n_saved = len(store.saved)
+        assert podctl.cmd_create(prov, podctl.build_parser().parse_args(argv)) in (None, 0)
+        assert [p for p, _ in srv.bodies].count("/templates") == 1 and len(store.saved) == n_saved
+        body2 = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert body2["templateId"] == "tpl001" and body2["env"]["JUPYTER_TOKEN"] != tok          # a token per pod
+        # --no-names: the same ports, no template
+        assert podctl.cmd_create(prov, podctl.build_parser().parse_args(argv + ["--no-names"])) in (None, 0)
+        body3 = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert "templateId" not in body3 and body3["ports"] == body["ports"]
+        # the default (3.8.1), private: 22/tcp only, no template, no token in RunPod's env
+        capsys.readouterr()
+        priv = [a for a in argv if a != "--public"]
+        assert podctl.cmd_create(prov, podctl.build_parser().parse_args(priv)) in (None, 0)
+        body4 = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert body4["ports"] == ["22/tcp"] and "templateId" not in body4 and "JUPYTER_TOKEN" not in body4["env"]
+        assert "podctl tunnel newpod0000001 prints the links" in capsys.readouterr().out
+    finally:
+        srv.close()
+
+
+def test_unit_runpod_port_names_refuse_a_port_the_template_lacks_and_a_failure_still_makes_the_pod(tmp_path, capsys):
+    podctl = _load()
+    srv, store = _fake()
+    try:
+        api = podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql")
+        tid = podctl._runpod.names_template(api, [(8188, "ComfyUI"), (8888, "Jupyter Terminal")], "x/i:1", say=lambda *a: None, sleep=lambda s: None)
+        with pytest.raises(podctl.PodctlError) as e:
+            podctl._runpod.save_port_names(api, tid, [(8189, "Not There")], sleep=lambda s: None)
+        assert "8189 is not one of template" in str(e.value)
+        with pytest.raises(podctl.PodctlError):
+            podctl._runpod.save_port_names(api, tid, [(8188, "  ")], sleep=lambda s: None)
+        # RunPod refusing the names never costs the pod: create says so and goes on without a template
+        srv.gql = lambda body: {"__error__": "saveTemplate refused"} if "saveTemplate" in (body.get("query") or "") else TemplateStore.graphql(store, body)
+        said = []
+        pod_id = podctl.create(api, "n2", "NVIDIA B200", "EU-RO-1", data_gb=50, image="x/i:2", pubkey="ssh-ed25519 K k",
+                               wait=False, say=said.append, names=[(8188, "ComfyUI"), (8888, "Jupyter Terminal"), (8189, "App")])
+        assert pod_id == "newpod0000001" and any("could not be written" in s for s in said), said
+        assert "templateId" not in [b for p, b in srv.bodies if p == "/pods"][-1]
+    finally:
+        srv.close()
+
+
+def test_unit_status_prints_the_named_links_and_deploy_keeps_the_names(tmp_path):
+    podctl = _load()
+    prov = podctl.RunPodProvider(api=object())
+    pod = _pod(id="pod123", ports=["8188/http", "8888/http", "8189/http", "8200/http", "22/tcp"], env={"JUPYTER_TOKEN": "tokfromenv"})
+    declared = [(8189, "video-thing", "Video Thing App", "video-thing")]
+    lines = podctl.status_links(prov, pod, declared, machine=("tokfrommachine", []))
+    got = [re.split(r"\s{2,}", l.replace("links    ", "", 1)) for l in lines]
+    assert got == [["ComfyUI", "https://pod123-8188.proxy.runpod.net"],
+                   ["Jupyter Terminal", "https://pod123-8888.proxy.runpod.net/lab?token=tokfromenv"],   # the pod's own token wins
+                   ["Video Thing App", "https://pod123-8189.proxy.runpod.net"],
+                   ["HTTP Service (port 8200)", "https://pod123-8200.proxy.runpod.net"]], lines
+    # the machine's own rows name a port this tree does not declare; its saved token is used when the env has none
+    pod2 = _pod(id="pod9", ports=["8188/http", "8888/http", "8190/http"], env={})
+    l2 = podctl.status_links(prov, pod2, [], machine=("tokm", [(8190, "other", "Other App")]))
+    assert "Other App" in l2[2] and l2[1].endswith("/lab?token=tokm"), l2
+    # a private pod has nothing to link through the proxy: the tunnel is the way
+    l3 = podctl.status_links(prov, _pod(id="priv", ports=["22/tcp"], env={}), declared)
+    assert l3 == ["links    none through the proxy (no http port): podctl tunnel priv prints the localhost links"]
+    facts = podctl.pod_facts(_pod(env={}))
+    assert "auth: NONE" not in facts and "token: generated by the boot" in facts
+    # deploy: a names template is kept, any other template is not; the clone gets its own token
+    srv, store = _fake(_pod(templateId="tplX", env={"JUPYTER_TOKEN": "old", "PUBLIC_KEY": "k"}, networkVolume={"id": "v", "dataCenterId": "EU-RO-1"},
+                            machine={"gpuTypeId": "NVIDIA B200", "secureCloud": True}))
+    store.templates["tplX"] = {"id": "tplX", "name": "comfy-base ports abc", "ports": "8188/http"}
+    try:
+        api = podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql")
+        podctl.deploy(api, "fakepod0000001", wait=False, say=lambda *a: None)
+        b = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert b["templateId"] == "tplX" and b["env"]["JUPYTER_TOKEN"] not in ("old", "") and b["env"]["PUBLIC_KEY"] == "k"
+        store.templates["tplX"]["name"] = "someone else's template"
+        srv.pod = _pod(templateId="tplX", networkVolume={"id": "v", "dataCenterId": "EU-RO-1"}, machine={"gpuTypeId": "NVIDIA B200"})
+        podctl.deploy(api, "fakepod0000001", wait=False, say=lambda *a: None)
+        assert "templateId" not in [b for p, b in srv.bodies if p == "/pods"][-1]
+    finally:
+        srv.close()
+
+
+def test_unit_tunnel_forwards_the_machines_app_ports_and_prints_named_localhost_links():
+    podctl = _load()
+    tok, apps = podctl.parse_tunnel_facts("abc123\n--apps--\n8189|video-thing|Video Thing App\njunk\n")
+    assert tok == "abc123" and apps == [(8189, "video-thing", "Video Thing App")]
+    assert podctl.parse_tunnel_facts("\n--apps--\n") == (None, [])
+    ports, lines = podctl.tunnel_plan([8188, 8888], False, apps, [], tok)
+    assert ports == [8188, 8888, 8189]
+    assert lines == ["tunnel  ComfyUI           http://localhost:8188",
+                     "tunnel  Jupyter Terminal  http://localhost:8888/lab?token=abc123",
+                     "tunnel  Video Thing App   http://localhost:8189"], lines
+    # --port given: exactly those, LOCAL:REMOTE named by the remote port
+    ports, lines = podctl.tunnel_plan(["8190:8188", "8191:8189"], True, apps, [], None)
+    assert ports == ["8190:8188", "8191:8189"] and lines[0].endswith("http://localhost:8190") and "Video Thing App" in lines[1]
+    # nothing read from the machine: this tree's declarations name and add the ports
+    ports, lines = podctl.tunnel_plan([8188, 8888], False, [], [(8189, "v", "V App", "v")], None)
+    assert ports == [8188, 8888, 8189] and "(no token read: podctl jupyter <pod>)" in lines[1] and "V App" in lines[2]
+    a = podctl.build_parser().parse_args(["tunnel", "p1"]); assert not getattr(a, "port_given", False)
+    a = podctl.build_parser().parse_args(["tunnel", "p1", "--port", "9000"]); assert a.port_given and a.port == [9000]
+    cmd = podctl.tunnel_facts_cmd()
+    assert "JUPYTER_TOKEN" in cmd and "cat /workspace/comfy-base/state/tokens.env" not in cmd    # the one token, never the file
+
+
+def test_unit_private_create_hands_the_token_over_ssh_and_prints_the_tunnels_named_links(tmp_path, monkeypatch):
+    """A private pod's token never goes into RunPod's env (kept in the clear): once ssh answers, create hands it to the
+    encrypted volume through ssh's STDIN (never argv), keeps one already there, and prints the links the tunnel opens."""
+    podctl = _load()
+    seen = []
+
+    def fake_ssh(cmd, env=None, timeout=None, input=None):
+        seen.append((cmd, input))
+        return subprocess.CompletedProcess(cmd, 0, "SEEDED\n", "")
+    monkeypatch.setattr(podctl, "ssh_run", fake_ssh)
+    srv, store = _fake()
+    try:
+        api = podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql")
+        said = []
+        podctl.create(api, "p1", "NVIDIA B200", "EU-RO-1", data_gb=50, image="x/i:cu130", pubkey="ssh-ed25519 K k", private=True,
+                      wait=True, sleep=lambda s: None, banner=lambda h, p: True, ssh_config=tmp_path / "config", say=said.append,
+                      names=[(8188, "ComfyUI"), (8888, "Jupyter Terminal"), (8189, "Video Thing App")])
+    finally:
+        srv.close()
+    (cmd, inp), = seen
+    tok = inp.strip().split("=", 1)[1]
+    assert re.fullmatch(r"[0-9a-f]{48}", tok) and tok not in cmd and "tokens.env" in cmd and "umask 077" in cmd
+    lines = [s.strip() for s in said if s.strip().startswith("tunnel ")]
+    assert lines == ["tunnel  ComfyUI           http://localhost:8188",
+                     "tunnel  Jupyter Terminal  http://localhost:8888/lab?token=%s" % tok,
+                     "tunnel  Video Thing App   http://localhost:8189"], said
+    assert "JUPYTER_TOKEN" not in [b for p, b in srv.bodies if p == "/pods"][-1]["env"]
+    # a token already on the volume is kept, and that is the one printed
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None, input=None: subprocess.CompletedProcess(cmd, 0, "keptone\n", ""))
+    assert podctl._runpod.seed_jupyter_token(say=lambda *a: None) == "keptone"
+    monkeypatch.setattr(podctl, "ssh_run", lambda cmd, env=None, timeout=None, input=None: subprocess.CompletedProcess(cmd, 255, "", "x"))
+    assert podctl._runpod.seed_jupyter_token(say=lambda *a: None) is None

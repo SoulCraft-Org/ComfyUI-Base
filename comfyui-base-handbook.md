@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.8.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.9.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -75,8 +75,14 @@ run once per machine as **step one**; then each workflow package is **step two**
    where `BASE_LISTEN` is loopback (every host but RunPod, so the terminal is reachable only through an ssh tunnel)
    the boot GENERATES a token instead of leaving the terminal dark, and writes it owner-only to `state/tokens.env`.
    It is still never printed, for the same reason no other token is: with a shared store the boot log is a file every
-   machine mounts. `podctl jupyter <machine>` reads it over ssh and prints the URL with the token already in it. On a
-   public bind with no credential, 2.1.0's refusal is unchanged.
+   machine mounts. `podctl jupyter <machine>` reads it over ssh and prints the URL with the token already in it.
+   3.9.0: JupyterLab is the pod's named "Jupyter Terminal" link, so the boot generates its token on EVERY bind; 2.1.0's
+   public-bind refusal is gone because nothing listens tokenless and the token now has owner-only places to be read:
+   `podctl create --public` puts a fresh per-pod `JUPYTER_TOKEN` in a RunPod pod's env and prints the ready link with it
+   (`deploy --like` gives the clone its own; the private default hands it to the encrypted volume over ssh stdin instead),
+   `podctl status`, `jupyter` and `tunnel` print the link with it, and on RunPod's public bind a token the boot made
+   (never one the env set) is written as ONE line to the container log, the start command's own stdout (RunPod's Logs
+   tab), which is how a pod from a public template with no ssh key gets its terminal. Never to the boot log.
 10. **The base owns ComfyUI's launch flags.** `state/comfyui_args.txt` is the only source. An image's own args file
     (RunPod's `runpod-slim/comfyui_args.txt`) is imported once, on the first real run, and never read again; nothing
     creates a phantom file on images that have none. `HYGIENE_ARGS` entries are ensured present, `HYGIENE_ARGS_REMOVE`
@@ -186,10 +192,12 @@ the local zip is checked current, the volume size is recorded for the disk gate,
 copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block is printed, and a green run writes the pack records
 it printed (each pack's HEAD) into the local script and rebuilds its zip. A run that upgraded the NVIDIA driver stops with
 "restart required" and prints the `podctl restart` a person approves; the same install then continues. A red run stops with the console's path: the log is the deliverable, the fix loop
-starts there. `podctl tunnel <pod>` is the one ssh session that forwards ports (8188, 8888, and 9199 and 11434 beside them:
+starts there. `podctl tunnel <pod>` is the one ssh session that forwards ports (8188, 8888, each app port the machine
+serves (3.9.0), and 9199 and 11434 beside them:
 the base runs no metrics exporter and no inference server, but a package may run one on the machine and reach
 it on loopback, which is the shape a package takes when its point is that nothing leaves the box) for the canvas tools and
-the browser. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
+the browser; it prints them first as named localhost links (`ComfyUI http://localhost:8188`, `Jupyter Terminal
+http://localhost:8888/lab?token=…`, one per app), which is how a `--private` pod's ports are named. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
 (`<Display Name>/` with a `<Display Name> Script.sh`, and `ComfyUI Base/`) and their workflow copies in ComfyUI's
 browser; `--yes` removes exactly those, after the re-install has put the `<name>/` folders beside them. `--pkg` takes
 the repository-relative package path (`<brand>/packages/<name>`) or a bare `<name>` that one brand has.
@@ -212,7 +220,18 @@ uv run "base/comfyui-base/_build/pod/podctl.py" stop|start|restart <pod> --wait
 <sshd bootstrap>; exec <the image's own entry>"` (the image's entry read from Docker Hub's registry; `--entry` for
 private images). Before the base is installed that boots the image as it was plus sshd; afterwards it boots the base.
 `stop`/`start --wait` rewrite the `Host runpod` block, because RunPod maps a new public port on every start. ComfyUI
-(8188) and JupyterLab (8888) are also on RunPod's HTTP proxy ports, which is why this host binds `0.0.0.0`. Fallback
+(8188) and JupyterLab (8888) are also on RunPod's HTTP proxy ports, which is why this host binds `0.0.0.0`.
+
+**Named ports (3.9.0).** RunPod's Connect tab links ports, not paths, and names a port only from the pod's TEMPLATE:
+GraphQL `PodTemplate.portsConfig: [{port, name}]`, written by `saveTemplate` (REST v1 and v2 have no label field, and a
+pod has no names of its own; a pod with no template shows "Port 8188 → HTTP Service"). So `podctl create` exposes
+`8188/http` "ComfyUI", `8888/http` "Jupyter Terminal" and one `/http` port per customer app the tree's packages declare
+(§4 `APP_PORTS`), then `22/tcp`, and puts the pod on a private template of the account, `comfy-base ports <sig>`, made
+once per set of names (REST `POST /templates`, then the names re-sent with every other field through `saveTemplate`, the
+way runpodctl v3 does). That template carries the names and nothing else: no env, no start command, no volume.
+`--no-names` skips it. A failure to write the names is said and never costs the pod. `status` prints the links
+(`https://<pod>-<port>.proxy.runpod.net`, the terminal's with its token). On the machine, `py/app_proxy.py` serves each
+app at its own port's root (§6). Fallback
 when the API is not available: the JupyterLab terminal on port 8888, where `bash lib/boot.sh --print-sshd-bootstrap`
 prints the sshd snippet to paste.
 
@@ -354,6 +373,15 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   says so: the run's test stage notes it, and `verify.sh` passes the package as "no suite, declared". `LOADER_CATS`
   rows (`NodeType|library category`) extend the base's map of loader node types to library folders (`lib/60-sync.sh`
   covers ComfyUI's core loaders and the shared packs'); a package whose own pack loads models declares its loaders here.
+- Optional, 3.9.0: `APP_PORTS=("<port>|<slug>|<name>" …)`, one row per customer app the package ships, which ComfyUI
+  serves at `/apps/<slug>/` (a pack the package carries; the base serves none). The port is 1024-65535 and never one
+  of the base's (22, 8188, 8888, 9199, 11434), the slug is the app's folder, the name is what the host's console and
+  the tunnel call it (`APP_PORTS=("8189|video-replacer|Video Replacer App")`). The BOOT stage writes the rows to
+  `state/apps.d/<package>.list` and restarts the forwarder; `podctl create`, `status`, `tunnel` and a brand's
+  template read the same rows from the script. A port two packages declare fails `podctl`, naming both. The app must
+  reach ComfyUI's own routes relative to its own URL (`new URL("../../", here)`), so it works at `/apps/<slug>/` and at
+  `/` on its port alike, and may not name a top-level file after a route the forwarder passes through (`ws upload view
+  history queue interrupt`).
 - `VENDORED_PACKS=( dir ... )` (3.2.0): the package's own node packs, folders beside the script that ship in its zip
   (their files listed in `ZIP_EXTRA`). The base mirrors each into `custom_nodes` on every install, right after
   `pkg_post_venv` and before the requirements resolve: the installed folder becomes exactly what the zip carries (a file
@@ -480,7 +508,8 @@ and a failed import check is a failure, never a rollback.
 | Launch flags | `state/comfyui_args.txt` (§0.10) |
 | Tokens | the machine's own environment, then `state/tokens.env` (§0.9) |
 | The host | `BASE_HOST`, `BASE_VOLUME`, `BASE_VOLUME_KIND`, `BASE_LISTEN` (§1); `state/host.env` when the driver wrote it |
-| The boot | `boot.sh`: PID 1 via podctl's start command on RunPod, the process of `comfy-base-boot.service` on a VM host: sshd (keys only) → JupyterLab (base tools venv, `JUPYTER_TOKEN`/`JUPYTER_PASSWORD`) → boot extensions (§9) → ComfyUI (base venv, base line, bound to `BASE_LISTEN`) → sleep forever |
+| The boot | `boot.sh`: PID 1 via podctl's start command on RunPod, the process of `comfy-base-boot.service` on a VM host: sshd (keys only) → JupyterLab (base tools venv, `JUPYTER_TOKEN`/`JUPYTER_PASSWORD`, else generated: never tokenless) → boot extensions (§9) → ComfyUI (base venv, base line, bound to `BASE_LISTEN`) → the app ports (3.9.0) → sleep forever |
+| App ports | `py/app_proxy.py` (standard library, any python3, never the GPU): one process for every row of `state/apps.d/*.list`, bound to `BASE_LISTEN`. `:<port>/<path>` → `127.0.0.1:8188/apps/<slug>/<path>`, except `ws upload view history queue interrupt`, which pass unchanged; one request per connection (`Connection: close` both ways), then bytes piped both ways, so bodies, streams and the websocket's 101 pass unparsed; `Host` and `Origin` untouched; a page that says ComfyUI is starting while it does not answer. `boot.sh --apps` restarts it (the install runs it) |
 | Restart | `_base_pids_from_table`: a python running `main.py` from the tree, or naming a `…/ComfyUI/main.py`; never PID 1 |
 | Uploads | `<volume>/packages/` (`podctl upload`); each package extracted into its own folder there |
 | A baked image | a project's own (the base ships no generator): the base built at these very paths and parked on the container disk; a boot extension copies it onto an empty volume once and installs the project's packages, non-interactive, everything newest (§0.12) |
@@ -489,7 +518,7 @@ and a failed import check is a failure, never a rollback.
 **RunPod, three image families:** RunPod's ComfyUI (tree `/workspace/runpod-slim/ComfyUI`,
 `runpod-slim/comfyui_args.txt` imported once, sshd native); community templates that keep the code on the container
 disk (`/ComfyUI`) with the persist dirs at `/workspace/ComfyUI`, so the base materialises the code beside them (no sshd;
-JupyterLab unauthenticated unless `JUPYTER_TOKEN`); a bare GPU image (everything materialised). `/workspace` is a
+their own JupyterLab, if any, unauthenticated unless `JUPYTER_TOKEN`; the base's never is); a bare GPU image (everything materialised). `/workspace` is a
 network filesystem: `df` reports the shared pool, so the disk gate says when it cannot verify headroom. Slim images
 have no `unzip`; `python3 -m zipfile -e` does the job.
 
@@ -508,9 +537,10 @@ listens beyond loopback.
 `<volume>/comfy-base/` holds the library (`base.sh lib/ py/ suite/ hosts/`, verified against `MANIFEST.sha256` on
 every source), `boot.sh`, `comfy-base-boot.service` (the unit's text, always written; installed under
 `/etc/systemd/system` on a VM host), `ext/` when a project's image put extensions there (§9), `state/` (`boot.env`,
-`host.env` (`BASE_HOST`, `BASE_VOLUME`, written by the driver), `comfyui_args.txt`, `tokens.env` 0600,
+`host.env` (`BASE_HOST`, `BASE_VOLUME`, written by the driver), `comfyui_args.txt`, `tokens.env` 0600, `apps.d/<package>.list`
+(3.9.0: the package's `APP_PORTS` rows),
 `constraints-torch.txt`, `boot-facts.txt`, `volume.env` on RunPod, `gpu.lease`, `packages/<id>.manifest`, `logs/`: install
-logs, `boot_<ts>.log`, `comfyui.log`, `jupyter.log`, `fetch-later_<ts>.log`; 3.1.0: `last-run/<id>` (the last run's
+logs, `boot_<ts>.log`, `comfyui.log`, `jupyter.log`, `app_proxy.log`, `fetch-later_<ts>.log`; 3.1.0: `last-run/<id>` (the last run's
 verdict), `runtime.json` and `runtime.stamp` (the applied runtime), and for a staged install `standins.list`,
 `later.queue`, `later.failed`, `fetch-later.pid` and `progress.json`:
 `{"format": 1, "updated", "stage": "first|later|done", "files": [{"file", "rel", "bytes", "state":
@@ -625,6 +655,16 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.9.0: named ports. On RunPod's Connect tab every link has a name: `8188` "ComfyUI", `8888` "Jupyter Terminal", and
+  one port per customer app a package declares (`APP_PORTS`, §4), through a private port-names template `podctl
+  create` makes once per set of names (§1.1; RunPod names ports only on templates, GraphQL `portsConfig`). The machine
+  serves each app at its port's root with `py/app_proxy.py` (§6), restarted by the install and started by the boot
+  after ComfyUI. JupyterLab is never tokenless and never dark for want of a token: a per-pod `JUPYTER_TOKEN` from
+  `create` (a fresh one for a `deploy --like` clone), else generated by the boot on any bind, read back by `status`,
+  `jupyter` and `tunnel`, and on RunPod's public bind named once on the container log, never the boot log (rule 9).
+  `podctl tunnel` forwards the machine's app ports too and prints the three kinds of link as named localhost URLs.
+  Exercised on this Mac against fakes (the suite's fake RunPod REST and GraphQL, a raw-socket ComfyUI, fake pods);
+  the console showing the names and the forwarder in front of a real ComfyUI are owed on a real pod.
 - 3.8.2: the canvas size cache is compared only on the OS that photographed it. The frontend measures text with the
   system's fonts, so the package gate's Linux runner computed other sizes than the Mac that made `_build/sizes.json`
   (2026-10-16: 22 of the Character Creator's nodes off on Linux, 1 on the Mac, both on frontend 1.55.17), and

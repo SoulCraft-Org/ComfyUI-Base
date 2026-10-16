@@ -4,8 +4,9 @@
 # (the Mac runs these functions in the suite). Never `set -e`: a boot that dies takes the machine with it, and the whole
 # point of this file is that it always comes up reachable.
 #
-#     bash boot.sh                          the boot (sshd → JupyterLab → ComfyUI → sleep infinity); BOOT_HOME=<volume>/comfy-base
+#     bash boot.sh                          the boot (sshd → JupyterLab → ComfyUI → app ports → sleep infinity); BOOT_HOME=<volume>/comfy-base
 #     bash boot.sh --print-sshd-bootstrap   the self-contained sshd snippet podctl puts in a RunPod start command
+#     bash boot.sh --apps                   (re)start the app ports only (3.9.0; the install runs it)
 #
 # BOOT_HOME defaults to this file's own directory (the image's ENV or the unit sets it explicitly). BOOT_ROOT prefixes
 # /root and /run for the suite's fake pods; empty on a machine. BASE_LISTEN is 0.0.0.0 on RunPod and 127.0.0.1 elsewhere.
@@ -80,52 +81,62 @@ boot_extensions(){ # 2.2.0: a project's own boot stages, ext/*.sh, sourced in na
   [ "$n" -gt 0 ] || echo "boot: no extensions (no ext/*.sh on the volume or beside boot.sh)"
   return 0
 }
-boot_jupyter(){ # JupyterLab from the base's tools venv; the token rides the environment (never argv); no token, no JupyterLab
-  # 2.1.0: the tokenless start is gone. It was survivable while every pod set JUPYTER_TOKEN by hand; a pod from a public
-  # template sets nothing, and an unauthenticated JupyterLab on a *.proxy.runpod.net URL is root on the box. A pod that wants a terminal sets JUPYTER_TOKEN (or JUPYTER_PASSWORD) and stops/starts.
-  local jl="$BOOT_HOME/tools/bin/jupyter-lab" tok="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}" made=""
+boot_jupyter(){ # JupyterLab from the base's tools venv; the token rides the environment (never argv); never tokenless
+  # 2.1.0: the tokenless start is gone: an unauthenticated JupyterLab on a *.proxy.runpod.net URL is root on the box.
+  # 3.9.0: and it is never dark for want of a token either. A pod's own JUPYTER_TOKEN (podctl create sets a fresh one per
+  # pod) or JUPYTER_PASSWORD wins; else the one saved in state/tokens.env; else one is GENERATED and saved, on every bind.
+  # 2.5.6 generated only on loopback and 2.1.0 refused the public bind, because nobody had anywhere to read a generated
+  # token. Now somebody does: podctl status, jupyter and tunnel read it over ssh, and on RunPod's public bind the boot
+  # writes ONE line naming it to the CONTAINER log (RunPod's Logs tab, the pod owner's), which is how a pod from the
+  # public template, with no ssh key, gets its terminal. Never to the boot log, which is a file on the volume.
+  local jl="$BOOT_HOME/tools/bin/jupyter-lab" tok="${JUPYTER_TOKEN:-${JUPYTER_PASSWORD:-}}" made="" own=1
   local listen="${BASE_LISTEN:-127.0.0.1}"
   if [ ! -x "$jl" ]; then echo "boot: no JupyterLab in $BOOT_HOME/tools (the base install builds it) — port 8888 stays dark"; return 0; fi
   # read the saved one FIRST, so this does not depend on boot_tokens having run: a second boot must reuse the
   # token, never append a new line. My own test caught it doing exactly that.
   local tf="$BOOT_HOME/state/tokens.env"
+  if [ -n "$tok" ]; then own=0; fi
   if [ -z "$tok" ] && [ -f "$tf" ]; then tok="$(sed -n 's/^JUPYTER_TOKEN=//p' "$tf" | tail -1)"; fi
   if [ -z "$tok" ]; then
-    # 2.5.6: with no credential, GENERATE one rather than leave the terminal dark — but ONLY where the server binds
-    # loopback and is therefore reachable through an ssh tunnel and nothing else. That is every host but RunPod.
-    # On a public bind 2.1.0's refusal stands unchanged: a generated token is still a service listening on a
-    # *.proxy.runpod.net URL that nobody asked to start, and the operator has somewhere to read the token only if
-    # they already have the box. Fail closed, the house default.
-    case "$listen" in
-      127.0.0.1|localhost|::1|'')
-        tok="$( (openssl rand -hex 32 2>/dev/null) || (head -c32 /dev/urandom | od -An -tx1 | tr -d " \n") )"
-        if [ -z "$tok" ]; then echo "boot: JupyterLab not started — no token could be generated and none was set (never tokenless)"; return 0; fi
-        mkdir -p "$BOOT_HOME/state"; ( umask 077; printf 'JUPYTER_TOKEN=%s\n' "$tok" >> "$tf" )
-        chmod 600 "$tf" 2>/dev/null || true
-        export JUPYTER_TOKEN="$tok"; made=" (token generated, saved to state/tokens.env)"
-        ;;
-      *)
-        echo "boot: JupyterLab not started — no JUPYTER_TOKEN or JUPYTER_PASSWORD, and this host binds $listen, which is"
-        echo "boot:   reachable from outside. JupyterLab is never tokenless: set one and restart, or bind loopback and"
-        echo "boot:   reach it through an ssh tunnel, which generates a token for you."
-        return 0
-        ;;
-    esac
+    tok="$( (openssl rand -hex 32 2>/dev/null) || (head -c32 /dev/urandom | od -An -tx1 | tr -d " \n") )"
+    if [ -z "$tok" ]; then echo "boot: JupyterLab not started — no token could be generated and none was set (never tokenless)"; return 0; fi
+    mkdir -p "$BOOT_HOME/state"; ( umask 077; printf 'JUPYTER_TOKEN=%s\n' "$tok" >> "$tf" )
+    chmod 600 "$tf" 2>/dev/null || true
+    made=" (token generated, saved to state/tokens.env)"
   fi
+  export JUPYTER_TOKEN="$tok"
   mkdir -p "$BOOT_HOME/state/logs"
-  JUPYTER_TOKEN="$tok" nohup "$jl" --ip "${BASE_LISTEN:-127.0.0.1}" --port 8888 --allow-root --no-browser --ServerApp.allow_origin='*' --notebook-dir "${BOOT_VOLUME:-$(dirname "$BOOT_HOME")}" >> "$BOOT_HOME/state/logs/jupyter.log" 2>&1 &
-  echo "boot: JupyterLab starting on 8888$made"
+  JUPYTER_TOKEN="$tok" nohup "$jl" --ip "$listen" --port 8888 --allow-root --no-browser --ServerApp.allow_origin='*' --notebook-dir "${BOOT_VOLUME:-$(dirname "$BOOT_HOME")}" >> "$BOOT_HOME/state/logs/jupyter.log" 2>&1 &
+  echo "boot: JupyterLab starting on 8888 (the Jupyter Terminal, bound to $listen)$made"
   # The token is NEVER echoed here. This log is a file on the volume, and with a shared store that volume is mounted
   # by every machine and readable by every session on it; the suite has forbidden logging an operator-supplied token
   # since 2.1.0 and a generated one is the same secret. What goes in the log is how to GET it.
-  # It is never reachable from the internet either: the server binds $BASE_LISTEN, and on every host but RunPod that
-  # is loopback, which is what Verda's own documentation instructs ("Keep it private. Use SSH port-forwarding. Do
-  # not open port 8888 to the internet"). hostname -I reads the machine's own NIC: nothing is asked of the network.
-  local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  echo "boot: to use the terminal and upload files, from YOUR OWN computer run:"
-  echo "boot:     podctl jupyter <this machine>     # prints the URL with the token already in it"
-  echo "boot:   or by hand:  ssh -L 8888:127.0.0.1:8888 root@${ip:-THE-MACHINE-IP}"
-  echo "boot:     then open http://127.0.0.1:8888/lab and paste the token from state/tokens.env (owner-only)"
+  case "$listen" in
+    127.0.0.1|localhost|::1|'')
+      local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+      echo "boot: to use the terminal and upload files, from YOUR OWN computer run:"
+      echo "boot:     podctl jupyter <this machine>     # prints the URL with the token already in it"
+      echo "boot:     podctl tunnel <this machine>      # the one tunnel; prints every named link, the terminal's with its token"
+      echo "boot:   or by hand:  ssh -L 8888:127.0.0.1:8888 root@${ip:-THE-MACHINE-IP}"
+      echo "boot:     then open http://127.0.0.1:8888/lab and paste the token from state/tokens.env (owner-only)"
+      ;;
+    *)
+      echo "boot: the token: podctl status <pod> prints the link with it; on RunPod also the pod's Logs tab (not this file)"
+      boot_console_token "$tok" "$own"
+      ;;
+  esac
+  return 0
+}
+boot_console_token(){ # <token> <own: 1 = generated or saved, 0 = the pod's own env> → one line on the CONTAINER log, RunPod only
+  # fd 3 is the start command's own stdout, saved by boot_main before it sends everything else to the boot log. On RunPod
+  # that is the pod's Logs tab, which only the pod's owner reads; the boot log is a file on a volume others may mount.
+  # A token the pod's env set is the operator's own and is not repeated; one the boot made is the only copy they can see.
+  [ "${2:-1}" = 1 ] || return 0
+  [ "${BASE_HOST:-}" = runpod ] || return 0
+  { true >&3; } 2>/dev/null || return 0
+  local url=""
+  if [ -n "${RUNPOD_POD_ID:-}" ]; then url="https://${RUNPOD_POD_ID}-8888.proxy.runpod.net/lab?token=$1"; fi
+  echo "Jupyter Terminal token: $1${url:+   (open $url)}" >&3
   return 0
 }
 boot_tokens(){ # 2.1.0: the tokens an earlier install saved (state/tokens.env, 0600) join the pod's own; the Hub browser
@@ -166,14 +177,55 @@ boot_comfy(){ # ComfyUI from the base's venv with the base's launch line, only w
   if _base_start_comfy; then echo "boot: ComfyUI answers on $HOSTPORT"; else echo "boot: ComfyUI did not answer within the wait — see $COMFY_LOG"; fi
   return 0
 }
+boot_apps_py(){ # the Python the forwarder runs on: the tools venv's, else the machine's python3 (standard library only)
+  if [ -x "$BOOT_HOME/tools/bin/python" ]; then echo "$BOOT_HOME/tools/bin/python"; return 0; fi
+  command -v python3 2>/dev/null && return 0
+  return 1
+}
+boot_apps_stop(){ # every forwarder THIS volume's boot started on this machine (matched by its own path, so a shared store's
+  # other machines, and anything else that happens to be a python, are never touched)
+  local pids i
+  pids="$(pgrep -f "app_proxy\.py --state $BOOT_HOME/state" 2>/dev/null | tr '\n' ' ' || true)"; pids="${pids% }"
+  [ -n "$pids" ] || return 0
+  kill $pids 2>/dev/null || true
+  for i in 1 2 3 4 5; do
+    sleep 1; [ -n "$(pgrep -f "app_proxy\.py --state $BOOT_HOME/state" 2>/dev/null || true)" ] || return 0
+  done
+  kill -9 $pids 2>/dev/null || true
+  return 0
+}
+boot_apps(){ # 3.9.0: each customer app at the root of its own port (state/apps.d/*.list, one file per package's APP_PORTS)
+  # A host whose console links PORTS, not paths (RunPod's Connect tab), can only name an app that has a port of its own;
+  # ComfyUI serves the app at /apps/<slug>/ and py/app_proxy.py forwards <port>/ there. Restarted on every call, so an
+  # install that adds or drops an app takes effect at once (boot.sh --apps). Not on the GPU: it only moves bytes.
+  local py proxy="$BOOT_HOME/py/app_proxy.py" port="${PORT:-}" rows n
+  if [ -z "$port" ] && [ -f "$BOOT_HOME/state/boot.env" ]; then port="$(sed -n "s/^PORT='\{0,1\}\([0-9]*\).*/\1/p" "$BOOT_HOME/state/boot.env" | head -1)"; fi
+  port="${port:-8188}"
+  boot_apps_stop
+  if [ ! -f "$proxy" ]; then echo "boot: no $proxy, so no app ports (the base install puts it there)"; return 0; fi
+  if ! py="$(boot_apps_py)"; then echo "boot: no python for the app ports: none started"; return 0; fi
+  rows="$("$py" "$proxy" --state "$BOOT_HOME/state" --list 2>&1)" || { echo "boot: app ports unreadable: $rows"; return 0; }
+  n="$(printf '%s\n' "$rows" | grep -c '^[0-9]' || true)"
+  if [ "${n:-0}" = 0 ]; then echo "boot: app ports: none declared (no package ships a customer app)"; return 0; fi
+  mkdir -p "$BOOT_HOME/state/logs"
+  nohup "$py" "$proxy" --state "$BOOT_HOME/state" --upstream "127.0.0.1:$port" --listen "${BASE_LISTEN:-127.0.0.1}" >> "$BOOT_HOME/state/logs/app_proxy.log" 2>&1 &
+  printf '%s\n' "$rows" | while IFS='|' read -r p s nm; do
+    case "$p" in [0-9]*) echo "boot: app port $p: $nm (/apps/$s/ on ComfyUI's $port)";; *) echo "boot: $p";; esac
+  done
+  return 0
+}
 boot_main(){
   case "${1:-}" in
     --print-sshd-bootstrap) declare -f _boot_sshd_bin; declare -f boot_sshd; echo "boot_sshd"; return 0 ;;
+    --apps)                                        # 3.9.0: the install restarts the app ports without a reboot
+      BOOT_HOME="${BOOT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+      boot_host >/dev/null; boot_apps; return 0 ;;
   esac
   BOOT_HOME="${BOOT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"   # the image's ENV or the unit sets it; this file's own directory otherwise
   mkdir -p "$BOOT_HOME/state/logs"
   echo $$ > "$BOOT_HOME/state/boot.pid"        # the pod tier tells a base boot from the image's by this pid's cmdline (2.0.6)
   BOOT_LOG="$BOOT_HOME/state/logs/boot_$(date +%Y%m%d-%H%M%S).log"
+  exec 3>&1                                    # 3.9.0: the start command's own stdout (RunPod's Logs tab), for boot_console_token
   exec >> "$BOOT_LOG" 2>&1
   trap 'exit 0' TERM
   echo "== comfy-base boot $(date -u +%Y-%m-%dT%H:%M:%SZ) · $(hostname 2>/dev/null || echo ?) =="
@@ -184,6 +236,7 @@ boot_main(){
   boot_tokens
   boot_extensions
   boot_comfy
+  boot_apps
   echo "boot: done — sleeping forever so the pod stays up (this script never exits on its own)"
   if [ "${BOOT_ONCE:-0}" = "1" ]; then return 0; fi
   sleep infinity

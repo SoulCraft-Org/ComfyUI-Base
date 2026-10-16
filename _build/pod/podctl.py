@@ -58,6 +58,7 @@ _hosts = _load_by_path("comfyui_hosts", BASE_DIR / "hosts" / "__init__.py", BASE
 _brand = _load_by_path("comfyui_brand", BASE_DIR / "py" / "brand.py")
 _pkgdirs = _load_by_path("comfyui_pkgdirs", BASE_DIR / "py" / "pkgdirs.py")     # 3.6.0: the one package-discovery rule
 _gpu_fit = _load_by_path("comfyui_gpu_fit", BASE_DIR / "py" / "gpu_fit.py")     # 3.8.0: the one GPU-preference rule (GPU_PREFER)
+_appproxy = _load_by_path("comfyui_app_proxy", BASE_DIR / "py" / "app_proxy.py")   # 3.9.0: the one APP_PORTS row rule
 PodctlError = _hosts.PodctlError
 Provider = _hosts.Provider
 
@@ -68,7 +69,8 @@ RunPodProvider = _runpod.RunPodProvider
 for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "Api", "pod_image", "pod_volume_id", "env_verdicts", "pod_facts",
            "BOOT_GUARD", "image_config", "wrap_entry", "sshd_bootstrap_text", "wait_for", "ensure", "stop", "start", "restart", "deploy_body",
            "deploy", "volume_size_gb", "record_volume", "POD_READ", "pod_volume", "volume_line", "stock", "cuda_floor", "create_floor", "DEFAULT_GPUS", "DEFAULT_MIN_CUDA", "allowed_cuda",
-           "create_body", "create"):
+           "create_body", "create",
+           "save_port_names", "names_template", "template_state", "http_ports", "jupyter_token", "proxy_url"):   # 3.9.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -390,6 +392,85 @@ def consumer_root(base_dir=None, env=None):
         return _pkgdirs.consumer_root(pathlib.Path(base_dir or BASE_DIR), None, os.environ if env is None else env)
     except _pkgdirs.NoSuchRoot as e:
         raise PodctlError(str(e))
+
+
+# ---------------------------------------------------------------- 3.9.0: named ports
+# A host whose console links ports (RunPod's Connect tab) shows a NAME for each one only if somebody gives it one. The base
+# names its own two; every customer app a package ships gets a port of its own and the name the package declares in its
+# script, APP_PORTS=("8189|<slug>|<name>"), which the machine's forwarder (py/app_proxy.py) serves at that port's root.
+# podctl create, status, tunnel and a brand's template all read the same rows, so a console name, a port on the pod
+# and a localhost link can never disagree. The base declares no app and knows none.
+BASE_PORT_NAMES = [(8188, "ComfyUI"), (8888, "Jupyter Terminal")]
+
+
+def app_rows_in(text):
+    """The APP_PORTS rows of a package script's text, as written (`port|slug|name`), comments and blanks left out.
+    Both shapes: APP_PORTS=("a" "b") on one line, and one row per line up to a line holding only `)`."""
+    m = re.search(r'^APP_PORTS=\(([^\n]*)\)[ \t]*(?:#[^\n]*)?$', text, re.M) or re.search(r'^APP_PORTS=\((.*?)^\)', text, re.S | re.M)
+    if not m:
+        return []
+    rows = []
+    for ln in m.group(1).splitlines():
+        s = ln.split("#", 1)[0] if not ln.strip().startswith('"') else ln
+        rows.extend(re.findall(r'"([^"]*)"', s))
+    return rows
+
+
+def declared_apps(root=None, base_dir=None, env=None):
+    """Every customer app the consumer root's packages declare: [(port, slug, name, package)], by port. A bad row, or a
+    port two packages both claim, is an error naming both: a console would link one name to the other's app."""
+    if root is None:
+        root = consumer_root(base_dir, env)
+    if root is None:
+        return []
+    out, seen = [], {}
+    for d in _pkgdirs.package_dirs(pathlib.Path(root), pathlib.Path(base_dir or BASE_DIR)):
+        script = d / ("%s-script.sh" % d.name)
+        if not script.is_file():
+            continue
+        for raw in app_rows_in(script.read_text(encoding="utf-8")):
+            try:
+                port, slug, name = _appproxy.parse_row(raw)
+            except ValueError as e:
+                raise PodctlError("%s: APP_PORTS: %s" % (d.name, e))
+            if port in seen:
+                raise PodctlError("port %d is declared twice: %s (%s) and %s (%s); give one of them another port"
+                                  % (port, seen[port][0], seen[port][1], d.name, slug))
+            seen[port] = (d.name, slug)
+            out.append((port, slug, name, d.name))
+    return sorted(out)
+
+
+def port_names(apps=()):
+    """[(port, name)] for the base's two ports and each app, in port order after the base's own."""
+    return list(BASE_PORT_NAMES) + [(int(a[0]), a[2]) for a in apps]
+
+
+def apps_from_listing(text):
+    """`app_proxy.py --list` (or an apps.d file) as read from a machine → [(port, slug, name)]; junk lines are skipped."""
+    out = []
+    for line in (text or "").splitlines():
+        try:
+            r = _appproxy.parse_row(line)
+        except ValueError:
+            continue
+        if r:
+            out.append(r)
+    return out
+
+
+def links_lines(names, url_for, token=None, prefix="links"):
+    """One line per named port: `<prefix>  <name padded>  <url>`, the terminal's with its token when there is one."""
+    w = max([len(n) for _, n in names] + [0])
+    lines = []
+    for port, name in names:
+        url = url_for(port)
+        if url is None:
+            continue
+        if port == 8888:
+            url = url.rstrip("/") + ("/lab?token=%s" % token if token else "/lab   (token: podctl jupyter <pod>)")
+        lines.append("%-8s %-*s  %s" % (prefix, w, name, url))
+    return lines
 
 
 def brands_at(root):
@@ -1394,13 +1475,75 @@ def tunnel_key(pubkey_arg, env=None):
     return re.sub(r"\.pub$", "", os.path.expanduser(pub))
 
 
+def tunnel_facts_cmd():
+    """What the tunnel reads from the machine before it forwards (3.9.0): the JupyterLab token alone (never the rest of
+    tokens.env) and the app ports the machine serves, one `port|slug|name` per line."""
+    return ("sed -n 's/^JUPYTER_TOKEN=//p' %s/state/tokens.env 2>/dev/null | tail -1; echo '--apps--'; "
+            "cat %s/state/apps.d/*.list 2>/dev/null; true" % (REMOTE_HOME, REMOTE_HOME))
+
+
+def parse_tunnel_facts(text):
+    """tunnel_facts_cmd's answer -> (token or None, [(port, slug, name)])."""
+    head, _, apps = (text or "").partition("--apps--")
+    tok = head.strip().splitlines()[-1].strip() if head.strip() else ""
+    return (tok or None), apps_from_listing(apps)
+
+
+def tunnel_plan(ports, given, machine_apps, declared, token, names=None):
+    """The ports to forward and the named localhost links to print: [ports], [lines].
+    Without --port: ComfyUI, JupyterLab and every app port the machine serves (else the ones this tree declares).
+    With --port: exactly those. A forwarded port is named by the base, then the machine's apps, then this tree's."""
+    apps = list(machine_apps or []) or [(a[0], a[1], a[2]) for a in (declared or [])]
+    ports = list(ports or TUNNEL_PORTS)
+    if not given:
+        for a in apps:
+            if int(a[0]) not in [int(str(p).rpartition(":")[2]) for p in ports]:
+                ports.append(int(a[0]))
+    named = dict(names or BASE_PORT_NAMES)
+    for a in reversed(list(declared or [])):
+        named.setdefault(int(a[0]), a[2])
+    for a in apps:
+        named[int(a[0])] = a[2]
+    pairs = []
+    for p in ports:
+        local, _, remote = str(p).partition(":")
+        remote = int(remote or local)
+        pairs.append((remote, int(local), named.get(remote, "port %d" % remote)))
+    w = max([len(n) for _, _, n in pairs] + [0])
+    lines = []
+    for remote, local, name in pairs:
+        url = "http://localhost:%d" % local
+        if remote == 8888:
+            url += "/lab?token=%s" % token if token else "/lab   (no token read: podctl jupyter <pod>)"
+        lines.append("tunnel  %-*s  %s" % (w, name, url))
+    return ports, lines
+
+
 def cmd_tunnel(prov, args):
     import subprocess
     addr = prov.address(prov.pod(args.pod))
     if addr is None:
         print("tunnel  the machine has no reachable address yet (podctl ensure / start --wait)"); return 1
     key = tunnel_key(getattr(args, "pubkey", None))
-    argv = tunnel_argv(args.port, host=addr.host, port=addr.port, key=key, user=addr.user)
+    token, machine_apps = None, []
+    probe = ["ssh", "-F", "/dev/null", "-i", str(key), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=15", "-p", str(int(addr.port)), "%s@%s" % (addr.user or SSH_USER, addr.host), tunnel_facts_cmd()]
+    try:
+        r = subprocess.run(probe, capture_output=True, text=True, timeout=40)
+        if r.returncode == 0:
+            token, machine_apps = parse_tunnel_facts(r.stdout)
+        else:
+            print("tunnel  (the machine did not answer the names probe: forwarding the defaults)")
+    except (subprocess.TimeoutExpired, OSError):
+        print("tunnel  (the names probe timed out: forwarding the defaults)")
+    try:
+        declared = declared_apps()
+    except PodctlError as e:
+        print("tunnel  (this tree's APP_PORTS are unreadable: %s)" % e); declared = []
+    ports, lines = tunnel_plan(args.port, getattr(args, "port_given", False), machine_apps, declared, token)
+    for line in lines:
+        print(line)
+    argv = tunnel_argv(ports, host=addr.host, port=addr.port, key=key, user=addr.user)
     print("tunnel  %s" % " ".join(argv), flush=True)
     return subprocess.call(argv)
 
@@ -1519,6 +1662,12 @@ def cmd_jupyter(prov, args):
         print("jupyter  If ComfyUI is running but JupyterLab is not, restart the machine's boot (podctl ensure).")
         return 1
     local = tunnel_locals(SSH_ALIAS)["jupyter"]
+    try:                                       # 3.9.0: a pod that exposes 8888 through its host's proxy: that link first
+        url = prov.http_url(prov.pod(args.pod), 8888) if hasattr(prov, "http_url") else None
+    except PodctlError:
+        url = None
+    if url:
+        print("jupyter  Jupyter Terminal:  %s/lab?token=%s" % (url, tok))
     print("jupyter  tunnel:  ssh -L %d:127.0.0.1:8888 %s -N" % (local, SSH_ALIAS))
     print("jupyter  then:    http://127.0.0.1:%d/lab?token=%s" % (local, tok))
     return 0
@@ -1545,8 +1694,40 @@ def gpu_line_over_ssh():
     return "\n".join(lines)
 
 
+def status_links(prov, pod, declared, machine=None):
+    """3.9.0: the named links a status prints for a pod its host proxies: [lines]. machine is (token, apps) read over
+    ssh, or None. The pod's own JUPYTER_TOKEN wins over the machine's saved one."""
+    if not hasattr(prov, "http_url"):
+        return []
+    tok_m, apps_m = machine or (None, [])
+    token = (prov.pod_token(pod) if hasattr(prov, "pod_token") else None) or tok_m
+    names = dict(port_names(declared))
+    for a in apps_m:
+        names[int(a[0])] = a[2]
+    exposed = sorted(int(p.split("/")[0]) for p in (pod.get("ports") or []) if p.endswith("/http"))
+    order = [p for p, _ in BASE_PORT_NAMES if p in exposed] + [p for p in exposed if p not in dict(BASE_PORT_NAMES)]
+    lines = links_lines([(p, names.get(p, "HTTP Service (port %d)" % p)) for p in order], lambda p: prov.http_url(pod, p), token)
+    if not lines:
+        return ["links    none through the proxy (no http port): podctl tunnel %s prints the localhost links" % pod.get("id")]
+    return lines
+
+
 def cmd_status(prov, args):
-    print(prov.status_text(prov.pod(args.pod)))
+    pod = prov.pod(args.pod)
+    print(prov.status_text(pod))
+    machine = None
+    try:
+        r = ssh_run(tunnel_facts_cmd(), timeout=30)
+        if r.returncode == 0:
+            machine = parse_tunnel_facts(r.stdout)
+    except Exception:                          # a dead pod still gets its facts; the links fall back to the env token
+        machine = None
+    try:
+        declared = declared_apps()
+    except PodctlError as e:
+        print("links    (this tree's APP_PORTS are unreadable: %s)" % e); declared = []
+    for line in status_links(prov, pod, declared, machine):
+        print(line)
     print(gpu_line_over_ssh())
 
 
@@ -1586,6 +1767,7 @@ class _FreshAppend(__import__("argparse").Action):
         if items is None or items is self.default:
             items = []
         items.append(values); setattr(ns, self.dest, items)
+        setattr(ns, self.dest + "_given", True)          # 3.9.0: the tunnel adds the machine's app ports only to its defaults
 
 
 # ---- 3.1.0: the buyer verbs (a host that lacks one says so; Verda has them all)
@@ -1663,6 +1845,9 @@ def cmd_create(prov, args):
     for k in extra:
         if k not in takes:
             raise PodctlError("--%s: not offered by host %s" % (k.replace("_", "-"), getattr(prov, "name", "?")))
+    if "names" in takes:                       # 3.9.0: the ports' names (a host that has no console takes none);
+        extra["names"] = port_names(declared_apps())     # a private pod prints them as its tunnel's localhost links
+        extra["name_ports"] = not private and not getattr(args, "no_names", False)
     pod_id = prov.create_machine(args.name, args.gpu, loc, args.data_gb, os_gb=args.os_gb, pubkey=pub, spot=args.spot,
                                  wait=not args.no_wait, ssh_config=args.ssh_config, **extra)
     print("next: podctl ensure %s · podctl install %s --base --pkg <dir> (or buyer-install with --runtime and the zips)%s" % (
@@ -1713,7 +1898,8 @@ def build_parser():
     ap.add_argument("--pubkey", default=os.environ.get("PODCTL_PUBKEY"), help="the Mac's public key file (default: the provider's key plus .pub)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("pods", help="every pod: id, name, image, status, public ip, port 22")
-    p = sub.add_parser("status", help="the pod's facts; env NAMES and placeholder verdicts, never values; the GPU verdict over ssh"); p.add_argument("pod")
+    p = sub.add_parser("status", help="the pod's facts; env NAMES and placeholder verdicts, never values; the named links "
+                                      "(the Jupyter Terminal's carries its token); the GPU verdict over ssh"); p.add_argument("pod")
     p = sub.add_parser("image", help="the image's entrypoint/cmd and how ensure would wrap them"); p.add_argument("pod")
     p = sub.add_parser("ensure", help="TCP 22, PUBLIC_KEY, the base's boot as the start command, Host runpod"); p.add_argument("pod")
     p.add_argument("--entry", help="the image's own start command when its config cannot be read, e.g. '/start_script.sh'")
@@ -1754,9 +1940,10 @@ def build_parser():
     p.add_argument("--minutes", type=int, default=60, help="how long to hold it (default 60)")
     p.add_argument("--force", action="store_true", help="take it even though another session holds a live one")
     p = sub.add_parser("jupyter", help="the JupyterLab URL with the token in it, read from the machine over ssh"); p.add_argument("pod")
-    p = sub.add_parser("tunnel", help="the ONE ssh session that forwards ports (ComfyUI 8188, JupyterLab 8888); runs until killed")
+    p = sub.add_parser("tunnel", help="the ONE ssh session that forwards ports (ComfyUI 8188, Jupyter Terminal 8888, each app port the "
+                                      "machine serves) and prints them as named localhost links; runs until killed")
     p.add_argument("pod"); p.add_argument("--port", type=tunnel_port, action=_FreshAppend, default=list(TUNNEL_PORTS),
-                   help="repeatable; default 8188 and 8888. LOCAL:REMOTE shifts the local side, e.g. --port 8190:8188 "
+                   help="repeatable; default 8188, 8888 and the machine's app ports. LOCAL:REMOTE shifts the local side, e.g. --port 8190:8188 "
                         "reaches a second machine's ComfyUI on 8190 while the first keeps 8188")
     p = sub.add_parser("mcp", help="write the .mcp.json that points an MCP client at this machine's ComfyUI (Comfy MCP)")
     p.add_argument("pod")
@@ -1781,10 +1968,12 @@ def build_parser():
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
     p.add_argument("--private", action="store_true", help="the default since 3.8.1 (RunPod): an ENCRYPTED pod volume of --data-gb "
-                   "(network volumes cannot be encrypted), ports 22/tcp only (no proxy URL, no JupyterLab), ComfyUI on loopback: "
-                   "reach it with podctl tunnel")
-    p.add_argument("--public", action="store_true", help="RunPod: NOT private: a network volume (new, or --volume), ComfyUI and "
-                   "JupyterLab on RunPod's proxy URLs, ComfyUI on 0.0.0.0")
+                   "(network volumes cannot be encrypted), ports 22/tcp only (no proxy URL), ComfyUI, JupyterLab and the apps on loopback: "
+                   "podctl tunnel names them")
+    p.add_argument("--public", action="store_true", help="RunPod: NOT private: a network volume (new, or --volume), ComfyUI, "
+                   "the Jupyter Terminal and each app on RunPod's proxy URLs, named in the Connect tab")
+    p.add_argument("--no-names", dest="no_names", action="store_true", help="RunPod: no port-names template (the Connect tab "
+                   "then says \"HTTP Service\"); the ports are the same")
     p.add_argument("--spot", action="store_true"); p.add_argument("--no-wait", dest="no_wait", action="store_true")
     p = sub.add_parser("pause", help="delete the instance and keep its disks (the same as stop --wait): only storage bills"); p.add_argument("pod")
     p = sub.add_parser("put-away", help="copy output/ and input/ to this Mac; with --yes, then delete the machine and its disks (to the trash)")

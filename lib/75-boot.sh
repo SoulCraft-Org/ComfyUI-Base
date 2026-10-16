@@ -1,14 +1,49 @@
 # 75-boot.sh: the base owns the machine's boot: boot.sh + the launch lib on the volume, the tools venv (JupyterLab, newest),
 # state/boot.env (what boot.sh starts). On RunPod podctl points the pod's start command at <volume>/comfy-base/boot.sh;
 # on a VM host (2.2.0) the base installs comfy-base-boot.service, which runs it at every boot. From then on every boot is
-# the base's: sshd → JupyterLab → ComfyUI from the base's venv, and the script never exits.
+# the base's: sshd → JupyterLab → ComfyUI from the base's venv → the app ports (3.9.0), and the script never exits.
 
 _base_jupyter_auth(){ # which variable protects JupyterLab at boot (the value is never shown)
   local v
   for v in JUPYTER_TOKEN JUPYTER_PASSWORD; do
     if [ -n "${!v:-}" ] || [ -n "$(_base_pid1_env "$v")" ]; then echo "$v"; return 0; fi
   done
-  echo "NONE — set JUPYTER_TOKEN on the pod"
+  echo "generated at boot (state/tokens.env; podctl status or jupyter prints it)"
+}
+_base_app_rows(){ # 3.9.0: this package's APP_PORTS, validated, one `port|slug|name` per line; a bad row is an error, named on stderr (the caller captures stdout)
+  local r p s n rc=0
+  for r in ${APP_PORTS[@]+"${APP_PORTS[@]}"}; do
+    IFS='|' read -r p s n <<< "$r"
+    if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1024 ] || [ "$p" -gt 65535 ]; then err "APP_PORTS row '$r': the port must be 1024-65535" >&2; rc=1; continue; fi
+    case " 22 8188 8888 9199 11434 " in *" $p "*) err "APP_PORTS row '$r': $p is the base's own (sshd, ComfyUI, JupyterLab, the tunnel's)" >&2; rc=1; continue;; esac
+    if ! [[ "$s" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then err "APP_PORTS row '$r': the slug must be lowercase kebab-case (its /apps/<slug>/ folder)" >&2; rc=1; continue; fi
+    if [ -z "$n" ] || [[ "$n" == *"|"* ]]; then err "APP_PORTS row '$r': port|slug|name, the name non-empty" >&2; rc=1; continue; fi
+    printf '%s|%s|%s\n' "$p" "$s" "$n"
+  done
+  return $rc
+}
+base_boot_apps(){ # 3.9.0: the package's customer apps get a port each: state/apps.d/<package>.list, then the forwarder restarts
+  # The declaration is the package's (APP_PORTS=("8189|<slug>|<name>")); the base knows no app. podctl create and a
+  # template read the same rows from the script, so the console's names and the machine's ports cannot drift apart.
+  local pkg rows f d="$BASE_STATE/apps.d"
+  if [ -z "${PKG_DIR:-}" ] || [ "$PKG_DIR" = "$BASE_DIR" ]; then return 0; fi      # the base's own run declares no app
+  pkg="$(basename "$PKG_DIR")"; f="$d/$pkg.list"
+  if ! rows="$(_base_app_rows)"; then BASE_FAILED+=("app ports: a bad APP_PORTS row (above)"); return 0; fi
+  if [ "$BASE_DRY" = "1" ]; then
+    if [ -n "$rows" ]; then would "app ports for $pkg: $(printf '%s' "$rows" | tr '\n' ' ')"; fi
+    return 0
+  fi
+  if [ -z "$rows" ]; then
+    [ -f "$f" ] || return 0
+    rm -f "$f"; ok "app ports: $pkg declares none now; $f removed"
+  else
+    mkdir -p "$d"
+    if [ -f "$f" ] && [ "$(cat "$f")" = "$rows" ]; then ok "app ports current: $(printf '%s' "$rows" | cut -d'|' -f1,3 | tr '\n' ' ')"
+    else printf '%s\n' "$rows" > "$f"; ok "app ports: $(printf '%s' "$rows" | cut -d'|' -f1,3 | tr '\n' ' ')"; BASE_CHANGED+=("app ports: $pkg"); fi
+  fi
+  if [ -n "$BASE_FAKE_ROOT" ]; then note "app ports: not (re)started in a fake tree"; return 0; fi
+  bash "$BASE_HOME/boot.sh" --apps 2>&1 | sed 's/^/  /'
+  return 0
 }
 base_boot_env_write(){ # the facts boot.sh needs; written by every real run, single-quoted so boot.sh can source it
   local f="$BASE_STATE/boot.env"
@@ -116,6 +151,7 @@ base_boot_install(){ # boot.sh + lib/85-launch.sh on the volume (current copies)
   if [ "$BASE_DRY" = "1" ]; then
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then ok "boot.sh current at $dst"; else would "install $dst (PID 1 once podctl points the pod's start command at it)"; fi
     base_boot_tools; would "write $BASE_STATE/boot.env (COMFY, VENV, PORT, ARGS_FILE)"
+    base_boot_apps
     BASE_BOOT_RESULT="would install · tools: $BASE_TOOLS_RESULT · auth: $(_base_jupyter_auth)"; return 0
   fi
   mkdir -p "$BASE_HOME/lib"
@@ -124,10 +160,14 @@ base_boot_install(){ # boot.sh + lib/85-launch.sh on the volume (current copies)
   # VERSION rides beside boot.sh too (on a pod BASE_DIR is BASE_HOME and this is a no-op; in the suite the fake pod's
   # comfy-base/ gets exactly what the boot needs and nothing else)
   if [ -f "$BASE_DIR/VERSION" ] && ! { [ -f "$BASE_HOME/VERSION" ] && cmp -s "$BASE_DIR/VERSION" "$BASE_HOME/VERSION"; }; then cp "$BASE_DIR/VERSION" "$BASE_HOME/VERSION" && changed=1; fi
+  # 3.9.0: the forwarder rides beside boot.sh (on a pod BASE_DIR is BASE_HOME and this is a no-op)
+  local psrc="$BASE_DIR/py/app_proxy.py" pdst="$BASE_HOME/py/app_proxy.py"
+  if [ "$psrc" != "$pdst" ] && ! { [ -f "$pdst" ] && cmp -s "$psrc" "$pdst"; }; then mkdir -p "$BASE_HOME/py" && cp "$psrc" "$pdst" && changed=1; fi
   if [ "$changed" = "1" ]; then ok "installed $dst (+ lib/85-launch.sh)"; BASE_CHANGED+=("boot: installed $dst"); else ok "boot.sh current at $dst"; fi
   base_boot_unit
   base_boot_tools
   base_boot_env_write
+  base_boot_apps
   BASE_BOOT_RESULT="$dst · tools: $BASE_TOOLS_RESULT · JupyterLab auth: $(_base_jupyter_auth)"
   return 0
 }
