@@ -288,7 +288,7 @@ def test_unit_verify_talks_only_to_a_server_it_started_or_proved(tmp_path):
     # the caller's own BASE_SERVER is used as given; testbed.sh is not asked
     run, calls, log = _verify_beside(tmp_path / "c")
     r = run(BASE_SERVER="127.0.0.1:9911")
-    assert r.returncode == 0 and "set by the caller" in r.stdout and [x[0] for x in calls()] == ["suite 127.0.0.1:9911"] * 2, r.stdout + log.read_text()
+    assert r.returncode == 0 and "set by the caller" in r.stdout and [x[0] for x in calls()] == ["suite 127.0.0.1:9911", "zip-suite 127.0.0.1:9911"], r.stdout + log.read_text()
 
 
 def test_unit_verify_suite_zip_runs_the_zip_then_only_what_it_skipped(tmp_path):
