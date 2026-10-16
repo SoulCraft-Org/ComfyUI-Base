@@ -2393,10 +2393,18 @@ def test_unit_runpod_create_references_only_the_secrets_the_account_has(tmp_path
         body = srv.bodies[-1][1]
         assert body["env"]["HF_TOKEN"] == "{{ RUNPOD_SECRET_HF_TOKEN }}", body["env"]
         assert "CIVITAI_TOKEN" not in body["env"]                                       # civitai_token is not the name
-        assert set(body["env"]) == {"PUBLIC_KEY", "JUPYTER_TOKEN", "BASE_LINK_TOKEN", "HF_TOKEN"}
+        assert set(body["env"]) == {"PUBLIC_KEY", "HF_TOKEN"}               # 3.19.1: open by default, no token or key minted
         assert srv.secrets_auth == ["Bearer rp_key_create"]
         said = [l for l in out.splitlines() if l.strip().startswith("secrets")]
         assert len(said) == 1 and "HF_TOKEN" in said[0] and "CIVITAI_TOKEN" not in said[0], out
+        # the same references on a locked pod (--lock), beside its token, its key and the lock
+        assert _create(podctl, srv, pub, "--data-gb", "500", "--lock") in (None, 0)
+        out = capsys.readouterr().out
+        body = srv.bodies[-1][1]
+        assert set(body["env"]) == {"PUBLIC_KEY", "JUPYTER_TOKEN", "BASE_LINK_TOKEN", "BASE_LINK_LOCK", "HF_TOKEN"}, body["env"]
+        assert body["env"]["HF_TOKEN"] == "{{ RUNPOD_SECRET_HF_TOKEN }}" and "CIVITAI_TOKEN" not in body["env"]
+        said = [l for l in out.splitlines() if l.strip().startswith("secrets")]
+        assert len(said) == 1 and "HF_TOKEN" in said[0], out
         # both names: both referenced, on a private pod as well
         srv.secrets = ["CIVITAI_TOKEN", "HF_TOKEN"]
         assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
