@@ -22,6 +22,14 @@
 #
 # A package whose script declares PKG_NO_SUITE=1 and ships no suite.py skips steps 2 and 3 as "declared":
 # the zip check still runs over it.
+#
+# The server the suites talk to (3.16.0) is one this run started, or none:
+#   VERIFY_SERVER=own    (the default) a ComfyUI of this run's own, from the testbed's venv: a free port, its pid, port and
+#                        log files in a folder of the run's own, stopped when the run ends, however it ends
+#   VERIFY_SERVER=reuse  this checkout's testbed server (testbed.sh --server), only when `testbed.sh --owned` proves that
+#                        its pid file names the process on that port; anything else stops the gate with the reason
+#   VERIFY_SERVER=none   no server: the live checks skip
+#   BASE_SERVER=<h:p>    set by the caller: the caller's own choice, used as given
 set -uo pipefail
 BASE="$(cd "$(dirname "$0")/.." && pwd)"; UP="$(cd "$BASE/../.." && pwd)"
 # Fail closed: an empty answer is "no consumer root" (documented, printed below); a helper that is missing, crashes, or
@@ -32,13 +40,6 @@ ROOT="${CROOT:-$UP}"
 # One root is chosen and used whole, so the port file always comes from the same place as the tree.
 if [ -f "$BASE/testbed.sh" ]; then TB_ROOT="$BASE"; else TB_ROOT="$UP/base"; fi
 export BASE_NODE_SRC="${BASE_NODE_SRC:-$TB_ROOT/testbed}"
-# BASE_SERVER only when nothing set it: the runner detects the testbed itself (lib/95-summary.sh), and an
-# unconditional export here overrode that detection. The testbed's port file wins over the 8199 default.
-if [ -z "${BASE_SERVER:-}" ]; then
-  if [ -f "$TB_ROOT/.testbed-server.port" ]; then BASE_SERVER="127.0.0.1:$(tr -d '[:space:]' < "$TB_ROOT/.testbed-server.port")"
-  else BASE_SERVER="127.0.0.1:8199"; fi
-  export BASE_SERVER
-fi
 items=(); rc=0
 if [ "$#" -gt 0 ]; then for a in "$@"; do items+=("$ROOT/$a"); done
 else
@@ -50,6 +51,53 @@ else
     echo "── no consumer root (no \$BASE_WORKSPACE, not at <root>/base/comfyui-base): verifying the base alone"
   fi
 fi
+# 3.16.0: which server (error log row 84). This used to be whatever answered on the port in .testbed-server.port, else
+# 8199. On a Mac where several sessions each run a testbed, that was another checkout's server: the snapshot tier measured
+# ITS frontend (other LoadImage sizes), a server test lost it mid-run when its session stopped it, and a clean PR went red.
+# Now a run starts its own (two runs at once never share one) or proves the one it reuses. 127.0.0.1:0 is "no server"
+# said out loud: an empty BASE_SERVER lets a suite fall back to its own default (8199, 8188), where a stranger's ComfyUI
+# may well be listening.
+NO_SERVER="127.0.0.1:0"; RUN_TB=""
+_verify_stop_server(){ # the run's own server, stopped and its folder gone, on every way out
+  [ -n "$RUN_TB" ] || return 0
+  TESTBED_STATE="$RUN_TB" bash "$TB_ROOT/testbed.sh" --stop >/dev/null 2>&1 || true
+  rm -rf "$RUN_TB"; RUN_TB=""
+}
+trap _verify_stop_server EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+if [ -n "${BASE_SERVER:-}" ]; then
+  echo "── server: $BASE_SERVER (BASE_SERVER, set by the caller)"
+else
+  case "${VERIFY_SERVER:-own}" in
+    none) BASE_SERVER="$NO_SERVER"; echo "── server: none (VERIFY_SERVER=none): the live checks skip";;
+    reuse)
+      [ -f "$TB_ROOT/testbed.sh" ] || { echo "── VERIFY_SERVER=reuse, but there is no testbed.sh at $TB_ROOT: NOT green"; exit 1; }
+      if BASE_SERVER="$(bash "$TB_ROOT/testbed.sh" --owned 2>/tmp/verifys-$$.log)"; then
+        rm -f /tmp/verifys-$$.log; echo "── server: $BASE_SERVER (this checkout's testbed server; its pid file names the process on that port)"
+      else
+        echo "── VERIFY_SERVER=reuse refused: $(head -1 /tmp/verifys-$$.log)"; rm -f /tmp/verifys-$$.log
+        echo "   start this checkout's own (bash \"$TB_ROOT/testbed.sh\" --server), or leave VERIFY_SERVER unset and the run starts one: NOT green"
+        exit 1
+      fi;;
+    own)
+      if [ -f "$TB_ROOT/testbed.sh" ]; then
+        RUN_TB="$(mktemp -d "${TMPDIR:-/tmp}/verify-server.XXXXXX")"
+        port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+        TESTBED_STATE="$RUN_TB" TESTBED_PORT="$port" bash "$TB_ROOT/testbed.sh" --start > "$RUN_TB/start.out" 2>&1; s=$?
+        if [ $s -eq 0 ] && BASE_SERVER="$(TESTBED_STATE="$RUN_TB" bash "$TB_ROOT/testbed.sh" --owned 2>>"$RUN_TB/start.out")"; then
+          echo "── server: $BASE_SERVER (this run's own, stopped when it ends)"
+        elif [ $s -eq 3 ]; then
+          BASE_SERVER="$NO_SERVER"; _verify_stop_server; echo "── server: none (the testbed has no venv: bash testbed.sh --server builds one): the live checks skip"
+        else
+          echo "── this run's own testbed server did not start:"; tail -25 "$RUN_TB/start.out" | sed 's/^/    /'
+          echo "── NOT green: the testbed is broken (VERIFY_SERVER=none runs the gate without a server)"; exit 1
+        fi
+      else
+        BASE_SERVER="$NO_SERVER"; echo "── server: none (no testbed.sh at $TB_ROOT): the live checks skip"
+      fi;;
+    *) echo "── VERIFY_SERVER=${VERIFY_SERVER}: it is own, reuse or none. NOT green"; exit 1;;
+  esac
+fi
+export BASE_SERVER
 # 3.15.3: a failing suite's report, whole enough to diagnose from CI: pytest's ERRORS and FAILURES sections (each test's
 # header, its > lines and its whole E block) capped at 200 lines, then the short summary naming every failing test.
 # It used to keep 12-24 lines, and a long assertion lost its cause (2026-10-16, a Video Replacer failure).

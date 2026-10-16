@@ -235,18 +235,32 @@ def test_unit_a_package_without_a_workflow_ships_none(tmp_path):
     assert r.stdout.strip() == "runpod", r.stdout + r.stderr
 
 
+def _owned_stub(owned):
+    """A testbed.sh whose --owned says `owned` (an address: exit 0) or, given None, refuses as a foreign holder does."""
+    if owned:
+        return '#!/bin/bash\n[ "$1" = --owned ] && { echo "%s"; exit 0; }\nexit 2\n' % owned
+    return '#!/bin/bash\n[ "$1" = --owned ] && { echo "port 8299 is held by pid 4242, not by this testbed\'s server (pid 77)" >&2; exit 1; }\nexit 2\n'
+
+
 def test_unit_the_testbed_port_file_picks_the_server(tmp_path):
+    """3.16.0: the runner takes the server testbed.sh --owned names, never the port file alone. With the port file naming
+    8299 and something answering there that this testbed did not start (another checkout's server, error log row 84), it
+    says why and hands the suite 127.0.0.1:0, so no suite falls back to a default port either."""
     here = tmp_path / "base"; base = here / "comfyui-base"; base.mkdir(parents=True)
     for f in ("base.sh", "VERSION"):
         (base / f).write_text((BASE / f).read_text())
     (base / "lib").mkdir(); [ (base / "lib" / p.name).write_text(p.read_text()) for p in (BASE / "lib").glob("*.sh") ]
     (base / "py").mkdir()
-    (here / "testbed.sh").write_text("#!/bin/bash\n"); (here / "testbed" ).mkdir(); (here / "testbed" / "main.py").write_text("")
+    (here / "testbed" ).mkdir(); (here / "testbed" / "main.py").write_text("")
     (here / ".testbed-server.port").write_text("8299\n")
-    bin_ = tmp_path / "bin"; bin_.mkdir(); (bin_ / "curl").write_text('#!/bin/bash\ncase "$*" in *8299*) exit 0;; esac; exit 1\n'); (bin_ / "curl").chmod(0o755)
+    bin_ = tmp_path / "bin"; bin_.mkdir(); (bin_ / "curl").write_text('#!/bin/bash\ncase "$*" in *8299*|*8199*) exit 0;; esac; exit 1\n'); (bin_ / "curl").chmod(0o755)
     env = {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"]), "BASE_NODE_SRC": "", "BASE_SERVER": ""}
-    r = subprocess.run(["bash", "-c", 'source "%s/base.sh"; BASE_NODE_SRC=""; BASE_SERVER=""; _base_use_testbed; echo "S=$BASE_SERVER"' % base], capture_output=True, text=True, env=env)
-    assert "S=127.0.0.1:8299" in r.stdout, r.stdout + r.stderr
+    run = lambda: subprocess.run(["bash", "-c", 'source "%s/base.sh"; BASE_NODE_SRC=""; BASE_SERVER=""; _base_use_testbed; echo "S=$BASE_SERVER"' % base], capture_output=True, text=True, env=env)
+    (here / "testbed.sh").write_text(_owned_stub("127.0.0.1:8299"))
+    r = run(); assert "S=127.0.0.1:8299" in r.stdout and "this testbed's own server" in r.stdout, r.stdout + r.stderr
+    (here / "testbed.sh").write_text(_owned_stub(None))
+    r = run()
+    assert "S=127.0.0.1:0" in r.stdout and "held by pid 4242" in r.stdout and "the live checks skip" in r.stdout, r.stdout + r.stderr
 
 
 def test_unit_the_testbed_is_found_inside_the_base_too(tmp_path):
@@ -260,7 +274,7 @@ def test_unit_the_testbed_is_found_inside_the_base_too(tmp_path):
     (base / "lib").mkdir(); [ (base / "lib" / q.name).write_text(q.read_text()) for q in (BASE / "lib").glob("*.sh") ]
     (base / "py").mkdir()
     # everything in the base itself, not one level up
-    (base / "testbed.sh").write_text("#!/bin/bash\n"); (base / "testbed").mkdir(); (base / "testbed" / "main.py").write_text("")
+    (base / "testbed.sh").write_text(_owned_stub("127.0.0.1:8399")); (base / "testbed").mkdir(); (base / "testbed" / "main.py").write_text("")
     (base / ".testbed-server.port").write_text("8399\n")
     bin_ = tmp_path / "bin"; bin_.mkdir(); (bin_ / "curl").write_text('#!/bin/bash\ncase "$*" in *8399*) exit 0;; esac; exit 1\n'); (bin_ / "curl").chmod(0o755)
     env = {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"]), "BASE_NODE_SRC": "", "BASE_SERVER": ""}

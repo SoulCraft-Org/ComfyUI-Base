@@ -295,6 +295,8 @@ def test_install_a_second_run_of_the_same_install_takes_seconds_and_full_runs_ev
     assert line.startswith("green ") and "base=" in line and "pkgfp=" in line and "basefp=" in line, line
     t0 = time.time(); again = run_script(STUB / "stub-script.sh", fake_root=tmp_path); took = time.time() - t0
     assert again.returncode == 0 and "ALREADY INSTALLED" in again.stdout and "══ VENV" not in again.stdout, again.stdout[-3000:]
+    # 3.16.0: the skip prints the models line too; the packages' install tests read "downloaded 0" from a second run
+    assert re.search(r"models +ok [1-9]\d* in place · moved 0 · downloaded 0\b", again.stdout), again.stdout[-3000:]
     assert took < 60, took
     full = run_script(STUB / "stub-script.sh", fake_root=tmp_path, env={"BASE_FULL": "1"})
     assert full.returncode == 0 and "ALREADY INSTALLED" not in full.stdout and "══ VENV" in full.stdout, full.stdout[-3000:]

@@ -10,16 +10,20 @@
 #  provides that torch ships for (3.7.1), torch upgraded, and every requirement installed from one pin-free set (py/reqlift.py), so ComfyUI's
 #  own == pins (its frontend packages) never hold anything below its newest. --latest is accepted and changes nothing.
 #      bash testbed.sh --packs    # the node packs alone, each to its tip (3.6.1); ComfyUI left as it is
+#      bash testbed.sh --start    # the server alone, from the venv as it is (3.16.0; verify.sh starts each run's own)
 #      bash testbed.sh --stop     # stop the server
 #      bash testbed.sh --status   # what is here and what is running
+#      bash testbed.sh --owned    # 127.0.0.1:<port> of the server THIS testbed started, else exit 1 with the reason (3.16.0)
 #
 #  Then, from any package folder that runs on ComfyUI Base:
 #      bash "<name>-script.sh" test             # auto-detects base/testbed and the server on the port --server took
-#  Overrides: BASE_NODE_SRC="<this dir>/testbed"  BASE_SERVER=127.0.0.1:8199
+#  Overrides: BASE_NODE_SRC="<this dir>/testbed"  BASE_SERVER=127.0.0.1:<port>
 #  Which packages: $BASE_WORKSPACE, else <repo> of <repo>/base/comfyui-base (3.6.0)
 #  (every package with a suite finds it the same way: BASE_NODE_SRC / BASE_SERVER, auto-detected by `test`;
-#   --server writes the port it chose to .testbed-server.port beside this script, which the base's runner
-#   and its _build/verify.sh read; --stop removes it)
+#   --server writes the port it chose to .testbed-server.port beside this script, and --stop removes it. 3.16.0: nothing
+#   trusts that file alone any more: the runner, verify.sh and podctl ask --owned, which answers only when the pid this
+#   testbed recorded is what listens on that port. TESTBED_STATE=<dir> keeps the pid, port and log files there instead,
+#   which is how verify.sh gives every run a server of its own)
 #
 #  WHICH PACKS
 #  The base derives them: `base.sh list-packs <every package py/pkgdirs.py finds>` merges the four
@@ -49,9 +53,13 @@ COMFY="$HERE/testbed"
 CN="$COMFY/custom_nodes"
 VENV="$COMFY/.venv-testbed"
 PORT="${TESTBED_PORT:-8199}"
-LOG="$HERE/.testbed-server.log"
-PIDF="$HERE/.testbed-server.pid"
-PORTF="$HERE/.testbed-server.port"   # the port a running server took; read by the base's runner and verify.sh (base 2.2.0)
+# 3.16.0: where this server's pid, port and log files live. Beside this script by default; verify.sh hands each run a
+# folder of its own (TESTBED_STATE), so two runs, or a run and a session's --server, never share a server (error log row 84)
+STATE="${TESTBED_STATE:-$HERE}"
+[ -d "$STATE" ] || mkdir -p "$STATE"
+LOG="$STATE/.testbed-server.log"
+PIDF="$STATE/.testbed-server.pid"
+PORTF="$STATE/.testbed-server.port"   # the port a running server took (base 2.2.0); only --owned turns it into an address
 COMFY_REF="${COMFY_REF:-}"          # empty = the newest release tag; else a branch, a newer tag or a full commit (3.0.0: COMFY_TAG is retired)
 # The base is either this script's own directory (testbed.sh ships in the ComfyUI Base repository) or a
 # comfyui-base/ beside it (a brand repository keeps the base as a submodule at base/comfyui-base).
@@ -65,6 +73,57 @@ ok(){ echo -e "${GREEN}  ✔ $*${NC}"; }
 note(){ echo "  ○ $*"; }
 warn(){ echo -e "${YEL}  ✖ $*${NC}"; }
 hdr(){ echo -e "\n${CYA}══ $* ══${NC}"; }
+
+# 3.9.2: the testbed stops only the server it started. It used to kill whatever listened on $PORT, and on a Mac shared
+# by several sessions that was another checkout's ComfyUI on 8199. Ours is the pid --server recorded in $PIDF, or a
+# child of it (a pid file written before 3.9.2 holds the subshell nohup's python ran under), and only while its command
+# line is still a ComfyUI main.py: a pid the system has since handed to something else is never ours.
+own_pids() {
+  [ -f "$PIDF" ] || return 0
+  local rec p
+  rec="$(tr -dc '0-9' < "$PIDF" 2>/dev/null || true)"
+  [ -n "$rec" ] && kill -0 "$rec" 2>/dev/null || return 0
+  for p in "$rec" $(pgrep -P "$rec" 2>/dev/null || true); do
+    case "$(ps -o command= -p "$p" 2>/dev/null || true)" in *main.py*--cpu*) echo "$p";; esac
+  done
+}
+
+# Who listens on a port (pids), or "?" when something accepts a connection there and lsof is not on this host to say who.
+# NB: lsof exits 1 when nothing matches, and `set -o pipefail` propagates that, so every lookup needs `|| true`.
+port_holders() { # [port] (default $PORT)
+  local port="${1:-$PORT}"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u || true
+  elif (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    echo "?"
+  fi
+}
+
+# 3.16.0: the one answer to "is there a server this testbed started, and where is it". Ours only when the recorded pid (or
+# its child, see own_pids) is a live ComfyUI main.py AND is what listens on the recorded port. The port file alone proved
+# nothing: verify.sh and the runner used whatever answered there, else 8199, and on a Mac where several sessions each run
+# a testbed that was another checkout's server (error log row 84: the snapshot tier measured its frontend, and a server
+# test lost it mid-run when its session stopped it). A foreign holder is named, never used.
+owned_server() { # -> 127.0.0.1:<port> on stdout and exit 0; else the reason on stderr and exit 1
+  local port pids held p
+  [ -f "$PORTF" ] || { echo "no server recorded in $STATE (no .testbed-server.port)" >&2; return 1; }
+  port="$(tr -dc '0-9' < "$PORTF" 2>/dev/null || true)"
+  [ -n "$port" ] || { echo "$PORTF holds no port" >&2; return 1; }
+  pids="$(own_pids | tr '\n' ' ')"; pids="${pids% }"
+  held="$(port_holders "$port" | tr '\n' ' ')"; held="${held% }"
+  if [ -z "$pids" ]; then
+    if [ -n "$held" ]; then echo "port $port (recorded in $STATE) is held by pid $held, which this testbed did not start: its own server is gone" >&2
+    else echo "the server recorded in $STATE is gone (stale pid and port files)" >&2; fi
+    return 1
+  fi
+  [ -n "$held" ] || { echo "this testbed's server (pid $pids) is not listening on port $port" >&2; return 1; }
+  if [ "$held" = "?" ]; then echo "127.0.0.1:$port"; return 0; fi   # no lsof: our live main.py, and its port answers
+  for p in $held; do case " $pids " in *" $p "*) echo "127.0.0.1:$port"; return 0;; esac; done
+  echo "port $port is held by pid $held, not by this testbed's server (pid $pids)" >&2; return 1
+}
+
+# --owned answers before anything is derived: the runner, verify.sh and podctl ask it on every run (no python, no git)
+if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = "--owned" ]; then owned_server; exit $?; fi
 
 # dir | git url — packs of packages NOT yet converted onto ComfyUI Base (unpinned, pulled --ff-only).
 # The four shared base packs are never listed here: list-packs supplies them, pinned.
@@ -269,46 +328,34 @@ provision_server() {
     uv pip install -q --upgrade --python "$VENV/bin/python" -r "$COMFY/requirements.txt" pytest >/dev/null
   fi
   "$VENV/bin/python" -c 'import importlib.metadata as m; print("  frontend " + m.version("comfyui-frontend-package"))' 2>/dev/null || true
+  start_server
+}
+
+# The server alone, from the venv as it is: --server's last step, and --start (3.16.0), which verify.sh runs with a
+# TESTBED_STATE and a free TESTBED_PORT of its own. Exit 3 when there is no venv to start from (verify.sh: no server).
+start_server() {
+  [ -x "$VENV/bin/python" ] || { warn "no venv at $VENV: bash \"$HERE/testbed.sh\" --server builds it"; return 3; }
   stop_server
   refuse_foreign_port
+  # a server with its own state folder gets its own temp folder too: ComfyUI empties its temp directory when it starts,
+  # and two servers on one tree would empty each other's
+  local tmpd=(); [ "$STATE" = "$HERE" ] || tmpd=(--temp-directory "$STATE")
   note "starting ComfyUI --cpu on port $PORT …"
   # nohup alone in the background, so $! is the pid python runs as (nohup execs it): the pid file names the server
-  ( cd "$COMFY" || exit 1; nohup "$VENV/bin/python" main.py --cpu --port "$PORT" --disable-auto-launch \
+  ( cd "$COMFY" || exit 1; nohup "$VENV/bin/python" main.py --cpu --port "$PORT" --disable-auto-launch ${tmpd[@]+"${tmpd[@]}"} \
       >"$LOG" 2>&1 & echo $! >"$PIDF" )
-  echo "$PORT" >"$PORTF"     # the base's runner (lib/95-summary.sh) and _build/verify.sh read this to find the server
+  echo "$PORT" >"$PORTF"
   local i
   for i in $(seq 1 120); do
-    if curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
+    # up only when OUR pid answers: a server that takes the port between the check above and python's bind is not ours
+    if owned_server >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
       ok "server up at http://127.0.0.1:$PORT (pid $(cat "$PIDF"), port recorded in $PORTF)"; return 0
     fi
+    [ -n "$(own_pids)" ] || break               # it exited (a port taken under it, an import error): no point waiting
     sleep 2
   done
   rm -f "$PORTF"
-  warn "server did not answer within 240 s — see $LOG"; tail -30 "$LOG" || true; return 1
-}
-
-# 3.9.2: the testbed stops only the server it started. It used to kill whatever listened on $PORT, and on a Mac shared
-# by several sessions that was another checkout's ComfyUI on 8199. Ours is the pid --server recorded in $PIDF, or a
-# child of it (a pid file written before 3.9.2 holds the subshell nohup's python ran under), and only while its command
-# line is still a ComfyUI main.py: a pid the system has since handed to something else is never ours.
-own_pids() {
-  [ -f "$PIDF" ] || return 0
-  local rec p
-  rec="$(tr -dc '0-9' < "$PIDF" 2>/dev/null || true)"
-  [ -n "$rec" ] && kill -0 "$rec" 2>/dev/null || return 0
-  for p in "$rec" $(pgrep -P "$rec" 2>/dev/null || true); do
-    case "$(ps -o command= -p "$p" 2>/dev/null || true)" in *main.py*--cpu*) echo "$p";; esac
-  done
-}
-
-# Who listens on $PORT (pids), or "?" when something accepts a connection there and lsof is not on this host to say who.
-# NB: lsof exits 1 when nothing matches, and `set -o pipefail` propagates that, so every lookup needs `|| true`.
-port_holders() {
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u || true
-  elif (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
-    echo "?"
-  fi
+  warn "this testbed's server did not come up — see $LOG"; tail -30 "$LOG" || true; return 1
 }
 
 stop_server() {
@@ -344,9 +391,9 @@ status() {
   hdr "STATUS"
   [ -d "$COMFY/.git" ] && ok "ComfyUI $(git -C "$COMFY" describe --tags 2>/dev/null || echo '?') · $(ls -1 "$CN" 2>/dev/null | wc -l | tr -d ' ') packs" || note "no source tree yet"
   [ -x "$VENV/bin/python" ] && ok "venv $($VENV/bin/python -V 2>&1)" || note "no venv"
-  local mine; mine="$(own_pids | head -1)"
-  if curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then
-    if [ -n "$mine" ]; then ok "server answering on $PORT (this testbed's, pid $mine)"; else note "a server answers on $PORT, but not this testbed's (TESTBED_PORT picks another)"; fi
+  local mine
+  if mine="$(owned_server 2>/dev/null)"; then ok "server answering at $mine (this testbed's, pid $(own_pids | head -1))"
+  elif curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then note "a server answers on $PORT, but not this testbed's (TESTBED_PORT picks another)"
   else note "server not running"; fi
   [ -f "$PORTF" ] && note "port file: $PORTF ($(tr -d '[:space:]' < "$PORTF"))"
   # what a provision WOULD install, and where the packages were found. Silent derivation is how 2.6.0 shipped
@@ -363,7 +410,8 @@ case "${1:-}" in
   --latest)  LATEST=1; provision_source; status;;
   --server)  provision_source; provision_server; status;;
   --packs)   provision_packs; status;;   # 3.6.1: the node packs alone (each to its tip), ComfyUI left as it is
+  --start)   start_server; status;;   # 3.16.0: the server alone (exit 3: no venv to start it from)
   --stop)    stop_server;;
   --status)  status;;
-  *) echo "usage: bash testbed.sh [--server | --latest | --packs | --stop | --status]"; exit 2;;
+  *) echo "usage: bash testbed.sh [--server | --start | --latest | --packs | --stop | --status | --owned]"; exit 2;;
 esac

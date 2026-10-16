@@ -222,3 +222,66 @@ def test_unit_verify_prints_a_failing_tests_whole_error_block(tmp_path):
     assert "line 39 of a long assertion" in r.stdout and ">       assert a == b" in r.stdout, r.stdout
     assert "FAILED suite/x.py::test_long" in r.stdout, r.stdout
     assert "head -16" not in src and "head -24" not in src, "the old 16/24-line caps are back"
+
+
+def _verify_beside(tmp_path, start="exit 0", owned='echo "127.0.0.1:$(cat "$TESTBED_STATE/p")"'):
+    """verify.sh in a stand-in base: no consumer root, a packager whose --check is green, a base.sh whose `test` records the
+    BASE_SERVER it was handed (from the repo and from the zip), and a testbed.sh that records every call with its
+    TESTBED_STATE and TESTBED_PORT; its --start runs `start` and --owned runs `owned`."""
+    import zipfile
+    b = tmp_path / "b"; (b / "_build").mkdir(parents=True); (b / "py").mkdir()
+    (b / "_build" / "verify.sh").write_text((BASE / "_build" / "verify.sh").read_text())
+    (b / "py" / "pkgdirs.py").write_text("print('')\n")
+    (b / "_build" / "package.py").write_text("print('comfyui-base.zip current')\n")
+    log = tmp_path / "calls.log"
+    base_sh = '#!/bin/bash\necho "suite $BASE_SERVER" >> "%s"; echo "1 passed"\n' % log
+    (b / "base.sh").write_text(base_sh)
+    with zipfile.ZipFile(b / "comfyui-base.zip", "w") as z:
+        z.writestr("comfyui-base/base.sh", base_sh)
+    (b / "testbed.sh").write_text('#!/bin/bash\necho "$1|${TESTBED_STATE:-}|${TESTBED_PORT:-}" >> "%s"\n'
+                                  'case "$1" in\n  --start) echo "${TESTBED_PORT:-}" > "$TESTBED_STATE/p"; %s;;\n  --owned) %s;;\nesac\nexit 0\n'
+                                  % (log, start, owned))
+    run = lambda **kw: subprocess.run(["bash", str(b / "_build" / "verify.sh")], capture_output=True, text=True, env={k: v for k, v in _env(**{"VERIFY_SERVER": "", **kw}).items() if not k.startswith("TESTBED_") or k in kw}, timeout=120)
+    calls = lambda: [ln.split("|") for ln in log.read_text().splitlines()] if log.exists() else []
+    return run, calls, log
+
+
+def test_unit_verify_talks_only_to_a_server_it_started_or_proved(tmp_path):
+    """3.16.0 (error log row 84): verify.sh used whatever answered on the port in .testbed-server.port, else 8199; another
+    session's server answered, the snapshot tier measured its frontend and a server test lost it mid-run. Now, by default,
+    each run starts its own on a free port with a folder of its own, both suites (repo and zip) get that address, and it
+    is stopped and its folder removed when the run ends; two runs never share one. VERIFY_SERVER=reuse takes the
+    checkout's server only when testbed.sh --owned proves it, and refuses a foreign one before any suite runs."""
+    _repo_only("_build/verify.sh")
+    run, calls, log = _verify_beside(tmp_path)
+    folders = []
+    for _ in range(2):
+        log.unlink(missing_ok=True)
+        r = run(); c = calls()
+        assert r.returncode == 0 and "this run's own, stopped when it ends" in r.stdout, r.stdout + r.stderr
+        start = [x for x in c if x[0] == "--start"]; assert len(start) == 1, c
+        state, port = start[0][1], start[0][2]
+        assert state and port.isdigit() and port != "8199", c
+        addr = "127.0.0.1:%s" % port
+        assert ("── server: %s" % addr) in r.stdout and log.read_text().count("suite %s\n" % addr) == 2, r.stdout + log.read_text()
+        assert ["--stop", state, ""] in c and c[-1][0] == "--stop" and not pathlib.Path(state).exists(), c
+        folders.append(state)
+    assert folders[0] != folders[1]
+    # reuse: a foreign holder is refused, by name, before anything runs
+    run, calls, log = _verify_beside(tmp_path / "r", owned='echo "port 8199 is held by pid 4242, not by this testbed\'s server (pid 77)" >&2; exit 1')
+    r = run(VERIFY_SERVER="reuse")
+    assert r.returncode == 1 and "refused: port 8199 is held by pid 4242" in r.stdout and "NOT green" in r.stdout, r.stdout + r.stderr
+    assert "══" not in r.stdout and [x[0] for x in calls()] == ["--owned"], calls()
+    # no venv (exit 3): no server, said out loud as 127.0.0.1:0, and the run folder is gone
+    run, calls, log = _verify_beside(tmp_path / "n", start="exit 3")
+    r = run()
+    assert r.returncode == 0 and "server: none (the testbed has no venv" in r.stdout and log.read_text().count("suite 127.0.0.1:0") == 2, r.stdout + log.read_text()
+    assert not pathlib.Path([x for x in calls() if x[0] == "--start"][0][1]).exists()
+    # a server that does not come up is a red gate that says so, never a quiet run without one
+    run, calls, log = _verify_beside(tmp_path / "f", start='echo "this testbed\'s server did not come up"; exit 1')
+    r = run()
+    assert r.returncode == 1 and "did not start" in r.stdout and "did not come up" in r.stdout and "══" not in r.stdout, r.stdout + r.stderr
+    # the caller's own BASE_SERVER is used as given; testbed.sh is not asked
+    run, calls, log = _verify_beside(tmp_path / "c")
+    r = run(BASE_SERVER="127.0.0.1:9911")
+    assert r.returncode == 0 and "set by the caller" in r.stdout and [x[0] for x in calls()] == ["suite 127.0.0.1:9911"] * 2, r.stdout + log.read_text()

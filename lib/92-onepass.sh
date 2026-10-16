@@ -59,8 +59,9 @@ _base_green_fp(){ # → "pkgfp=<sha> basefp=<sha>": every file the package folde
   b="$(_base_sha256 < "$BASE_DIR/MANIFEST.sha256" 2>/dev/null | cut -c1-16)" || true
   echo "pkgfp=${p:-?} basefp=${b:-?}"
 }
-_base_already_green(){ # → 0 when this exact install is already in place on this store (the reason it is not: BASE_GREEN_WHY)
-  BASE_GREEN_WHY=""
+_base_already_green(){ # → 0 when this exact install is already in place on this store (the reason it is not: BASE_GREEN_WHY;
+                       # the declared files it found in place: BASE_GREEN_FILES)
+  BASE_GREEN_WHY=""; BASE_GREEN_FILES=0
   if [ "$BASE_DRY" = "1" ] || [ "${BASE_FULL:-0}" = "1" ] || [ "${BASE_SEED:-0}" = "1" ] || _base_runtime_on; then BASE_GREEN_WHY="a full run was asked for"; return 1; fi
   local f="${BASE_STATE:-/nonexistent}/last-run/${PKG_ID:-}" w ts ver rest base="" sm="" fp="" x cat fam purp file url bytes mnote alts rel dest
   if [ ! -f "$f" ]; then BASE_GREEN_WHY="no earlier run of ${PKG_ID:-this package} on this store"; return 1; fi
@@ -76,8 +77,8 @@ _base_already_green(){ # → 0 when this exact install is already in place on th
     [ -n "$cat" ] || continue
     if [ "${BASE_STAGED:-0}" = "1" ] && _base_is_later "$file"; then continue; fi
     rel="$(_base_dest_rel "$cat|$fam|$purp|$file|$url|$bytes|$mnote|$alts")"; dest="$(_base_dest_path "$rel")"
-    if [[ "$file" == */ ]]; then [ -d "$dest" ] && continue
-    elif [ -f "$dest" ] && _base_size_ok "$(_base_fsize "$dest")" "$bytes"; then continue; fi
+    if [[ "$file" == */ ]]; then [ -d "$dest" ] && { BASE_GREEN_FILES=$((BASE_GREEN_FILES + 1)); continue; }
+    elif [ -f "$dest" ] && _base_size_ok "$(_base_fsize "$dest")" "$bytes"; then BASE_GREEN_FILES=$((BASE_GREEN_FILES + 1)); continue; fi
     BASE_GREEN_WHY="$rel is no longer in place"; return 1
   done <<< "$(_base_model_rows 2>/dev/null || true)"
   return 0
@@ -90,6 +91,9 @@ _base_green_run(){ # the whole run when _base_already_green: the workflow checke
   base_restart || true
   hdr "SUMMARY · ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION} · base $BASE_VERSION · already installed"
   echo "  install    skipped: this store already holds it, green ($(cat "$f" 2>/dev/null))"
+  # 3.16.0: the models line every run prints, so a reader of the summary (the packages' install tests grep "downloaded 0" on
+  # a second run) finds it here too; a skipped install downloads nothing by definition (free CI, image-creator-flux-3-klein#6)
+  echo "  models     ok ${BASE_GREEN_FILES:-0} in place · moved 0 · downloaded 0 · failed 0"
   echo "  restart    $BASE_RESTART_RESULT"
   _base_timings_block; _base_timings_write
   echo "  log        ${BASE_LOG:-none}"

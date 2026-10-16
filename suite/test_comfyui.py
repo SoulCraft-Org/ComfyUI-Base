@@ -1,4 +1,4 @@
-"""comfyui tier: needs the shared testbed and, for the live checks, its server on 127.0.0.1:8199. Since 2.6.0 the
+"""comfyui tier: needs the shared testbed and, for the live checks, a server of this checkout's own. Since 2.6.0 the
 tree is <base>/testbed, provisioned by the testbed.sh that ships here; a brand repository has base/testbed beside
 base/comfyui-base instead. Both are looked for, in that order, the same way lib/95-summary.sh does it - the runner
 normally hands BASE_NODE_SRC down and this fallback is for a bare `pytest suite/`. Everything skips cleanly when
@@ -14,8 +14,18 @@ def _find_testbed():
     return ""
 
 
+def _owned_server():
+    """3.16.0: a bare `pytest suite/` talks only to the server this checkout's testbed started (testbed.sh --owned), never
+    to whatever answers on 8199: on a shared Mac that was another checkout's (error log row 84). 127.0.0.1:0 is none."""
+    for root in (BASE, BASE.parent):
+        if (root / "testbed.sh").exists():
+            r = subprocess.run(["bash", str(root / "testbed.sh"), "--owned"], capture_output=True, text=True, timeout=60)
+            return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "127.0.0.1:0"
+    return "127.0.0.1:0"
+
+
 NODE_SRC = os.environ.get("BASE_NODE_SRC") or _find_testbed()
-SERVER = os.environ.get("BASE_SERVER") or "127.0.0.1:%s" % os.environ.get("TESTBED_PORT", "8199")
+SERVER = os.environ.get("BASE_SERVER") or _owned_server()
 
 
 def _server_up():
