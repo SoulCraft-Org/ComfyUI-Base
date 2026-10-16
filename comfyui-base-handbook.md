@@ -718,6 +718,22 @@ for any invocation that somehow arrives without the environment. The suite asser
   Video Replacer set is about 70 s of hashing in total on a fresh volume, spread over the parallel downloads, and 0 s
   on a volume that has it. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
   real Hub for `hf cache verify` (a flipped byte fails it, exit 1); not on a pod.
+- 3.10.1: `podctl ensure` on a fresh RunPod pod, and one clearer STOP (three defects from the Video Swapper's pod install,
+  2026-10-16). (1) `ensure` reset a fresh pod while its image was still in its own first boot (`runpod/comfyui` copies
+  ComfyUI and its venv onto the volume then): no venv, a crash loop, ssh never up (pod wibxqf22v26shv). It now waits,
+  before its first reset of a pod the base's boot does not own yet, until an image that ships ComfyUI answers
+  through the proxy on 8188 (any status below 500), or, for any other image (`runpod/base`), three minutes after the
+  pod started; at most 15 minutes. (2) After its own reset it kept polling the OLD ssh port: the API answers with the pod as it was for a while
+  after the PATCH, and RunPod had moved 22/tcp (20424 to 36944). It now waits for `lastStartedAt` to move and looks for
+  sshd on the port the pod has now, re-read on every try. (3) `podctl install` on a package folder not named after its
+  package (`vr` for `video-replacer-minimax-h3`) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
+  name must be the package's and names the one to rename it to. (4) `podctl create` offered data centres a pod cannot be
+  created in: the stock view names more than REST v1 `POST /pods` takes (its `dataCenterIds` enum has 30 ids and lacks
+  US-NE-1, a B200 location: a schema 400), and it picked ones that take no network volume (US-NC-1, US-MO-2, EUR-IS-2:
+  `POST /networkvolumes` 500). The candidates are now those in the live enum (REST v1's own `openapi.json`, read once per
+  run; the 30 ids read on 2026-10-16 when it cannot be read) and, when a network volume is wanted, those whose GraphQL
+  `storageSupport` is true; each one left out is named. Exercised on this Mac against the suite's fake RunPod, which now
+  answers stale reads after a reset and moves the ssh port; (2) also on a live pod (16174 became 19093, followed).
 - 3.10.0: a package can set ComfyUI's launch environment, and ComfyUI starts sized to the container's CPU quota
   (2026-10-16). `LAUNCH_ENV=( "KEY=value" ... )` (§4): an allowlist of thread, tokenizer, allocator and CTranslate2
   (`CT2_*`) variables, each value one word, so no path or secret can reach a file or a log; anything else, or a key set

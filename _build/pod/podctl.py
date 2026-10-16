@@ -924,6 +924,15 @@ def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_
     today = today or datetime.date.today().isoformat()
     items = items or [item_for(d) for d in dirs]
     for it in items:
+        if it["kind"] == "pkg" and not it.get("buyer") and not it["local_script"].exists():
+            # 3.10.1: a folder not named after its package ("vr" for video-replacer-minimax-h3) used to stop on "vr has no
+            # zip (vr-runpod.zip)", which sends one to build a zip that cannot exist under that name
+            found = sorted(p.name[:-len("-script.sh")] for p in it["dir"].glob("*-script.sh"))
+            io.say("STOP: the folder %s is not named after its package: a package folder's name is its package's name, the "
+                   "stem of <name>-script.sh and of its zip, and %s has no %s%s" % (
+                       it["dir"].name, it["dir"].name, it["local_script"].name,
+                       (" (it holds %s: rename the folder to %s)" % (", ".join("%s-script.sh" % f for f in found), found[0])) if found else ""))
+            return 1
         if not it["zip"].exists():
             io.say("STOP: %s has no zip (%s) — build it first" % (it["name"], it["zip"].name)); return 1
     if not gpu_gate(io, io.say):
@@ -1823,9 +1832,13 @@ def cmd_create(prov, args):
     if not gpus:
         raise PodctlError("--gpu is required on host %s (it has no default GPU order)" % getattr(prov, "name", "?"))
     seen = []
+    takes_volume = "volume" in inspect.signature(prov.availability).parameters
     for gpu in gpus:
-        locs = prov.availability(gpu, spot=args.spot)
+        # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one
+        locs = prov.availability(gpu, spot=args.spot, volume=not private) if takes_volume else prov.availability(gpu, spot=args.spot)
         print("stock   %s%s free now in: %s" % (gpu, spot, ", ".join(locs) if locs else "no location"))
+        for dc, why in getattr(prov, "skipped", None) or []:
+            print("stock   %s%s also free in %s, left out: %s" % (gpu, spot, dc, why))
         seen.append((gpu, locs))
         if locs and (not loc or loc in locs):
             args.gpu, loc = gpu, loc or locs[0]
