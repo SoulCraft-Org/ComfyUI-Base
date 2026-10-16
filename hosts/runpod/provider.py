@@ -337,9 +337,11 @@ def proxy_status(url, timeout=10):
 def first_boot_done(pod, probe, now):
     """3.10.1: has the IMAGE's own first boot finished? An image like runpod/comfyui copies ComfyUI and its venv onto the
     volume on its first start; a reset in the middle leaves no venv and the pod crash-loops (MEASURED 2026-10-16, pod
-    wibxqf22v26shv). Where the pod exposes 8188/http: its ComfyUI answers through the proxy (any status below 500; the
-    proxy says 502 while nothing listens). Otherwise FIRST_BOOT_MIN seconds since it started; unknown start: done."""
-    if "8188/http" in (pod.get("ports") or []):
+    wibxqf22v26shv). An image that ships ComfyUI (its name says comfy) and exposes 8188/http: done when that ComfyUI answers
+    through the proxy (any status below 500; the proxy says 502 while nothing listens). Any other image (runpod/base serves
+    nothing on 8188, so waiting for it would cost the whole FIRST_BOOT_WAIT): FIRST_BOOT_MIN seconds since it started;
+    unknown start: done."""
+    if "8188/http" in (pod.get("ports") or []) and "comfy" in pod_image(pod).lower():
         code = probe(proxy_url(pod, 8188) + "/")
         return code is not None and code < 500
     t = started_at(pod)

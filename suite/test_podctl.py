@@ -2019,6 +2019,7 @@ def test_unit_ensure_waits_for_the_images_first_boot_and_follows_the_ssh_port_a_
     followed by lastStartedAt; sshd is looked for on the port the pod has NOW, re-read on every try."""
     podctl = _load()
     fake = FakeRunPod(_pod(ports=["8188/http", "8888/http", "22/tcp"], portMappings={"22": 15270}, lastStartedAt="2026-10-16 08:59:00.000 +0000 UTC",
+                           imageName="runpod/comfyui:1.4.7-cuda13.0",
                            env={"PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}))
     fake.move_port_on_reset = True; fake.stale_reads = 3
     cfg = tmp_path / "ssh_config"; cfg.write_text(SSH_CONFIG, encoding="utf-8")
@@ -2046,7 +2047,8 @@ def test_unit_ensure_waits_for_the_images_first_boot_and_follows_the_ssh_port_a_
     assert "Port 15271" in cfg.read_text() and "15271" in out, (cfg.read_text(), out)
     assert any("still in its first boot" in s for s in said) and any("first boot is done" in s for s in said), said
     # a pod the base's boot already owns is never held for a first boot; an image that never answers is waited for, then reset
-    fake2 = FakeRunPod(_pod(ports=["8188/http", "22/tcp"], portMappings={"22": 15270}, env={"PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}))
+    fake2 = FakeRunPod(_pod(ports=["8188/http", "22/tcp"], portMappings={"22": 15270}, imageName="runpod/comfyui:1.4.7-cuda13.0",
+                            env={"PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key"}))
     try:
         api2 = podctl.Api("k", base_url=fake2.url); said2 = []; clock["t"] = 0.0
         podctl.ensure(api2, "fakepod0000001", pubkey="ssh-ed25519 AAAAC3fake mac@key", ssh_config=cfg, bootstrap="B",
@@ -2060,6 +2062,11 @@ def test_unit_ensure_waits_for_the_images_first_boot_and_follows_the_ssh_port_a_
         assert len(fake2.patches) == n
     finally:
         fake2.close()
+    # an image without ComfyUI of its own (runpod/base) is never asked on 8188: three minutes after it started will do
+    base_img = {"ports": ["8188/http", "22/tcp"], "imageName": "runpod/base:1.4.0-cuda1300-ubuntu2404", "lastStartedAt": "2026-10-16 09:00:00 +0000 UTC"}
+    t = lambda hms: (lambda: podctl._runpod.started_at({"lastStartedAt": "2026-10-16 %s +0000 UTC" % hms}))
+    assert podctl._runpod.first_boot_done(base_img, lambda u: (_ for _ in ()).throw(AssertionError("asked")), t("09:03:00")) is True
+    assert podctl._runpod.first_boot_done(base_img, None, t("09:01:00")) is False
     # no 8188/http: three minutes after the pod started is its first boot done
     assert podctl._runpod.first_boot_done({"ports": ["22/tcp"], "lastStartedAt": "2026-10-16 09:00:00.000 +0000 UTC"}, None,
                                           lambda: podctl._runpod.started_at({"lastStartedAt": "2026-10-16 09:02:59.000 +0000 UTC"})) is False

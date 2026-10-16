@@ -687,9 +687,9 @@ for any invocation that somehow arrives without the environment. The suite asser
 - 3.10.1: `podctl ensure` on a fresh RunPod pod, and one clearer STOP (three defects from the Video Swapper's pod install,
   2026-10-16). (1) `ensure` reset a fresh pod while its image was still in its own first boot (`runpod/comfyui` copies
   ComfyUI and its venv onto the volume then): no venv, a crash loop, ssh never up (pod wibxqf22v26shv). It now waits,
-  before its first reset of a pod the base's boot does not own yet, until the image's ComfyUI answers through the
-  proxy (any status below 500), or three minutes after the pod started where 8188/http is not exposed, at most 15
-  minutes. (2) After its own reset it kept polling the OLD ssh port: the API answers with the pod as it was for a while
+  before its first reset of a pod the base's boot does not own yet, until an image that ships ComfyUI answers
+  through the proxy on 8188 (any status below 500), or, for any other image (`runpod/base`), three minutes after the
+  pod started; at most 15 minutes. (2) After its own reset it kept polling the OLD ssh port: the API answers with the pod as it was for a while
   after the PATCH, and RunPod had moved 22/tcp (20424 to 36944). It now waits for `lastStartedAt` to move and looks for
   sshd on the port the pod has now, re-read on every try. (3) `podctl install` on a package folder not named after its
   package (`vr` for `video-replacer-minimax-h3`) stopped on "vr has no zip (vr-runpod.zip)"; it now says the folder's
