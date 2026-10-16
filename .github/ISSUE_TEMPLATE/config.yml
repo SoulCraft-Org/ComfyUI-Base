@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: The handbook
-    url: https://github.com/Soul-Craft/ComfyUI-Base/blob/main/comfyui-base-handbook.md
+    url: https://github.com/SoulCraft-Org/ComfyUI-Base/blob/main/comfyui-base-handbook.md
     about: Design rules, the per-host recipes, the package contract and the test tiers.
+  - name: Report a vulnerability (privately)
+    url: https://github.com/SoulCraft-Org/ComfyUI-Base/security/advisories/new
+    about: Never in a public issue. SECURITY.md says what the installer downloads and how each item is checked.
