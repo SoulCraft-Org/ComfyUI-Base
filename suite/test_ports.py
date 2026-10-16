@@ -20,6 +20,7 @@ BASE = pathlib.Path(__file__).resolve().parents[1]
 PROXY = BASE / "py" / "app_proxy.py"
 sys.path.insert(0, str(BASE / "suite"))
 from test_podctl import FakeRunPod, _load, _pod, B200_STOCK  # noqa: E402  (the one fake RunPod)
+from basetest import stop_forwarders  # noqa: E402  (stop AND wait: error log row 78)
 
 
 def _proxy_mod():
@@ -231,7 +232,7 @@ def test_unit_boot_apps_starts_one_forwarder_for_every_row_and_restarts_it(tmp_p
         r = subprocess.run(["bash", str(boot), "--apps"], capture_output=True, text=True, env=env, timeout=60)
         assert "app ports: none declared" in r.stdout and pids() == [], r.stdout
     finally:
-        subprocess.run(["pkill", "-f", "app_proxy\\.py --state %s/state" % home])
+        assert stop_forwarders("%s/state" % home)
 
 
 def _bash(snippet, env=None):
@@ -669,7 +670,7 @@ def test_unit_boot_makes_the_key_on_a_public_bind_and_starts_comfyuis_front(tmp_
                            env={**env, "BOOT_HOME": str(home2), "BASE_LISTEN": "127.0.0.1"})
         assert "app ports: none declared" in r.stdout and "front" not in r.stdout and not (home2 / "state" / "tokens.env").exists()
     finally:
-        subprocess.run(["pkill", "-f", "app_proxy\\.py --state %s/state" % home])
+        assert stop_forwarders("%s/state" % home)
     sh = 'source "%s/lib/boot.sh"; BOOT_HOME=%s; ' % (BASE, _sh(home))
     got = subprocess.run(["bash", "-c", sh + "BASE_LISTEN=0.0.0.0 BASE_LINK_TOKEN=fromenv; boot_link_token; echo $BASE_LINK_TOKEN $BOOT_LINK_MADE"],
                          capture_output=True, text=True, env={**env, "BOOT_ROOT": ""}).stdout.split()
