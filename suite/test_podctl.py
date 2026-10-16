@@ -1736,9 +1736,9 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
         out = capsys.readouterr().out
         assert "free now in: EU-RO-1, US-CA-2" in out and "STOP: US-NE-1 has no NVIDIA B200 free" in out, out
         assert [p for p in srv.posts if p != "/graphql"] == []
-        # neither a new size nor an existing volume: refused before any call bills
+        # neither a new size nor an existing volume, and (3.16.0) no fresh pod either: refused before any call bills
         with pytest.raises(podctl.PodctlError):
-            _create(podctl, srv, pub)
+            _create(podctl, srv, pub, "--no-fresh")
         # the first data centre with stock, a new volume there, the pod on it
         srv.posts.clear(); srv.bodies.clear()
         assert _create(podctl, srv, pub, "--data-gb", "500") in (None, 0)
@@ -1830,7 +1830,7 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         {"id": "EU-RO-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B200", "stockStatus": "Low", "available": True}]},
         {"id": "EUR-IS-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B300 SXM6 AC", "stockStatus": "Low", "available": True},
                                                {"gpuTypeId": "NVIDIA B300 SXM6 AC MIG 1g.34gb", "stockStatus": "High", "available": True}]}]}
-    assert podctl.RunPodProvider.default_gpus == ("NVIDIA B200", "NVIDIA B300 SXM6 AC")
+    assert podctl.RunPodProvider.default_gpus[:2] == ("NVIDIA B200", "NVIDIA B300 SXM6 AC")   # 3.16.0: then the next tier
     srv = FakeRunPod(_pod(), volumes={"isvol": {"id": "isvol", "size": 500, "dataCenterId": "EUR-IS-1"}}, gql=stock)
     def create(*argv, image="someone/comfy:cu128"):
         prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
@@ -1842,7 +1842,7 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         body = srv.bodies[-1][1]
         assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["dataCenterIds"] == ["EU-RO-1"], body
         assert body["allowedCudaVersions"] == ["13.0"], "a cu128 image tag must not lower the floor below the base's cu130"
-        assert "gpu     NVIDIA B200, in EU-RO-1 (no --gpu: the host's order is NVIDIA B200, NVIDIA B300 SXM6 AC)" in out, out
+        assert "gpu     NVIDIA B200, in EU-RO-1 (no --gpu: the host's order is %s)" % ", ".join(podctl.RunPodProvider.default_gpus) in out, out
         # the volume pins EUR-IS-1, which has no B200: the B300 there
         assert create("--volume", "isvol") in (None, 0)
         out = capsys.readouterr().out
@@ -1852,7 +1852,8 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         n = len(srv.bodies)
         assert create("--data-gb", "100", "--location", "US-CA-2") == 1
         out = capsys.readouterr().out
-        assert "STOP: US-CA-2 has no NVIDIA B200 or NVIDIA B300 SXM6 AC free right now; NVIDIA B200 is free in: EU-RO-1; NVIDIA B300 SXM6 AC is free in: EUR-IS-1" in out, out
+        assert "STOP: US-CA-2 has no %s free right now; NVIDIA B200 is free in: EU-RO-1; NVIDIA B300 SXM6 AC is free in: EUR-IS-1" % (
+            " or ".join(podctl.RunPodProvider.default_gpus)) in out, out
         assert [p for p, _ in srv.bodies[n:] if p != "/graphql"] == [], "a STOP creates no volume and no pod"
         # an explicit --gpu is the only one asked; an explicit --min-cuda still wins over the floor
         assert create("--data-gb", "100", "--gpu", "NVIDIA B300 SXM6 AC", "--min-cuda", "12.9") in (None, 0)
@@ -1861,6 +1862,92 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         srv.close()
     assert podctl.create_floor("someone/comfy:latest") == "13.0" and podctl.create_floor("runpod/comfyui:1.4.7-cuda13.0") == "13.0"
     assert podctl.create_floor("x/y:cu128", "12.8") == "12.8"
+
+
+def test_unit_runpod_create_order_goes_past_b300_and_says_what_each_gpu_means():
+    """3.16.0 (Paul, 2026-10-16: rendering speed first): B200, B300, then the next tier, RunPod's exact ids (never a
+    MIG slice, never the Workstation or Max-Q PRO 6000), and a note for each GPU past the B200 that a package must act on."""
+    podctl = _load()
+    order = podctl.RunPodProvider.default_gpus
+    assert order == ("NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA H200")
+    assert not any("MIG" in g or "Workstation" in g or "Max-Q" in g for g in order)
+    notes = podctl.RunPodProvider.gpu_notes
+    assert set(notes) == set(order[1:]) and "fp8" in notes["NVIDIA B300 SXM6 AC"] and "INT8" in notes["NVIDIA B300 SXM6 AC"]
+    assert podctl.RunPodProvider.fresh_pod_gb == podctl.FRESH_POD_GB == 400
+
+
+def test_unit_runpod_create_goes_fresh_where_the_gpu_is_when_the_volume_is_elsewhere(tmp_path, capsys):
+    """3.16.0: the GPU order comes first. The named volume sits where only a B300 is free and a B200 is free elsewhere:
+    the pod is the B200, fresh, on a pod volume (no network volume made or mounted, the public ports and key as ever).
+    --pod-gb sizes it; --no-fresh is 3.14.0's rule (the B300 on the volume, with its note); with the B200 sold out the
+    B300 on the volume is the pick anyway."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    stock = {"dataCenters": [
+        {"id": "US-CA-2", "gpuAvailability": [{"gpuTypeId": "NVIDIA B200", "stockStatus": "Low", "available": True}]},
+        {"id": "EUR-IS-1", "gpuAvailability": [{"gpuTypeId": "NVIDIA B300 SXM6 AC", "stockStatus": "Low", "available": True}]}]}
+    vols = {"isvol": {"id": "isvol", "name": "comfy-base-data", "dataCenterId": "EUR-IS-1", "size": 500}}
+    srv = FakeRunPod(_pod(), volumes=dict(vols), gql=stock)
+    prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    run = lambda *a: podctl.cmd_create(prov, podctl.build_parser().parse_args(
+        ["--pubkey", str(pub), "create", "--name", "f1", "--image", "x/c:cu130", "--no-wait", "--no-names", *a]))
+    pods = lambda: [b for p, b in srv.bodies if p == "/pods"]
+    try:
+        assert run() in (None, 0)
+        out, body = capsys.readouterr().out, pods()[-1]
+        assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["dataCenterIds"] == ["US-CA-2"], body
+        assert "networkVolumeId" not in body and body["volumeInGb"] == 400 and body["volumeMountPath"] == "/workspace"
+        assert "8188/http" in body["ports"] and body["env"]["BASE_LINK_TOKEN"] and "BASE_LISTEN" not in body["env"]
+        assert "/networkvolumes" not in srv.posts, srv.posts
+        assert "volume  none: a fresh pod in US-CA-2 on a 400 GB pod volume (comfy-base-data is only in EUR-IS-1)" in out, out
+        assert "pod volume 400 GB at /workspace" in out and "podctl guard" in out, out
+        assert run("--pod-gb", "250") in (None, 0)
+        assert pods()[-1]["volumeInGb"] == 250
+        capsys.readouterr()
+        assert run("--no-fresh") in (None, 0)
+        out, body = capsys.readouterr().out, pods()[-1]
+        assert body["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"] and body["networkVolumeId"] == "isvol" and "volumeInGb" not in body
+        assert "gpu     note: sm_103" in out and "fp8" in out, out
+        stock["dataCenters"][0]["gpuAvailability"][0]["available"] = False      # the B200 sold out everywhere
+        assert run() in (None, 0)
+        assert pods()[-1]["networkVolumeId"] == "isvol" and pods()[-1]["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"]
+        stock["dataCenters"][0]["gpuAvailability"][0]["available"] = True
+        stock["dataCenters"][0]["storageSupport"] = False                    # no network volumes there: fine for a fresh pod
+        assert run() in (None, 0) and pods()[-1]["dataCenterIds"] == ["US-CA-2"] and pods()[-1]["volumeInGb"] == 400
+        with pytest.raises(podctl.PodctlError):                                # a fresh pod takes no network volume
+            podctl.create(prov.api, "x", "NVIDIA B200", "US-CA-2", data_gb=10, image="x/c:cu130", pubkey="k", wait=False,
+                          pod_gb=100, say=lambda *a: None)
+    finally:
+        srv.close()
+
+
+def test_unit_balance_is_projected_past_the_lag_and_guard_stops_running_pods_at_the_floor(tmp_path, capsys):
+    """3.16.0: RunPod's balance trails its spend (2026-10-16: a $5 stop rule let it reach -$1.24 and the pods were
+    removed). balance() reads GraphQL myself; the projection takes off --lag-min of the spend; guard says what it
+    would stop without --yes (exit 3), stops every running pod with it, and is quiet above the floor (exit 0)."""
+    podctl = _load()
+    me = {"clientBalance": 9.0, "currentSpendPerHr": 12.0, "spendLimit": 80}
+    srv = FakeRunPod(_pod(name="Videos"), gql=lambda body: {"myself": dict(me)} if "myself" in (body.get("query") or "") else {})
+    prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    cmd = lambda *a: {"balance": podctl.cmd_balance, "guard": podctl.cmd_guard}[a[0]](prov, podctl.build_parser().parse_args(list(a)))
+    try:
+        b = prov.balance()
+        assert b == {"amount": 9.0, "currency": "USD", "spend_per_hr": 12.0, "spend_limit": 80}
+        assert podctl.projected_balance(b, 30) == 3.0 and podctl.projected_balance(dict(b, spend_per_hr=None), 30) == 9.0
+        cmd("balance"); out = capsys.readouterr().out
+        assert out.startswith("9.00 USD") and "spending 12.00/h" in out and "projected 3.00" in out, out
+        me["clientBalance"] = 20.0
+        assert cmd("guard") == 0 and srv.pod["desiredStatus"] == "RUNNING"
+        assert "h to the 5.00 floor" in capsys.readouterr().out
+        me["clientBalance"] = 9.0                                              # projected 3.00, under the $5 floor
+        assert cmd("guard") == 3 and srv.pod["desiredStatus"] == "RUNNING"
+        assert "WOULD STOP fakepod0000001 (Videos)" in capsys.readouterr().out
+        assert cmd("guard", "--yes") == 3 and srv.pod["desiredStatus"] == "EXITED"
+        assert "/pods/fakepod0000001/stop" in srv.posts and "STOPPED fakepod0000001" in capsys.readouterr().out
+        assert cmd("guard", "--yes") == 0, "nothing running: nothing to stop"
+        assert cmd("guard", "--floor", "1", "--lag-min", "10") == 0                        # 9 - 2 = 7 > 1
+    finally:
+        srv.close()
 
 
 def test_unit_create_flags_a_host_does_not_take_are_refused_by_name(tmp_path):

@@ -71,7 +71,8 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "deploy", "volume_size_gb", "record_volume", "POD_READ", "pod_volume", "volume_line", "stock", "cuda_floor", "create_floor", "DEFAULT_GPUS", "DEFAULT_MIN_CUDA", "allowed_cuda",
            "create_body", "create",
            "save_port_names", "names_template", "template_state", "http_ports", "jupyter_token", "proxy_url",   # 3.9.0
-           "link_token", "named_volumes", "DEFAULT_VOLUME_NAME"):                                              # 3.14.0
+           "link_token", "named_volumes", "DEFAULT_VOLUME_NAME",                                               # 3.14.0
+           "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB"):                                           # 3.16.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -1971,10 +1972,61 @@ def _offered(prov, *names):
         raise PodctlError("%s: not offered by host %s" % (", ".join(missing), getattr(prov, "name", "?")))
 
 
+# 3.16.0: RunPod's clientBalance is updated behind the spend (on 2026-10-16 a $5 stop rule let it reach -$1.24 and
+# RunPod removed the pods), so what is acted on is the balance minus the spend of the last BALANCE_LAG_MIN minutes.
+BALANCE_LAG_MIN = 30
+GUARD_FLOOR = 5.0
+
+
+def projected_balance(b, lag_min=BALANCE_LAG_MIN):
+    """The balance once the spend RunPod has not booked yet is taken off: amount - spend_per_hr x lag. A host that
+    states no spend rate is taken at its word."""
+    return b["amount"] - (b.get("spend_per_hr") or 0.0) * float(lag_min) / 60.0
+
+
+def balance_line(b, lag_min, floor=None):
+    line = "%.2f %s" % (b["amount"], b["currency"])
+    spend = b.get("spend_per_hr")
+    if spend is None:
+        return line + " (this host states no spend rate, so nothing is projected)"
+    p = projected_balance(b, lag_min)
+    line += " · spending %.2f/h · projected %.2f (%g min of spend not booked yet taken off)" % (spend, p, float(lag_min))
+    if floor is not None and spend > 0 and p > floor:
+        line += " · %.1f h to the %.2f floor" % ((p - floor) / spend, floor)
+    return line
+
+
 def cmd_balance(prov, args):
     _offered(prov, "balance")
     b = prov.balance()
-    print("%.2f %s" % (b["amount"], b["currency"]))
+    print(balance_line(b, getattr(args, "lag_min", BALANCE_LAG_MIN)))
+
+
+def cmd_guard(prov, args):
+    """3.16.0: stop every running pod once the projected balance is at --floor or below. A pod without a network volume
+    is TERMINATED at a $0 balance (RunPod's billing docs), with its models and outputs; a stopped one only waits. Without
+    --yes it says what it would stop. Exit 0 above the floor (or nothing running), 3 at or below it, 1 on an error."""
+    _offered(prov, "balance", "stop", "pods", "facts")
+    b = prov.balance()
+    p = projected_balance(b, args.lag_min)
+    running = [f for f in (prov.facts(x) for x in prov.pods()) if f.get("status") == "running"]
+    print("balance %s · floor %.2f · %d pod(s) running" % (balance_line(b, args.lag_min, args.floor), args.floor, len(running)))
+    if p > args.floor:
+        return 0
+    if not running:
+        print("at the floor, and nothing is running: nothing to stop")
+        return 0
+    names = ", ".join("%s (%s)" % (f["id"], f.get("name") or "") for f in running)
+    if not args.yes:
+        print("WOULD STOP %s: the projected balance %.2f is at or below %.2f (pass --yes to stop them)" % (names, p, args.floor))
+        return 3
+    for f in running:
+        try:
+            print(prov.stop(f["id"], wait=False))
+        except PodctlError as e:                      # one refusal never keeps the others running
+            print("  !! %s did not stop: %s" % (f["id"], e))
+    print("STOPPED %s: the projected balance %.2f is at or below %.2f. Top up, then podctl start <pod>" % (names, p, args.floor))
+    return 3
 
 
 def cmd_availability(prov, args):
@@ -2018,23 +2070,35 @@ def cmd_create(prov, args):
         if loc and loc != vloc:
             raise PodctlError("volume %s is in %s, not %s: a pod can only mount a volume in its own data centre" % (volume, vloc, loc))
         loc = vloc
-    elif not args.data_gb and not reuse:
+    elif private and not args.data_gb:
+        raise PodctlError("--data-gb N (a new volume) or --volume <id> (an existing one)")
+    # 3.16.0 (Paul, 2026-10-16: rendering speed first): with neither --volume nor --data-gb, a public pod no longer
+    # waits for the GPU where the named volume is. The GPU order comes first: the reusable volume where that GPU is
+    # free, else a FRESH pod (a pod volume of --pod-gb, models downloaded again, in parallel and pinned) in the first
+    # data centre that has it. --no-fresh is 3.14.0's rule: only where the volume is.
+    fresh_gb = getattr(args, "pod_gb", None) or getattr(prov, "fresh_pod_gb", None)
+    can_fresh = (not private and not volume and not args.data_gb and bool(fresh_gb) and not getattr(args, "no_fresh", False)
+                 and "pod_gb" in inspect.signature(prov.create_machine).parameters)
+    if not volume and not args.data_gb and not reuse and not can_fresh:
         raise PodctlError("--data-gb N (a new volume) or --volume <id> (an existing one)%s" % (
             "" if private else "; no network volume called %s exists yet to reuse" % vname))
-    elif not args.data_gb and loc and loc not in reuse:
+    if not volume and not args.data_gb and loc and loc not in reuse and not can_fresh:
         raise PodctlError("no network volume called %s in %s (it is in: %s): pass --data-gb N for a new one there, or drop "
-                          "--location" % (vname, loc, ", ".join(sorted(reuse))))
-    # 3.8.0: --gpu names one type; without it the host's default order (RunPod: B200, then B300) is tried, and the first
-    # with stock where the pod must go (the --location, the volume's data centre, else anywhere) is the one created
-    defaulted = not args.gpu
+                          "--location" % (vname, loc, ", ".join(sorted(reuse)) or "nowhere"))
+    # 3.8.0: --gpu names one type; without it the host's default order (RunPod: B200, then B300; 3.16.0: then the next
+    # tier) is tried, and the first with stock where the pod must go (the --location, the volume's data centre, else
+    # anywhere) is the one created
+    defaulted, fresh = not args.gpu, False
     gpus = [args.gpu] if args.gpu else list(getattr(prov, "default_gpus", ()) or ())
     if not gpus:
         raise PodctlError("--gpu is required on host %s (it has no default GPU order)" % getattr(prov, "name", "?"))
     seen = []
     takes_volume = "volume" in inspect.signature(prov.availability).parameters
     for gpu in gpus:
-        # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one
-        locs = prov.availability(gpu, spot=args.spot, volume=not private) if takes_volume else prov.availability(gpu, spot=args.spot)
+        # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one;
+        # 3.16.0: a fresh pod makes none (and a reusable volume's data centre takes them), so then every one counts
+        locs = (prov.availability(gpu, spot=args.spot, volume=not private and not can_fresh) if takes_volume
+                else prov.availability(gpu, spot=args.spot))
         print("stock   %s%s free now in: %s" % (gpu, spot, ", ".join(locs) if locs else "no location"))
         for dc, why in getattr(prov, "skipped", None) or []:
             print("stock   %s%s also free in %s, left out: %s" % (gpu, spot, dc, why))
@@ -2045,6 +2109,9 @@ def cmd_create(prov, args):
             break
         if locs and (not loc or loc in locs) and (args.data_gb or volume):
             args.gpu, loc = gpu, loc or locs[0]
+            break
+        if locs and (not loc or loc in locs) and can_fresh:   # 3.16.0: no reusable volume where this GPU is free
+            args.gpu, loc, fresh = gpu, loc or locs[0], True
             break
     else:
         if not any(locs for _, locs in seen):
@@ -2062,9 +2129,16 @@ def cmd_create(prov, args):
         print("volume  %s (%s) in %s: reused" % (volume, vname, loc))
     if defaulted:
         print("gpu     %s, in %s (no --gpu: the host's order is %s)" % (args.gpu, loc, ", ".join(gpus)))
+    note = (getattr(prov, "gpu_notes", None) or {}).get(args.gpu)
+    if note:
+        print("gpu     note: %s" % note)
+    if fresh:
+        print("volume  none: a fresh pod in %s on a %d GB pod volume (%s); the models download again" % (
+            loc, int(fresh_gb), ("%s is only in %s" % (vname, ", ".join(sorted(reuse)))) if reuse else "no %s to reuse" % vname))
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
-    extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private)) if v}
-    if not private and not volume and "volume_name" in inspect.signature(prov.create_machine).parameters:
+    extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private),
+                               ("pod_gb", int(fresh_gb) if fresh else None)) if v}
+    if not private and not volume and not fresh and "volume_name" in inspect.signature(prov.create_machine).parameters:
         extra["volume_name"] = vname                    # 3.14.0: the new volume gets the name the next create reuses
     takes = inspect.signature(prov.create_machine).parameters
     for k in extra:
@@ -2188,18 +2262,29 @@ def build_parser():
     p.add_argument("--out", default=".mcp.json", help="where to write it (default: .mcp.json here)")
     p.add_argument("--print", dest="print_only", action="store_true", help="print the JSON instead of writing it")
     # ---- 3.1.0: a buyer's machine
-    sub.add_parser("balance", help="the account's prepaid balance")
+    p = sub.add_parser("balance", help="the account's prepaid balance, and (RunPod) what it spends and the balance projected past RunPod's lag")
+    p.add_argument("--lag-min", dest="lag_min", type=float, default=BALANCE_LAG_MIN, help="minutes of spend not booked yet (default %d)" % BALANCE_LAG_MIN)
+    p = sub.add_parser("guard", help="stop every running pod once the projected balance is at --floor or below (3.16.0); "
+                                     "without --yes it says what it would stop; exit 3 at the floor")
+    p.add_argument("--floor", type=float, default=GUARD_FLOOR, help="the balance to stop at (default %.0f)" % GUARD_FLOOR)
+    p.add_argument("--lag-min", dest="lag_min", type=float, default=BALANCE_LAG_MIN, help="minutes of spend not booked yet (default %d)" % BALANCE_LAG_MIN)
+    p.add_argument("--yes", action="store_true", help="stop them (otherwise only say which)")
     p = sub.add_parser("availability", help="the locations where a GPU type can be deployed now"); p.add_argument("--gpu", required=True, help="an instance type, e.g. 1RTXPRO6000.30V")
     p.add_argument("--spot", action="store_true")
     p = sub.add_parser("create", help="a machine from nothing, after a stock check that names where the GPU is free: a data volume (or --volume), "
                                       "then the machine on it (Verda: NVMe disk + instance; RunPod: network volume + Secure Cloud pod); ensure configures it")
     p.add_argument("--name", required=True); p.add_argument("--gpu", help="Verda: an instance type (required); RunPod: a GPU type id (default: "
-                                                                      "'NVIDIA B200', then 'NVIDIA B300 SXM6 AC', the first with stock)")
+                                                                      "'NVIDIA B200', 'NVIDIA B300 SXM6 AC', 'NVIDIA RTX PRO 6000 Blackwell Server "
+                                                                      "Edition', 'NVIDIA H200', the first with stock)")
     p.add_argument("--location", help="Verda: a location; RunPod: a data centre id (default: the first with the GPU free now)")
     p.add_argument("--data-gb", dest="data_gb", type=int, help="the size of a NEW data volume (RunPod: a network volume in that data centre)")
     p.add_argument("--volume", help="RunPod: an EXISTING network volume id to put the pod on (its data centre is the pod's)")
     p.add_argument("--volume-name", dest="volume_name", help="RunPod: the network volume a public pod reuses, by name, in a data "
                    "centre with the GPU free, so models download once; made there (of --data-gb) when none exists (default comfy-base-data)")
+    p.add_argument("--pod-gb", dest="pod_gb", type=int, help="RunPod: the pod volume of a FRESH pod, made where the GPU is free "
+                   "and no network volume is (3.16.0; default %d); models download again" % _runpod.FRESH_POD_GB)
+    p.add_argument("--no-fresh", dest="no_fresh", action="store_true", help="RunPod: never a fresh pod: only where the network "
+                   "volume is, or a new one of --data-gb (3.14.0's rule)")
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
@@ -2243,7 +2328,7 @@ def main(argv=None):
         rc = {"status": cmd_status, "pods": cmd_pods, "image": cmd_image, "ensure": cmd_ensure, "ssh-config": cmd_ssh_config,
          "stop": cmd_stop, "start": cmd_start, "restart": cmd_restart, "deploy": cmd_deploy, "upload": cmd_upload, "tunnel": cmd_tunnel, "jupyter": cmd_jupyter, "install": cmd_install,
          "lease": cmd_lease, "pins": cmd_pins, "prune": cmd_prune, "mcp": cmd_mcp,
-         "balance": cmd_balance, "availability": cmd_availability, "create": cmd_create, "pause": cmd_pause, "put-away": cmd_put_away,
+         "balance": cmd_balance, "guard": cmd_guard, "availability": cmd_availability, "create": cmd_create, "pause": cmd_pause, "put-away": cmd_put_away,
          "buyer-install": cmd_buyer_install, "progress": cmd_progress, "runtime-capture": cmd_runtime_capture,
          "runner": cmd_runner}[args.cmd](prov, args)
         if isinstance(rc, int):

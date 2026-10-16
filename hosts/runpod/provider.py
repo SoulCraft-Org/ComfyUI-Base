@@ -803,10 +803,43 @@ PRIVATE_PORTS = ["22/tcp"]                               # 3.7.4 --private: sshd
 CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
 # 3.8.0: with no --gpu, `create` asks for these in order (the video packages' GPU_PREFER, py/gpu_fit.py): B200 first,
 # then B300. "NVIDIA B300 SXM6 AC MIG 1g.34gb" is a 34 GB slice of a B300 and is never on this list.
-DEFAULT_GPUS = ("NVIDIA B200", "NVIDIA B300 SXM6 AC")
+# 3.16.0 (Paul, 2026-10-16: rendering speed first): then the next tier, so a sold-out B200 and B300 still give a pod,
+# fastest first. The third and fourth are provisional until the 2-step benchmark per GPU confirms them: Paul asked for
+# the RTX PRO 6000 third; the first research put an H200 at about twice a PRO 6000. The ids are RunPod's (GraphQL
+# gpuTypes, 2026-10-16); the PRO 6000 is the Server Edition (the Workstation and Max-Q ones, and the MIG slices, are not).
+DEFAULT_GPUS = ("NVIDIA B200", "NVIDIA B300 SXM6 AC", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA H200")
+# 3.16.0: what `create` says when it picks one of these, before anything bills. Hardware facts, nothing about a package.
+# INT8: NVIDIA's HGX table lists HGX B300 at 3 POPS of INT8 tensor throughput (8 GPUs, sparse) against 72 for HGX B200,
+# with FP8 equal on both (nvidia.com/en-us/data-center/hgx, read 2026-10-16): about 0.19 POPS dense per B300.
+# nvfp4: ComfyUI computes it natively only on compute capability 10 and newer (model_management.supports_nvfp4_compute).
+GPU_NOTES = {
+    "NVIDIA B300 SXM6 AC": "sm_103: INT8 tensor throughput is about 1/24 of a B200's (FP8 is the same), so "
+                           "int8-quantized weights run slow here: a package should load its fp8 (or bf16) weights on this GPU",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": "sm_120, 96 GB: less memory than the B200's 180 GB",
+    "NVIDIA H200": "sm_90 (Hopper): ComfyUI emulates nvfp4 weights here (native from sm_100), so they run slower",
+}
+# 3.16.0: the pod volume of a fresh pod (no network volume where the GPU is): the models download again, in parallel and
+# pinned (lib/50-models.sh), so it only needs to hold one install. --pod-gb overrides it.
+FRESH_POD_GB = 400
 # The base installs a cu130 torch whatever the image was built for, so a host below CUDA 13.0 (a pre-580 driver) fails at
 # the first kernel. Without --min-cuda the floor is never lower than this; an explicit --min-cuda still wins.
 DEFAULT_MIN_CUDA = "13.0"
+
+
+BALANCE_QUERY = "query { myself { clientBalance currentSpendPerHr spendLimit } }"
+
+
+def balance(api):
+    """3.16.0: the account's prepaid balance and what it spends now: {"amount", "currency", "spend_per_hr", "spend_limit"}
+    (GraphQL myself; REST v1 has no balance call). RunPod updates clientBalance behind the spend, so a caller that acts
+    on it projects it forward (podctl balance, podctl guard)."""
+    me = api.graphql(BALANCE_QUERY).get("myself") or {}
+    if not isinstance(me.get("clientBalance"), (int, float)):
+        raise PodctlError("GraphQL myself answered no clientBalance: %r" % (sorted(me),))
+    spend = me.get("currentSpendPerHr")
+    return {"amount": float(me["clientBalance"]), "currency": "USD",
+            "spend_per_hr": float(spend) if isinstance(spend, (int, float)) else None,
+            "spend_limit": me.get("spendLimit")}
 
 
 def stock(api, gpu, volume=False, skipped=None):
@@ -875,7 +908,7 @@ def encryption_words(pod, gb=None):
 
 
 def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None, names=None,
-                template_id=None, token=None, link=None, start=None):
+                template_id=None, token=None, link=None, start=None, pod_gb=None):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
     data centre, the ports, PUBLIC_KEY, the CUDA floor. No start command: `ensure` installs the base's boot guard from the
     image's own entry, as for every other pod; and no templateId but the port-names one (3.9.0), which carries nothing else.
@@ -888,7 +921,9 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
     them in the console; token: the pod's own JUPYTER_TOKEN (JupyterLab is never tokenless). A private pod takes none of
     the three: no http port, so nothing to name, and the boot makes its token on the pod volume.
     3.14.0 link: the pod's own BASE_LINK_TOKEN, the key every proxied link but the terminal's needs (a private pod has none
-    to lock: its ports are on loopback)."""
+    to lock: its ports are on loopback).
+    3.16.0 pod_gb: a PUBLIC pod on a POD VOLUME of that size instead of a network volume (a fresh pod where the GPU is
+    and no network volume is): the same ports, names, tokens and key as a network-volume pod."""
     body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
             "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
@@ -900,6 +935,9 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
             body["env"]["BASE_LINK_TOKEN"] = link
         if template_id:
             body["templateId"] = template_id
+    if pod_gb and not private_gb:
+        del body["networkVolumeId"]
+        body["volumeInGb"] = int(pod_gb)
     if private_gb:
         del body["networkVolumeId"]
         body.update({"volumeInGb": int(private_gb), "ports": list(PRIVATE_PORTS),
@@ -913,12 +951,13 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
 
 def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_gb=100, pubkey=None, min_cuda=None, spot=False,
            wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print, private=False, names=None, name_ports=True,
-           volume_name=None):
+           volume_name=None, pod_gb=None):
     """A pod from nothing: a network volume of `data_gb` in `dc` named `volume_name` (default <name>-data; podctl create
     passes comfy-base-data, the one a later create reuses), or the existing `volume`, then the pod on it. A refused
     pod (sold out between the stock check and the create) takes a volume THIS call made with it, so nothing is left
     billing; an existing volume is never deleted. With wait: until sshd answers, then `Host runpod` -> the new pod.
-    Returns the pod id. Prints names and counts, never the key."""
+    Returns the pod id. Prints names and counts, never the key.
+    3.16.0 pod_gb: no network volume at all: the pod gets a pod volume of that size (models download fresh)."""
     import time
     sleep = sleep or time.sleep
     if not image:
@@ -930,7 +969,14 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
         return _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep,
                                banner, ssh_config, say, names=names)
     made = None
-    if volume:
+    if pod_gb:
+        if volume or data_gb:
+            raise PodctlError("a fresh pod (a pod volume of %s GB) takes no network volume: drop --volume / --data-gb" % pod_gb)
+        vid = None
+        say("note    a fresh pod: a %d GB pod volume, no network volume, so the models download again (in parallel, pinned). "
+            "The volume goes with the pod, and at a $0 account balance RunPod terminates the pod: podctl guard stops it "
+            "before that" % int(pod_gb))
+    elif volume:
         vid = volume
     else:
         if not data_gb:
@@ -948,7 +994,7 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     body = create_body(name, gpu, dc, vid, image, container_gb, pubkey, cuda=cuda, spot=spot, names=names, template_id=tid,
                        token=jupyter_token(),     # printed once, as the Jupyter Terminal link; RunPod keeps it in the pod's env
                        link=link_token(),         # 3.14.0: and the key, inside every other link printed below
-                       start=create_start(sshd_bootstrap_text()))
+                       start=create_start(sshd_bootstrap_text()), pod_gb=pod_gb)
     try:
         made_pod = api.post("/pods", body)
         pod_id = made_pod["id"]
@@ -960,8 +1006,9 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
             except Exception as e:  # the refusal is the news; a leftover volume is named so it can be removed
                 say("  !! could not delete the new network volume %s after the refusal: %s" % (made, e))
         raise
-    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · network volume %s at %s · ports %s · CUDA %s%s" % (
-        pod_id, name, image, gpu, dc, int(container_gb), vid, VOLUME_ROOT, " ".join(body["ports"]),
+    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · %s at %s · ports %s · CUDA %s%s" % (
+        pod_id, name, image, gpu, dc, int(container_gb), ("pod volume %d GB" % int(pod_gb)) if pod_gb else "network volume %s" % vid,
+        VOLUME_ROOT, " ".join(body["ports"]),
         (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
     say("  names    %s%s" % (" · ".join("%d %s" % (int(p), n) for p, n in names),
                              (" (template %s)" % tid) if tid else " (not in the console: no template)"))
@@ -1075,6 +1122,8 @@ class RunPodProvider(Provider):
     key_path = pathlib.Path.home() / ".ssh" / "id_ed25519"
     experimental = False
     default_gpus = DEFAULT_GPUS                 # 3.8.0: `create` with no --gpu tries these, in order
+    gpu_notes = GPU_NOTES                       # 3.16.0: said when `create` picks one
+    fresh_pod_gb = FRESH_POD_GB                 # 3.16.0: a fresh pod's volume where no network volume is
 
     def __init__(self, api=None):
         self.api = api or Api(load_api_key())
@@ -1138,6 +1187,9 @@ class RunPodProvider(Provider):
         self.skipped = []
         return [dc for dc, _ in stock(self.api, gpu, volume=volume, skipped=self.skipped)]
 
+    def balance(self):
+        return balance(self.api)
+
     def stock_text(self, gpu):
         rows = stock(self.api, gpu)
         return ", ".join("%s (%s)" % r for r in rows) if rows else "nowhere"
@@ -1154,12 +1206,12 @@ class RunPodProvider(Provider):
 
     def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True,
                        ssh_config=None, say=print, volume=None, min_cuda=None, private=False, names=None, name_ports=True,
-                       volume_name=None):
+                       volume_name=None, pod_gb=None):
         if not pubkey:
             pubkey = _c().mac_public_key(None)
         return create(self.api, name, gpu, location, data_gb=data_gb, volume=volume, image=image, container_gb=os_gb, pubkey=pubkey,
                       min_cuda=min_cuda, spot=spot, wait=wait, ssh_config=ssh_config, say=say, private=private, names=names,
-                      name_ports=name_ports, volume_name=volume_name)
+                      name_ports=name_ports, volume_name=volume_name, pod_gb=pod_gb)
 
     def http_url(self, pod, port):
         """3.9.0: the URL a browser opens for one of the pod's ports, or None when the host does not proxy it."""

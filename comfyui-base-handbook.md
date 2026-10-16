@@ -290,6 +290,21 @@ create reads it live):
 - No NVENC. NVIDIA's encode/decode matrix gives the HGX B200 and B300 0 NVENC engines (7 NVDEC), like the H100, so an
   `h264_nvenc` save fails there; encode on the CPU (`libx264`). "RTX" features (RTX Video Super Resolution) name an
   RTX GPU, which these are not.
+
+**Past B200 and B300, and no volume needed (3.16.0, Paul, 2026-10-16: rendering speed first).** `podctl create` with no
+`--gpu` asks for `NVIDIA B200`, `NVIDIA B300 SXM6 AC`, then `NVIDIA RTX PRO 6000 Blackwell Server Edition` and
+`NVIDIA H200` (the third and fourth are provisional until a 2-step benchmark per GPU confirms them; `DEFAULT_GPUS`,
+`hosts/runpod/provider.py`). The GPU order comes first: for each GPU in turn, the network volume `--volume-name` where
+that GPU is free, else a **fresh pod** in the first data centre that has it, on a pod volume of `--pod-gb` (default 400),
+where the install downloads the models again, six at a time and pinned (§5). So a B200 with no volume beside it beats a
+B300 that has one. `--location`, `--volume` and `--data-gb` keep their meaning; `--no-fresh` is 3.14.0's rule. When it
+picks a GPU, `create` says what that GPU means for a package before anything bills: on a B300, INT8 tensor throughput is
+about 1/24 of a B200's (NVIDIA's HGX table: 3 POPS for HGX B300 against 72 for HGX B200, FP8 the same), so a package
+loads fp8 or bf16 weights there; on an H200, nvfp4 is emulated. A pod volume is terminated with its pod at a $0 balance,
+and RunPod's balance trails its spend: `podctl balance` prints it with the spend per hour and the balance projected past
+`--lag-min` minutes (default 30) of spend not booked yet, and `podctl guard --floor 5 --yes` stops every running pod
+once that projection is at the floor (without `--yes` it says which it would stop; exit 3 at the floor). A scheduler
+on the Mac runs the guard; the base never schedules anything.
 - Attention (3.7.5): SageAttention's `auto` (KJ's default, and `--use-sage-attention`) has no `sm_100` dispatch, so on a
   B200 it fails at the first step. The base runs every KJ mode on a tiny tensor and keeps the answer per GPU
   (`$VENV/.comfy-base-sage/<sm>.json`, `base_sage_mode`, `bash base.sh sage`); a package uses the mode it names, and
@@ -436,7 +451,8 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   validated list to `state/launch.d/<PKG_ID>.env` (removed when the package stops declaring one) and every launch, the
   install's restart and every boot alike, reads the whole folder (`lib/85-launch.sh`, `_base_launch_env`). Allowed keys:
   `OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS
-  TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING` and CTranslate2's `CT2_*`;
+  TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING RENDER_SPEED_ATTENTION` (3.16.0: the
+  attention order a node pack reads at startup, `off`, `cudnn` or `fa4`) and CTranslate2's `CT2_*`;
   a value is one word of `[A-Za-z0-9_.,:+-]`. Anything else (a path, a library, a token, a variable the base owns such
   as `HF_HOME`) refuses the package's declarations before anything downloads, and a key set twice does too.
   Precedence: the machine's own environment (a variable set on the pod, in the unit) wins; then the packages' files in
@@ -793,6 +809,15 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.16.0: the GPU order past B200 and B300, no volume needed, and the balance projected (Paul, 2026-10-16: rendering
+  speed first). `podctl create` with no `--gpu` asks for B200, B300, then the RTX PRO 6000 Server Edition and the H200
+  (provisional), and takes the first GPU with stock: on the reusable network volume where that GPU is free, else as a
+  FRESH public pod on a pod volume (`--pod-gb`, default 400) in the first data centre that has it, models downloaded
+  again (`--no-fresh` keeps 3.14.0's rule). It names what the chosen GPU means (B300: INT8 is slow, load fp8 weights;
+  H200: nvfp4 is emulated). RunPod's provider gains `balance()` (GraphQL `myself { clientBalance currentSpendPerHr
+  spendLimit }`); `podctl balance` adds the spend and the projected balance (`--lag-min`, default 30), and new `podctl
+  guard --floor 5 [--yes]` stops every running pod at the projected floor. `LAUNCH_ENV` allows `RENDER_SPEED_ATTENTION`.
+  Tested against the fake RunPod only; NOT RUN ON A POD (no credit on 2026-10-16).
 - 3.17.1: the App Mode tour is marked seen, so the form opens clear (error log row 81); and `VERIFY_SUITE=zip` runs
   every test once, the zip first (2026-10-16).
   The tour: ComfyUI frontend 1.55.x opens a full-screen "Welcome to Apps" tour over the App Mode form on a first visit;

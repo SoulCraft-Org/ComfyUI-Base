@@ -136,3 +136,36 @@ One line in `video-replacer-minimax-h3-script.sh`, beside `WF_NAME`, once the wo
 may stay: a base before 3.9.0 never reads the array): `APP_PORTS=("8189|video-replacer|Video Replacer App")`. Then `podctl create`, `status`, `tunnel`
 and the template name it, and the machine serves the app at that port's root. The app needs no change: it already
 reaches ComfyUI through `new URL("../../", HERE)` and names no top-level file `ws upload view history queue interrupt`.
+
+## 5. The GPU order past B200 and B300, no volume needed, and the balance projected (3.16.0)   (2026-10-16, no pod used)
+
+**Why.** Paul, 2026-10-16: rendering speed first. A B200 and a B300 sold out, or the B200 only where the network volume
+is not (on 2026-10-16 the volume was in EU-RO-1, which then had only RTX PRO 6000s and smaller), left `podctl create`
+with no pod. And RunPod's balance trails its spend: a $5 stop rule let it reach -$1.24 and RunPod removed the pods.
+
+**What changed.**
+- `hosts/runpod/provider.py`: `DEFAULT_GPUS` is B200, B300, RTX PRO 6000 Blackwell Server Edition, H200 (RunPod's ids
+  from GraphQL `gpuTypes`). The third and fourth are PROVISIONAL: Paul asked for the PRO 6000 third, the first research
+  put an H200 at about twice a PRO 6000, and a 2-step benchmark per GPU (the Video Replacer's `_build/ab_speed.py`)
+  decides. `GPU_NOTES` says what a pick means before anything bills (B300: INT8 is about 1/24 of a B200's, NVIDIA's HGX
+  table, so load fp8 weights; H200: nvfp4 is emulated). `create_body(pod_gb=)` / `create(pod_gb=)`: a PUBLIC pod on a
+  pod volume. `balance()`: GraphQL `myself { clientBalance currentSpendPerHr spendLimit }`.
+- `podctl create`: per GPU in order, the reusable volume where it is free, else a fresh pod on a `--pod-gb` (default
+  400) pod volume in the first data centre with it (any data centre, since none needs to take a network volume);
+  `--no-fresh` is 3.14.0's rule. `--location`, `--volume`, `--data-gb` and `--private` are unchanged.
+- `podctl balance [--lag-min 30]` adds the spend per hour and the projection; `podctl guard --floor 5 [--yes]` stops every
+  running pod once the projection is at the floor (exit 3 there; without `--yes` it names them). Run it from a
+  scheduler on the Mac; the base schedules nothing.
+- `LAUNCH_ENV` allows `RENDER_SPEED_ATTENTION` (the Render Speed pack's startup order: off, cudnn, fa4).
+
+**Proven, and how.** Nothing ran here beyond `python3 -m py_compile` and `package.py --base`: the session was tier 0
+only (no suite on the Mac). The suite's new and changed tests (`test_podctl.py`: the order and notes, the fresh pod
+against the fake RunPod, balance and guard; `test_ports.py`: reuse, now fresh by default and STOP with `--no-fresh`;
+`test_unit.py`: the launch key) run in this repository's CI on the PR.
+
+**Owed (needs RunPod credit).**
+- A real `podctl create` with no `--gpu` that goes fresh: the pod volume's size and mount, and the install's download
+  time with no volume (six at a time, pinned).
+- `podctl balance` against the live account while a pod runs: how far `clientBalance` actually trails, to set
+  `--lag-min` from a measurement instead of 30.
+- The final third and fourth GPU, from the orchestrator after the benchmark: a one-line change to `DEFAULT_GPUS`.
