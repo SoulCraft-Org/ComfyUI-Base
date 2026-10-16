@@ -1,0 +1,50 @@
+# A GitHub release for every base tag, with the zip a pod installs. A maintainer tags as before (CLAUDE.md:
+# commit "ComfyUI Base X.Y.Z: ...", tag base-vX.Y.Z, push the tag); this publishes base-vX.Y.Z with comfyui-base.zip
+# from that tag's tree and the tagged commit's message as its notes. Run it by hand with a tag to publish one that
+# was pushed before this workflow existed. The tag must name the VERSION its tree carries, or nothing is published.
+name: release
+
+on:
+  push:
+    tags: ["base-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "an existing base-vX.Y.Z tag to publish"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write                  # create the release and upload its zip; nothing else
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: the tag names the tree's VERSION
+        run: |
+          [ "$TAG" = "base-v$(cat VERSION)" ] || { echo "::error::$TAG does not match VERSION $(cat VERSION)"; exit 1; }
+          [ -s comfyui-base.zip ] || { echo "::error::no comfyui-base.zip at $TAG"; exit 1; }
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$TAG already has a release; nothing to do"; exit 0
+          fi
+          git log -1 --format=%B > "$RUNNER_TEMP/notes.md"
+          printf '\nThe zip is what a pod installs. Handbook: [comfyui-base-handbook.md](https://github.com/%s/blob/%s/comfyui-base-handbook.md)\n' \
+            "$GITHUB_REPOSITORY" "$TAG" >> "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" comfyui-base.zip --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "ComfyUI Base $(cat VERSION)" --notes-file "$RUNNER_TEMP/notes.md"
