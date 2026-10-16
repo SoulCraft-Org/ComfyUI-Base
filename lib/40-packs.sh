@@ -454,6 +454,13 @@ base_build_sageattention(){ # for a package's pkg_post_venv: SageAttention insta
   if [ "$BASE_DRY" = "1" ] || [ "$BASE_NO_NET" = "1" ]; then return 0; fi
   if ! "$PY" -c "import sageattention" >/dev/null 2>&1; then return 0; fi     # the installer already failed it by name
   base_sage_proof
+  case "$(cat "$VENV/.comfy-base-sageattention" 2>/dev/null)" in *-fused)
+    if [ "$BASE_SAGE_VERDICT" = "none" ]; then
+      warn "Sage: the _fused-only build's Triton mode does not run on ${BASE_GPU_SM:-this GPU} ($(_base_sage_mode_detail sageattn_qk_int8_pv_fp16_triton)): building every kernel"
+      SAGE_FUSED_ONLY=0 _base_sage_install
+      base_sage_proof
+    fi ;;
+  esac
   case "$BASE_SAGE_VERDICT" in
     ok)      ok "Sage: OK -> sageattention ${BASE_SAGE_VERSION:-?} RUNS on ${BASE_GPU_SM:-this GPU} under KJ's \"auto\" (a tiny tensor, checked against PyTorch attention)" ;;
     only)    warn "Sage on ${BASE_GPU_SM:-this GPU}: KJ's \"auto\" (and --use-sage-attention) FAILS here: $(_base_sage_mode_detail auto). $(_base_sage_only_line)" ;;
@@ -483,6 +490,9 @@ base_sage_proof(){ # [--fresh] → BASE_SAGE_VERDICT (ok|only|none|nogpu|noimpor
     if [ "$kept" = 0 ] && mkdir -p "$(dirname "$pf")" 2>/dev/null; then
       printf '%s\n%s\n' "$head" "$out" > "$pf" 2>/dev/null || true
       _base_sage_json > "${pf%.proof}.json" 2>/dev/null || true
+      if [ -n "${BASE_STATE:-}" ] && [ -n "${BASE_GPU_SM:-}" ] && mkdir -p "$BASE_STATE/sage" 2>/dev/null; then   # 3.13.0: outlives the venv
+        case "$BASE_SAGE_VERDICT" in ok) echo auto;; only) echo "$BASE_SAGE_USE";; *) echo disabled;; esac > "$BASE_STATE/sage/$BASE_GPU_SM.mode" 2>/dev/null || true
+      fi
     fi ;;
   esac
   return 0
@@ -514,6 +524,74 @@ _base_sage_cached(){ # prints the kept proof and returns 0 only when it was made
   local pf; pf="$(_base_sage_proof_file)"
   [ -f "$pf" ] && [ "$(head -1 "$pf")" = "$(_base_sage_proof_head)" ] || return 1
   sed 1d "$pf"
+}
+_base_sage_prepare_src(){ # <checkout> — upstream's source as every build here compiles it, the pod's and the published wheels' alike
+  # torch 2.14's headers demand C++20 and upstream's setup.py hardcodes -std=c++17 (every kernel failed at the first include
+  # on the pod, 2.0.25); 10.3 joins 10.0's row (below). .github/workflows/sage-wheels.yml calls this same function.
+  sed -i.bak 's/-std=c++17/-std=c++20/g' "$1/setup.py" && rm -f "$1/setup.py.bak"
+  _base_sage_patch_setup "$1/setup.py"
+}
+_BASE_SAGE_PUB=""
+_base_sage_published(){ # <sha12> <cpXY> <torch, e.g. 2.14.1-cu130> <cache dir> → 0, and _BASE_SAGE_PUB=the wheel in that dir,
+  # when the base's releases carry a wheel for exactly this source, Python, torch and GPU arch whose sha256 matches the
+  # sum published beside it (sm_<arch>.sha256; both write-once, the workflow never replaces an asset). Anything else (no
+  # such wheel, another platform, a download that fails, a sum that differs) returns 1 with one line why, and the caller
+  # builds as before. SAGE_WHEELS=0 skips
+  # this; SAGE_WHEELS_URL points at another releases/download root (a fork's, or a file:// mirror).
+  local sha="$1" pytag="$2" tv="$3" dir="$4" root tag tmp line want asset whl got
+  _BASE_SAGE_PUB=""
+  if [ "${SAGE_WHEELS:-1}" = "0" ]; then note "SageAttention: published wheels off (SAGE_WHEELS=0)"; return 1; fi
+  command -v curl >/dev/null 2>&1 || return 1
+  root="${SAGE_WHEELS_URL:-https://github.com/SoulCraft-Org/ComfyUI-Base/releases/download}"; root="${root%/}"
+  tag="sage-${sha}-torch${tv}-${pytag}"
+  _base_tmp; tmp="$BASE_TMPD/sage-published"; rm -rf "$tmp"; mkdir -p "$tmp"
+  if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 -o "$tmp/sum" "$root/$tag/${BASE_GPU_SM}.sha256" 2>/dev/null; then
+    note "SageAttention: no published ${BASE_GPU_SM} wheel for $tag yet (a build follows)"; return 1
+  fi
+  line="$(awk -v p="${BASE_GPU_SM}." '{ n = $2; sub(/^\*/, "", n) } index(n, p) == 1 { print $1, n; exit }' "$tmp/sum")"
+  want="${line%% *}"; asset="${line#* }"; whl="${asset#"${BASE_GPU_SM}."}"
+  if ! [[ "$want" =~ ^[0-9a-f]{64}$ && "$whl" =~ ^sageattention-[A-Za-z0-9._+-]+\.whl$ ]] || [[ "$whl" == *..* ]]; then
+    warn "SageAttention: $tag's ${BASE_GPU_SM}.sha256 is malformed; not used (a build follows)"; return 1
+  fi
+  case "$whl" in *"_$(uname -m).whl") ;; *) note "SageAttention: $tag's ${BASE_GPU_SM} wheel is not for $(uname -m) (a build follows)"; return 1;; esac
+  if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 900 -o "$tmp/$whl" "$root/$tag/$asset" 2>/dev/null; then
+    warn "SageAttention: the published wheel $asset did not download (a build follows)"; return 1
+  fi
+  got="$(_base_sha256 "$tmp/$whl" | awk '{print $1}')"
+  if [ "$got" != "$want" ]; then
+    warn "SageAttention: $asset's sha256 is $got, its release says $want: NOT installed (a build follows)"; return 1
+  fi
+  mkdir -p "$dir" && mv -f "$tmp/$whl" "$dir/$whl" || return 1
+  ok "SageAttention: the published wheel for $tag (${BASE_GPU_SM}) downloaded; sha256 matches its release"
+  _BASE_SAGE_PUB="$dir/$whl"
+}
+_BASE_SAGE_FUSED_WHY=""
+_base_sage_fused_only(){ # <checkout> → 0 when THIS GPU needs only `_fused` (its mode is sageattn_qk_int8_pv_fp16_triton)
+  # Proven first: the mode this volume's last proof kept for this sm (state/sage/<sm>.mode, written by base_sage_proof and
+  # surviving a venv rebuild). Triton → yes; auto or a CUDA mode → no (those need the full build). With no proof yet, the
+  # source answers: upstream's sageattn() (what "auto" calls) has no branch for this sm (sm_100 and sm_103 today, #322),
+  # so only an explicit mode can run here, and the one proven on sm_10x is Triton (Video Replacer, B200, 2026-10-16).
+  # If the proof then finds Triton does not run, base_build_sageattention builds the full set (SAGE_FUSED_ONLY=0 does too).
+  local smn="${BASE_GPU_SM#sm_}" kept
+  _BASE_SAGE_FUSED_WHY=""
+  if [ "${SAGE_FUSED_ONLY:-1}" = "0" ] || [ -n "${SAGE_ARCHS:-}" ] || [ -z "$smn" ]; then return 1; fi
+  kept="$(cat "$BASE_STATE/sage/${BASE_GPU_SM}.mode" 2>/dev/null || true)"
+  case "$kept" in
+    sageattn_qk_int8_pv_fp16_triton) _BASE_SAGE_FUSED_WHY="this volume's proof for ${BASE_GPU_SM} names the Triton mode"; return 0 ;;
+    ?*) return 1 ;;
+  esac
+  [ -f "$1/sageattention/core.py" ] || return 1
+  if grep -q "arch == \"sm${smn}\"" "$1/sageattention/core.py"; then return 1; fi
+  _BASE_SAGE_FUSED_WHY="upstream's sageattn() has no ${BASE_GPU_SM} branch, so the Triton mode is the one that runs here"
+}
+_base_sage_fused_setup(){ # <setup.py> — build `_fused` alone: every qattn extension's HAS_SM flag is cleared just before
+  # upstream reads them. The gencode flags for this arch are already set above that line, so `_fused` is compiled for
+  # it as before. 1 (and the full build) when upstream's layout no longer has that line.
+  grep -q "comfyui-base: _fused only" "$1" && return 0
+  grep -qE '^[[:space:]]*if HAS_SM80 or' "$1" || return 1
+  awk '/^[ \t]*if HAS_SM80 or/ && !d { ind = $0; sub(/[^ \t].*$/, "", ind)
+         print ind "HAS_SM80 = HAS_SM86 = HAS_SM89 = HAS_SM90 = HAS_SM100 = HAS_SM120 = HAS_SM121 = False  # comfyui-base: _fused only"; d = 1 }
+       { print }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 _base_sage_patch_setup(){ # <setup.py> — upstream's arch table (main d1a57a5) stops at 10.0/12.x: a B300 (10.3) built NO qattn kernel
   # (the capability fell through to `continue`, so only _fused was compiled). The sm80/sm89 kernels are mma.sync, which
@@ -558,7 +636,8 @@ _base_sage_install(){ # SageAttention 2 built from source for THIS GPU's sm (no 
   # 40-hex SAGE_REF, both of which held it below its newest. It is rebuilt whenever the full cache key (the resolved commit,
   # Python, torch, sm) differs from the one stamped beside the install, so a reused venv follows main like a fresh one.
   # A failed build FAILS the run (2.0.22: a missing build died at the first render with `No module named 'sageattention'`).
-  if [ "$BASE_DRY" = "1" ]; then would "build SageAttention from source for ${BASE_GPU_SM:-the GPU} into $VENV unless the installed build matches main's newest commit"; return 0; fi
+  # 3.13.0: the order is this volume's wheel cache, then the wheel published for the same key (sha256-checked), then a build.
+  if [ "$BASE_DRY" = "1" ]; then would "install SageAttention for ${BASE_GPU_SM:-the GPU} into $VENV (a cached or published wheel for main's newest commit, else a build from source) unless the installed build already matches"; return 0; fi
   if [ "$BASE_NO_NET" = "1" ]; then note "SageAttention: skipped (fake venv — BASE_NO_NET)"; return 0; fi
   if _base_runtime_on; then                           # 3.1.0: the runtime's own build, by its cache key, or nothing
     local want stamped; want="$(_base_runtime_field sageattention.key)"; stamped="$(cat "$VENV/.comfy-base-sageattention" 2>/dev/null || true)"
@@ -592,6 +671,9 @@ _base_sage_install(){ # SageAttention 2 built from source for THIS GPU's sm (no 
        && "$PY" -c "import sageattention" >/dev/null 2>&1; then
       ok "sageattention $(_base_sage_ver) already built from SageAttention $sha for this venv (its newest)"; return 0
     fi
+    if [ -n "$sha" ] && [ "$stamped" = "${key}-fused" ] && [ "${SAGE_FUSED_ONLY:-1}" != "0" ] && "$PY" -c "import sageattention" >/dev/null 2>&1; then
+      ok "sageattention $(_base_sage_ver) already built from SageAttention $sha for this venv (_fused only: this GPU runs the Triton mode)"; return 0
+    fi
     # a build stamped with a pre-3.3.0 key for this very venv (same source, Python, torch, GPU; it imports with this
     # torch) is this venv's build: adopt it under the new key rather than spend 10 to 20 minutes rebuilding it
     if [ -n "$sha" ] && [ "$tvpub" != "$tvfull" ]; then
@@ -609,12 +691,7 @@ _base_sage_install(){ # SageAttention 2 built from source for THIS GPU's sm (no 
       if [ -z "$cc" ]; then err "no CUDA device visible: SageAttention needs the GPU's compute capability to build (or SAGE_ARCHS=<list>)"; BASE_FAILED+=("SageAttention: no GPU visible, not built"); return 0; fi
       cc="${cc%?}.${cc: -1}"                                        # sm_120 → 12.0 · sm_100 → 10.0 · sm_89 → 8.9
     fi
-    base_cuda_toolchain
-    if [ "$BASE_CUDA_BUILD_OK" != "1" ]; then                       # 7 minutes of nvcc to reach a link error we can predict
-      err "SageAttention links cuBLAS and this toolkit cannot — not starting a build that cannot finish"
-      BASE_FAILED+=("SageAttention: the CUDA toolkit cannot link cuBLAS (the toolchain line above names the fix)"); return 0
-    fi
-    hit=""; [ -n "$sha" ] && hit="$(ls "$cache/$key"/*.whl 2>/dev/null | head -1)"
+    hit=""; local from="cached"; [ -n "$sha" ] && hit="$(ls "$cache/$key"/*.whl 2>/dev/null | head -1)"
     if [ -z "$hit" ] && [ -n "$sha" ] && [ -z "${SAGE_ARCHS:-}" ] && [ -n "${BASE_GPU_SM:-}" ]; then   # 3.0.1: a wheel built for a list holding this GPU
       local cd_
       for cd_ in "$cache/${prefix}archs-"*; do
@@ -624,14 +701,25 @@ _base_sage_install(){ # SageAttention 2 built from source for THIS GPU's sm (no 
         fi
       done
     fi
+    # 3.13.0: no wheel on this volume yet: the one published for exactly this key (one GitHub release per source, torch
+    # and Python, one wheel per GPU arch, built by .github/workflows/sage-wheels.yml), downloaded and checked against the
+    # sha256 published beside it before pip sees it, then kept in the volume cache like a wheel built here. Seconds, not 10-20 min.
+    if [ -z "$hit" ] && [ -n "$sha" ] && [ -z "${SAGE_ARCHS:-}" ] && _base_sage_published "$sha" "$pytag" "$tv" "$cache/$key"; then
+      hit="$_BASE_SAGE_PUB"; from="published"
+    fi
     if [ -n "$hit" ]; then
-      ok "SageAttention: a cached wheel matches this exact source and venv — installing instead of a 10-20 min build"
+      ok "SageAttention: a $from wheel matches this exact source and venv — installing instead of a 10-20 min build"
       note "$(basename "$hit")  ($key)"
       _base_pip install -q --force-reinstall --no-deps "$hit" 2>&1 | tail -2 || true
       if "$PY" -c "import sageattention" >/dev/null 2>&1; then
-        echo "$key" > "$stampf"; BASE_CHANGED+=("SageAttention installed from the cached wheel ($sha)"); return 0
+        echo "$key" > "$stampf"; BASE_CHANGED+=("SageAttention installed from the $from wheel ($sha)"); return 0
       fi
-      warn "the cached wheel did not import — rebuilding from source and replacing it"; rm -rf "$cache/$key"
+      warn "the $from wheel did not import — rebuilding from source and replacing it"; rm -rf "$cache/$key"
+    fi
+    base_cuda_toolchain                                            # only a build needs the toolkit: a wheel never waits on it
+    if [ "$BASE_CUDA_BUILD_OK" != "1" ]; then                       # 7 minutes of nvcc to reach a link error we can predict
+      err "SageAttention links cuBLAS and this toolkit cannot — not starting a build that cannot finish"
+      BASE_FAILED+=("SageAttention: the CUDA toolkit cannot link cuBLAS (the toolchain line above names the fix)"); return 0
     fi
     _base_pip install -q --upgrade ninja 2>&1 | tail -1 || true       # the build's generator, at its newest
     # torch 2.14's headers demand C++20 and upstream's setup.py hardcodes -std=c++17: every kernel failed at the first
@@ -646,10 +734,24 @@ _base_sage_install(){ # SageAttention 2 built from source for THIS GPU's sm (no 
     if [ "$got" != "1" ]; then
       err "could not clone SageAttention ($ref)"; BASE_FAILED+=("SageAttention: clone failed"); return 0
     fi
-    sed -i.bak 's/-std=c++17/-std=c++20/g' "$src/setup.py" && rm -f "$src/setup.py.bak"
-    _base_sage_patch_setup "$src/setup.py"
+    _base_sage_prepare_src "$src"
     note "SageAttention $(git -C "$src" rev-parse --short HEAD 2>/dev/null) — setup.py patched: -std=c++17 → -std=c++20 (torch ≥ 2.14 headers), 10.3 builds as sm_103a"
-    echo "  building SageAttention from source for ${SAGE_ARCHS:-$BASE_GPU_SM} (TORCH_CUDA_ARCH_LIST=$cc, MAX_JOBS=${MAX_JOBS:-32}; 10–20 min, a heartbeat prints while it runs)"
+    # 3.13.0: on a GPU whose mode is the Triton one, only `_fused` is needed (core.py imports it unconditionally; the
+    # qattn extensions are optional imports the Triton mode never calls): about a minute instead of 10-20.
+    local how="10–20 min, a heartbeat prints while it runs"
+    if _base_sage_fused_only "$src" && _base_sage_fused_setup "$src/setup.py"; then
+      key="${key}-fused"; how="_fused only, about a minute: $_BASE_SAGE_FUSED_WHY"
+      hit="$(ls "$cache/$key"/*.whl 2>/dev/null | head -1)"
+      if [ -n "$hit" ]; then
+        _base_pip install -q --force-reinstall --no-deps "$hit" 2>&1 | tail -2 || true
+        if "$PY" -c "import sageattention" >/dev/null 2>&1; then
+          echo "$key" > "$stampf"; rm -rf "$src"; ok "SageAttention: the cached _fused-only wheel matches this source and venv"
+          BASE_CHANGED+=("SageAttention installed from the cached _fused-only wheel ($sha)"); return 0
+        fi
+        rm -rf "$cache/$key"
+      fi
+    fi
+    echo "  building SageAttention from source for ${SAGE_ARCHS:-$BASE_GPU_SM} (TORCH_CUDA_ARCH_LIST=$cc, MAX_JOBS=${MAX_JOBS:-32}; $how)"
     # built as a WHEEL, not installed straight in: the wheel is the artefact the next venv rebuild reuses
     mkdir -p "$cache/$key"
     if ! TORCH_CUDA_ARCH_LIST="$cc" MAX_JOBS="${MAX_JOBS:-32}" CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" PATH="/usr/local/cuda/bin:$PATH" \

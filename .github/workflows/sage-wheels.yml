@@ -1,0 +1,221 @@
+# SageAttention wheels a pod downloads in seconds instead of building for 10-20 minutes (ComfyUI Base 3.13.0).
+#
+# A pod (lib/40-packs.sh _base_sage_install) keys SageAttention on the upstream commit, its Python, torch and CUDA build,
+# and the GPU's sm. This builds that same key once per GPU arch, the way a pod builds it (_build/sage/build-wheel.sh
+# calls the base's own source patch), in an nvidia/cuda devel container whose CUDA minor is torch's, and publishes it:
+#
+#   release  sage-<commit12>-torch<ver>-<cuda>-<cpXY>         (a prerelease, never "latest": base-vX.Y.Z stays latest)
+#   assets   sm_<arch>.sageattention-<ver>-<cpXY>-<cpXY>-linux_x86_64.whl, one per arch
+#            sm_<arch>.sha256 beside each (uploaded after its wheel, so a sum never names a wheel that is not there yet;
+#            a pod checks the wheel against it before pip sees it)
+#            LICENSE-SageAttention.txt (Apache-2.0, from the same commit)
+#
+# Write-once: no asset is ever replaced. An arch whose sum is published is never built again for that release, and
+# the publish step refuses (fails) rather than overwrite anything already there. The sage-* tags are protected
+# against moves and deletes by the organisation's tag ruleset.
+#
+# Daily, it asks what a pod would pick today (_build/sage/resolve.py: SageAttention main, the newest Python the torch
+# family has wheels for, torch_pick.py's torch and CUDA build) and builds only the archs that release lacks, so a new
+# upstream commit or a new torch is published within a day and a pod builds only in between. By hand: any key. A pod on a GPU or key with no wheel builds as before; the per-GPU proof gates both. A pull request that
+# touches the build builds every arch and runs the publish step dry (nothing is created or uploaded).
+name: sage-wheels
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sage-wheels.yml"
+      - "_build/sage/**"
+      - "lib/40-packs.sh"
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "SageAttention branch, tag or 40-hex commit"
+        default: main
+      python:
+        description: "Python minor (empty: the newest the torch family has wheels for)"
+        default: ""
+      torch:
+        description: "torch version, e.g. 2.14.1 (empty: what torch_pick.py picks; needs backend too)"
+        default: ""
+      backend:
+        description: "torch's CUDA build, e.g. cu130 (with torch)"
+        default: ""
+
+permissions:
+  contents: read
+
+# a newer commit on a pull request cancels its superseded 4-arch build; a scheduled or dispatched publish is never cancelled
+# (publishes on main run one at a time, so two never upload to the same release at once)
+concurrency:
+  group: sage-wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      sha12: ${{ steps.r.outputs.sha12 }}
+      python: ${{ steps.r.outputs.python }}
+      pytag: ${{ steps.r.outputs.pytag }}
+      torch: ${{ steps.r.outputs.torch }}
+      backend: ${{ steps.r.outputs.backend }}
+      image: ${{ steps.r.outputs.image }}
+      tag: ${{ steps.r.outputs.tag }}
+      archs: ${{ steps.r.outputs.archs }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - id: r
+        name: what a pod would pick today, and what its release lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_REF: ${{ inputs.ref || 'main' }}
+          IN_PY: ${{ inputs.python }}
+          IN_TORCH: ${{ inputs.torch }}
+          IN_BACKEND: ${{ inputs.backend }}
+          IN_ALL: ${{ github.event_name == 'pull_request' && '1' || '' }}
+        run: |
+          python3 _build/sage/resolve.py --ref "$IN_REF" --python "$IN_PY" --torch "$IN_TORCH" --backend "$IN_BACKEND" ${IN_ALL:+--all} | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "### SageAttention wheels"
+            grep -E '^(tag|image|archs|build)=' "$GITHUB_OUTPUT" | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.resolve.outputs.archs) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # the devel image, torch and its CUDA wheels need ~20 GB; nvcc on 4 vCPUs and 16 GB wants swap
+      - name: room to build
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null
+          sudo fallocate -l 16G /mnt/sage.swap && sudo chmod 600 /mnt/sage.swap && sudo mkswap /mnt/sage.swap >/dev/null && sudo swapon /mnt/sage.swap
+          df -h / /mnt; free -g
+
+      - name: SageAttention at ${{ needs.resolve.outputs.sha12 }}
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          src="$RUNNER_TEMP/src"; mkdir -p "$src"; cd "$src"
+          git init -q && git remote add origin https://github.com/thu-ml/SageAttention && git fetch -q --depth 1 origin "$SHA" && git checkout -q FETCH_HEAD
+          [ "$(git rev-parse HEAD)" = "$SHA" ]
+          echo "$SHA" > .sage-commit
+
+      - name: build sm ${{ matrix.arch }} in ${{ needs.resolve.outputs.image }}
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          ARCH: ${{ matrix.arch }}
+          TORCH: ${{ needs.resolve.outputs.torch }}
+          BACKEND: ${{ needs.resolve.outputs.backend }}
+          PYMM: ${{ needs.resolve.outputs.python }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/base:ro" -v "$RUNNER_TEMP/src:/src" -v "$RUNNER_TEMP/out:/out" \
+            -v "$(command -v uv):/usr/local/bin/uv:ro" \
+            -e SRC=/src -e OUT=/out -e ARCH -e TORCH -e BACKEND -e PYMM -e MAX_JOBS=2 -e NVCC_THREADS=2 \
+            "$IMAGE" bash /base/_build/sage/build-wheel.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sage-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [resolve, build]
+    if: always() && needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write                  # create the sage-* release and upload its assets; nothing else
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sage-*
+          path: dist
+
+      - name: publish what was built
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SHA12: ${{ needs.resolve.outputs.sha12 }}
+          PYTAG: ${{ needs.resolve.outputs.pytag }}
+          TORCH: ${{ needs.resolve.outputs.torch }}
+          BACKEND: ${{ needs.resolve.outputs.backend }}
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY: ${{ github.event_name == 'pull_request' && '1' || '' }}
+        run: |
+          set -euo pipefail
+          gh(){ if [ -n "$DRY" ] && { [ "$1 $2" = "release create" ] || [ "$1 $2" = "release upload" ]; }; then echo "DRY (pull request): gh $*"; else command gh "$@"; fi; }
+          up="$RUNNER_TEMP/up"; mkdir -p "$up"
+          shopt -s nullglob
+          for d in dist/sage-*/; do
+            arch="${d%/}"; arch="${arch##*/sage-}"; sm="sm_${arch/./}"
+            want="sageattention-${SHA12}-${PYTAG}-torch${TORCH}-${BACKEND}-${sm}"
+            [ "$(cat "$d/key.txt")" = "$want" ] || { echo "::error::$d was built for $(cat "$d/key.txt"), not $want"; exit 1; }
+            whl=("$d"/sageattention-*.whl); [ "${#whl[@]}" = 1 ] || { echo "::error::$d holds ${#whl[@]} wheels"; exit 1; }
+            cp "${whl[0]}" "$up/$sm.$(basename "${whl[0]}")"
+          done
+          new=("$up"/sm_*.whl)
+          [ "${#new[@]}" -gt 0 ] || { echo "::error::no arch built"; exit 1; }
+          curl -fsSL -o "$up/LICENSE-SageAttention.txt" "https://raw.githubusercontent.com/thu-ml/SageAttention/$SHA/LICENSE"
+          grep -q "Apache License" "$up/LICENSE-SageAttention.txt"
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            {
+              echo "SageAttention ([thu-ml/SageAttention](https://github.com/thu-ml/SageAttention), Apache-2.0) at"
+              echo "[\`$SHA12\`](https://github.com/thu-ml/SageAttention/commit/$SHA), built for torch $TORCH+$BACKEND on $PYTAG, one wheel per GPU arch."
+              echo
+              echo "A ComfyUI Base pod installs the wheel for its own GPU (\`sm_<arch>.\` names it) after checking it against"
+              echo "\`sm_<arch>.sha256\`, instead of a 10-20 minute build; its per-GPU proof still decides whether Sage runs."
+              echo "Assets are write-once: none is ever replaced."
+              echo "Built with the base's own source patch (C++20, a 10.3 row) in \`$IMAGE\`: $RUN_URL"
+              echo
+              echo "The licence is \`LICENSE-SageAttention.txt\`; the wheels are unmodified upstream code apart from that patch."
+            } > "$RUNNER_TEMP/notes.md"
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "SageAttention $SHA12 · torch $TORCH $BACKEND · $PYTAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+
+          # write-once: refuse anything already published (or half-published), then each wheel, then its sum
+          have="$(command gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null || true)"
+          for w in "${new[@]}"; do
+            a="$(basename "$w")"; sm="${a%%.*}"
+            if grep -qxF "$a" <<< "$have" || grep -qxF "$sm.sha256" <<< "$have"; then
+              echo "::error::$TAG already holds $a or $sm.sha256: published assets are never replaced"; exit 1
+            fi
+          done
+          for w in "${new[@]}"; do
+            a="$(basename "$w")"; sm="${a%%.*}"
+            (cd "$up" && sha256sum "$a") > "$up/$sm.sha256"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$w"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$up/$sm.sha256"
+          done
+          grep -qxF LICENSE-SageAttention.txt <<< "$have" || gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$up/LICENSE-SageAttention.txt"
+          {
+            echo "### $TAG"
+            echo '```'; cat "$up"/sm_*.sha256; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

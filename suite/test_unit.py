@@ -1362,7 +1362,7 @@ def test_unit_sageattention_builder_is_dry_run_aware_and_idempotent(tmp_path):
     py.write_text('#!/bin/bash\ncase "$*" in *"import sageattention"*) exit "${SAGE_STUB_RC:-1}";; *) exit 0;; esac\n'); py.chmod(0o755)
     base = f'VENV="{v}"; PY="{py}"; BASE_STATE="{tmp_path}"; '
     r = _bash(base + 'BASE_DRY=1; base_build_sageattention; echo F=${#BASE_FAILED[@]}')
-    assert "would build SageAttention" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
+    assert "would install SageAttention" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
     r = _bash(base + 'BASE_DRY=0; BASE_NO_NET=1; base_build_sageattention; echo F=${#BASE_FAILED[@]}')
     assert "SageAttention: skipped" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
     # 3.0.0: "imports" is not enough; it must be built from main's newest commit for this venv (the stamped cache key)
@@ -1378,6 +1378,157 @@ def test_unit_sageattention_builder_is_dry_run_aware_and_idempotent(tmp_path):
     src = (BASE / "lib" / "40-packs.sh").read_text()
     body = src[src.index("base_build_sageattention()"):src.index("base_consolidate()")]
     assert "git clone" in body and "SAGE_REF" in body and "s/-std=c++17/-std=c++20/g" in body and "setup.py" in body, body[-600:]
+
+
+def _sage_published_env(tmp_path, wheel_bytes=b"wheel", sums=None, sm="sm_100"):
+    """A venv whose python answers the key's questions (cp314, torch 2.14.1-cu130) and imports sageattention once a pip
+    install ran; git ls-remote answering one commit; a file:// release mirror holding one wheel and the sm_<arch>.sha256 beside it."""
+    import hashlib, platform
+    v = tmp_path / "venv"; (v / "bin").mkdir(parents=True); py = v / "bin" / "python"; mark = tmp_path / "installed"
+    py.write_text('#!/bin/bash\ncase "$*" in *"import sageattention"*) [ -f "%s" ];; *version_info*) echo cp314;; *torch.__version__*) echo 2.14.1-cu130;; *) exit 0;; esac\n' % mark)
+    py.chmod(0o755)
+    gitbin = tmp_path / "gitbin"; gitbin.mkdir()
+    (gitbin / "git").write_text('#!/bin/bash\n[ "$1" = ls-remote ] && { echo "abcdef1234567890abcdef1234567890abcdef12\trefs/heads/main"; exit 0; }\nexec /usr/bin/git "$@"\n'); (gitbin / "git").chmod(0o755)
+    whl = "sageattention-2.2.0-cp314-cp314-linux_%s.whl" % platform.machine()
+    rel = tmp_path / "rel" / "sage-abcdef123456-torch2.14.1-cu130-cp314"; rel.mkdir(parents=True)
+    (rel / ("%s.%s" % (sm, whl))).write_bytes(wheel_bytes)
+    if sums is None:
+        sums = "%s  %s.%s\n" % (hashlib.sha256(wheel_bytes).hexdigest(), sm, whl)
+    (rel / ("%s.sha256" % sm)).write_text(sums)
+    snippet = (f'VENV="{v}"; PY="{py}"; BASE_STATE="{tmp_path}/state"; BASE_DRY=0; BASE_NO_NET=0; BASE_GPU_SM=sm_100; '
+               f'SAGE_WHEELS_URL="file://{tmp_path}/rel"; '
+               f'_base_pip(){{ echo "PIP $*"; touch "{mark}"; }}; base_cuda_toolchain(){{ echo TOOLCHAIN-PROBED; BASE_CUDA_BUILD_OK=0; }}; ')
+    env = {"PATH": f"{gitbin}:{os.environ['PATH']}"}
+    return snippet, env, v, whl
+
+
+def test_unit_sage_installs_the_published_wheel_after_checking_its_sha256(tmp_path):
+    """3.13.0: SageAttention was built from source on every fresh volume (10-20 min, the biggest step of a pod install
+    once the models download in parallel). A wheel published for exactly this key (commit, Python, torch + CUDA build,
+    GPU arch) is downloaded instead, checked against the sm_<arch>.sha256 beside it BEFORE pip sees it, and kept in the volume
+    cache; a wheel needs no CUDA toolkit, so the cuBLAS probe (which may apt-install a toolkit) is never reached."""
+    snippet, env, v, whl = _sage_published_env(tmp_path)
+    r = _bash(snippet + '_base_sage_install; echo F=${#BASE_FAILED[@]}', env=env)
+    out = r.stdout + r.stderr
+    assert "sha256 matches its release" in out and "a published wheel matches" in out and "F=0" in r.stdout, out
+    assert "TOOLCHAIN-PROBED" not in out and "building SageAttention" not in out, out
+    key = "sageattention-abcdef123456-cp314-torch2.14.1-cu130-sm_100"
+    assert (v / ".comfy-base-sageattention").read_text().strip() == key, out
+    assert (tmp_path / "state" / "wheels" / key / whl).is_file(), out          # the volume cache: the next venv needs no download
+    assert ("PIP install -q --force-reinstall --no-deps %s/state/wheels/%s/%s" % (tmp_path, key, whl)) in out, out
+
+
+def test_unit_sage_refuses_a_published_wheel_whose_sha256_differs(tmp_path):
+    snippet, env, v, whl = _sage_published_env(tmp_path, sums="%s  sm_100.%s\n" % ("0" * 64, "sageattention-2.2.0-cp314-cp314-linux_%s.whl" % __import__("platform").machine()))
+    r = _bash(snippet + '_base_sage_install; echo F=${#BASE_FAILED[@]}', env=env)
+    out = r.stdout + r.stderr
+    assert "NOT installed" in out and "PIP install" not in out, out
+    assert "TOOLCHAIN-PROBED" in out and "F=1" in r.stdout, out                  # it fell through to the build (no toolkit here)
+    assert not list((tmp_path / "state" / "wheels").glob("*/*.whl")), out
+
+
+def test_unit_sage_builds_when_no_wheel_is_published_or_wheels_are_off(tmp_path):
+    snippet, env, v, whl = _sage_published_env(tmp_path, sm="sm_120")            # the release has an sm_120 wheel only
+    r = _bash(snippet + '_base_sage_install; echo F=${#BASE_FAILED[@]}', env=env)
+    assert "no published sm_100 wheel for sage-abcdef123456-torch2.14.1-cu130-cp314" in r.stdout and "TOOLCHAIN-PROBED" in r.stdout and "PIP install" not in r.stdout, r.stdout + r.stderr
+    r = _bash(snippet + f'SAGE_WHEELS_URL="file://{tmp_path}/nowhere"; _base_sage_install', env=env)
+    assert "no published sm_100 wheel" in r.stdout and "TOOLCHAIN-PROBED" in r.stdout, r.stdout + r.stderr
+    r = _bash(snippet + 'SAGE_WHEELS=0; _base_sage_install', env=env)
+    assert "published wheels off" in r.stdout and "PIP install" not in r.stdout, r.stdout + r.stderr
+    r = _bash(snippet + 'SAGE_ARCHS="9.0;12.0"; _base_sage_install', env=env)    # an image build wants several archs in one wheel
+    assert "published" not in r.stdout and "TOOLCHAIN-PROBED" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_sage_prefers_the_volume_cache_to_a_download(tmp_path):
+    snippet, env, v, whl = _sage_published_env(tmp_path)
+    key = "sageattention-abcdef123456-cp314-torch2.14.1-cu130-sm_100"
+    (tmp_path / "state" / "wheels" / key).mkdir(parents=True); (tmp_path / "state" / "wheels" / key / whl).write_bytes(b"built here")
+    r = _bash(snippet + f'SAGE_WHEELS_URL="file://{tmp_path}/nowhere"; _base_sage_install; echo F=${{#BASE_FAILED[@]}}', env=env)
+    assert "a cached wheel matches" in r.stdout and "no published" not in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
+
+
+def _sage_src_fixture(tmp_path, branches=("sm80", "sm90", "sm120")):
+    """A SageAttention checkout's two files the base reads: setup.py's qattn gate, core.py's sageattn() dispatch."""
+    src = tmp_path / "fixture"; (src / "sageattention").mkdir(parents=True)
+    (src / "setup.py").write_text('    NVCC_FLAGS = ["-std=c++17"]\n    if HAS_SM80 or HAS_SM86:\n        ext_modules.append("_qattn_sm80")\n    ext_modules.append("_fused")\n')
+    (src / "sageattention" / "core.py").write_text("".join('    elif arch == "%s":\n        pass\n' % b for b in branches))
+    return src
+
+
+def test_unit_sage_builds_fused_only_where_the_triton_mode_is_the_one_that_runs(tmp_path):
+    """3.13.0: the Triton mode (what B200 and B300 run, upstream's sageattn() having no sm_100/sm_103 branch) needs only
+    the small `_fused` extension: core.py imports it unconditionally, the qattn kernels are optional imports. A GPU
+    whose kept proof names Triton, or with no proof yet and no branch in sageattn(), builds `_fused` alone (about a
+    minute, not 10-20); a proof naming auto or a CUDA mode, SAGE_FUSED_ONLY=0, or an image's arch list builds them all."""
+    src = _sage_src_fixture(tmp_path)
+    st = tmp_path / "state"; (st / "sage").mkdir(parents=True)
+    run = f'BASE_STATE="{st}"; _base_sage_fused_only "{src}" && echo "FUSED $_BASE_SAGE_FUSED_WHY" || echo FULL'
+    assert "no sm_100 branch" in _bash("BASE_GPU_SM=sm_100; " + run).stdout
+    assert "no sm_103 branch" in _bash("BASE_GPU_SM=sm_103; " + run).stdout
+    assert "FULL" in _bash("BASE_GPU_SM=sm_120; " + run).stdout                     # auto has a branch: the CUDA kernels
+    assert "FULL" in _bash("BASE_GPU_SM=sm_100; SAGE_FUSED_ONLY=0; " + run).stdout
+    assert "FULL" in _bash('BASE_GPU_SM=sm_100; SAGE_ARCHS="9.0;10.0"; ' + run).stdout
+    (st / "sage" / "sm_100.mode").write_text("sageattn_qk_int8_pv_fp8_cuda\n")     # proven to run a CUDA mode here
+    assert "FULL" in _bash("BASE_GPU_SM=sm_100; " + run).stdout
+    (st / "sage" / "sm_120.mode").write_text("sageattn_qk_int8_pv_fp16_triton\n")  # proven Triton, even where auto has a branch
+    assert "names the Triton mode" in _bash("BASE_GPU_SM=sm_120; " + run).stdout
+    # the patch: every qattn flag cleared just before upstream reads them; once only; _fused left as it was
+    r = _bash(f'_base_sage_fused_setup "{src}/setup.py" && _base_sage_fused_setup "{src}/setup.py" && cat "{src}/setup.py"')
+    assert r.stdout.count("comfyui-base: _fused only") == 1 and r.stdout.index("_fused only") < r.stdout.index("if HAS_SM80 or"), r.stdout + r.stderr
+    (src / "setup.py").write_text("ext_modules = []\n")                              # upstream's layout moved: the full build
+    assert "RC=1" in _bash(f'_base_sage_fused_setup "{src}/setup.py"; echo RC=$?').stdout
+
+
+def test_unit_sage_fused_only_build_is_stamped_and_cached_under_its_own_key(tmp_path):
+    snippet, env, v, whl = _sage_published_env(tmp_path)
+    fixture = _sage_src_fixture(tmp_path)
+    gitbin = tmp_path / "gitbin"
+    (gitbin / "git").write_text('#!/bin/bash\n[ "$1" = ls-remote ] && { echo "abcdef1234567890abcdef1234567890abcdef12\trefs/heads/main"; exit 0; }\n'
+                                '[ "$1" = clone ] && { d="${@: -1}"; mkdir -p "$d" && cp -R "%s/." "$d/"; exit 0; }\nexit 1\n' % fixture)
+    build = (f'base_cuda_toolchain(){{ BASE_CUDA_BUILD_OK=1; }}; _base_run_watched(){{ shift; "$@"; }}; '
+             f'_base_pip(){{ echo "PIP $*"; if [ "$1" = wheel ]; then cp "${{@: -1}}/setup.py" "{tmp_path}/built-setup.py"; while [ "$1" != -w ]; do shift; done; touch "$2/{whl}"; else touch "{tmp_path}/installed"; fi; }}; ')
+    r = _bash(snippet + build + f'SAGE_WHEELS_URL="file://{tmp_path}/nowhere"; _base_sage_install; echo F=${{#BASE_FAILED[@]}}', env=env)
+    out = r.stdout + r.stderr
+    key = "sageattention-abcdef123456-cp314-torch2.14.1-cu130-sm_100-fused"
+    assert "_fused only, about a minute" in out and "F=0" in r.stdout, out
+    assert (v / ".comfy-base-sageattention").read_text().strip() == key, out
+    assert (tmp_path / "state" / "wheels" / key / whl).is_file(), out
+    assert "comfyui-base: _fused only" in (tmp_path / "built-setup.py").read_text()
+    r = _bash(snippet + build + f'SAGE_WHEELS_URL="file://{tmp_path}/nowhere"; _base_sage_install', env=env)     # the next run: nothing to do
+    assert "_fused only: this GPU runs the Triton mode" in r.stdout and "PIP wheel" not in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_sage_a_fused_only_build_whose_triton_mode_fails_gets_every_kernel(tmp_path):
+    v = tmp_path / "venv"; (v / "bin").mkdir(parents=True); py = v / "bin" / "python"; py.write_text("#!/bin/bash\nexit 0\n"); py.chmod(0o755)
+    (v / ".comfy-base-sageattention").write_text("sageattention-abcdef123456-cp314-torch2.14.1-cu130-sm_100-fused\n")
+    r = _bash(f'VENV="{v}"; PY="{py}"; BASE_DRY=0; BASE_NO_NET=0; BASE_GPU_SM=sm_100; n=0; '
+              '_base_sage_install(){ echo "INSTALL FUSED_ONLY=${SAGE_FUSED_ONLY:-1}"; }; '
+              'base_sage_proof(){ n=$((n+1)); if [ $n = 1 ]; then BASE_SAGE_VERDICT=none; else BASE_SAGE_VERDICT=ok; fi; }; '
+              'base_build_sageattention; echo F=${#BASE_FAILED[@]}')
+    assert "building every kernel" in r.stdout and "INSTALL FUSED_ONLY=0" in r.stdout and "Sage: OK" in r.stdout and "F=0" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_sage_wheels_are_built_and_named_the_way_a_pod_keys_them(tmp_path):
+    """The published wheel only helps if the workflow's key is the pod's key, and only if it is built from the same patched
+    source. Both sides name the release sage-<commit12>-torch<ver>-<cuda>-<cpXY>, the asset sm_<arch>.<wheel> and its sum
+    sm_<arch>.sha256. Published assets are write-once: the workflow never passes --clobber and refuses a name already there."""
+    _repo_only("_build/sage/")
+    lib = (BASE / "lib" / "40-packs.sh").read_text()
+    sh = (BASE / "_build" / "sage" / "build-wheel.sh").read_text()
+    rs = (BASE / "_build" / "sage" / "resolve.py").read_text()
+    wf = (BASE / ".github" / "workflows" / "sage-wheels.yml").read_text()
+    assert 'tag="sage-${sha}-torch${tv}-${pytag}"' in lib and '"sage-%s-torch%s-%s-%s" % (sha[:12], torch, backend, pytag)' in rs
+    assert 'key="sageattention-${sha:0:12}-${pytag}-torch${tv}-${sm}"' in sh and '_base_sage_prepare_src "$SRC"' in sh
+    assert '_base_sage_prepare_src "$src"' in lib and 'p="${BASE_GPU_SM}."' in lib and '"$up/$sm.$(basename' in wf
+    assert '"$root/$tag/${BASE_GPU_SM}.sha256"' in lib and '"sm_%s.sha256" % x.replace(".", "") not in have' in rs
+    assert "--clobber" not in wf and "published assets are never replaced" in wf
+    up = wf[wf.index("(cd \"$up\" && sha256sum \"$a\")"):]
+    assert up.index('upload "$TAG" --repo "$GITHUB_REPOSITORY" "$w"') < up.index('upload "$TAG" --repo "$GITHUB_REPOSITORY" "$up/$sm.sha256"'), up[:600]   # the sum after its wheel
+    # the shared source patch: C++20 for torch >= 2.14's headers, and 10.3 in 10.0's row
+    src = tmp_path / "src"; src.mkdir()
+    (src / "setup.py").write_text('    NVCC_FLAGS = ["-std=c++17"]\n        elif capability.startswith("10.0"):\n            HAS_SM100 = True\n            num = "100a"\n')
+    r = _bash(f'_base_sage_prepare_src "{src}"; cat "{src}/setup.py"')
+    assert "-std=c++20" in r.stdout and "c++17" not in r.stdout and 'startswith("10.3")' in r.stdout and 'num = "103a"' in r.stdout, r.stdout + r.stderr
 
 
 def _fake_nvidia_smi(tmp_path, total, used, apps):
