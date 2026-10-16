@@ -160,13 +160,22 @@ _base_pack_stash(){ # <dir> <name> → stashes local edits under a named, restor
   fi
   return 1
 }
-_base_pack_move(){ # <name> <dir> <url> [branch] → moves one git checkout to its remote HEAD (or the branch's tip); records the result
-  local name="$1" dir="$2" url="$3" track="${4:-}" before after out
+_base_pack_move_pre(){ # <name> <dir> → 0 when the checkout may move (no local edits, or they are stashed); the refusal recorded otherwise
+  local name="$1" dir="$2"
   if [ -n "$(_base_git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ] && ! _base_pack_stash "$dir" "$name"; then
-    miss "$name: local edits could not be stashed: not moved"; PACK_DIRTY+=("$name"); BASE_FAILED+=("pack $name: local edits could not be stashed, not at its newest"); return 0
+    miss "$name: local edits could not be stashed: not moved"; PACK_DIRTY+=("$name"); BASE_FAILED+=("pack $name: local edits could not be stashed, not at its newest"); return 1
   fi
+  return 0
+}
+_base_pack_move(){ # <name> <dir> <url> [branch] → moves one git checkout to its remote HEAD (or the branch's tip); records the result
+  local name="$1" dir="$2" url="$3" track="${4:-}" before out
+  _base_pack_move_pre "$name" "$dir" || return 0
   before="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
   out="$(_base_pack_sync "$dir" "$url" "$track")"
+  _base_pack_move_post "$name" "$dir" "$before" "$out" "$track"
+}
+_base_pack_move_post(){ # <name> <dir> <short sha before> <git's complaint> [branch] → the verdict, recorded (3.11.0: shared by the parallel pass)
+  local name="$1" dir="$2" before="$3" out="$4" track="${5:-}" after
   after="$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')"
   if [ -n "$out" ]; then
     PACK_PRESENT+=("$name @ $after"); err "$name not at its newest: $(_base_git_diag "$out")"; BASE_FAILED+=("pack $name: could not move to its remote HEAD ($(_base_git_diag "$out"))")
@@ -217,6 +226,43 @@ _base_pack_imports_report(){ # <name|dir>… → for packs with no requirements 
   return 0
 }
 
+_base_packs_net(){ # <kind|name|dir|url|branch|before>... → the clones and fetches, BASE_PACK_JOBS at once (3.11.0, default 8),
+  # folded in row order with the same lines and records as one at a time. Each job is its own git in its own directory:
+  # nothing two of them touch is shared. Only this pass's own jobs are counted and waited for.
+  [ "$#" -gt 0 ] || return 0
+  local n="${BASE_PACK_JOBS:-8}" d i=0 spec kind name dir url branch before pids=() rc out keep e
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || n=8
+  _base_tmp; d="$BASE_TMPD/packs-net"; rm -rf "$d"; mkdir -p "$d"
+  if [ "$#" -gt 1 ] && [ "$n" -gt 1 ]; then note "cloning and fetching $# pack(s), up to $n at a time (BASE_PACK_JOBS)"; fi
+  for spec in "$@"; do
+    i=$((i + 1)); IFS='|' read -r kind name dir url branch before <<< "$spec"
+    while [ "$(_base_alive ${pids[@]+"${pids[@]}"})" -ge "$n" ]; do sleep 0.2; done
+    ( trap - ERR; set +e
+      if [ "$kind" = clone ]; then _base_git clone -q --depth 1 ${branch:+--branch "$branch"} "$url" "$dir" > "$d/$i.out" 2>&1; echo "$?" > "$d/$i.rc"
+      else _base_pack_sync "$dir" "$url" "$branch" > "$d/$i.out" 2> "$d/$i.err"; echo 0 > "$d/$i.rc"; fi ) &
+    pids+=("$!")
+  done
+  wait ${pids[@]+"${pids[@]}"} 2>/dev/null || true
+  i=0
+  for spec in "$@"; do
+    i=$((i + 1)); IFS='|' read -r kind name dir url branch before <<< "$spec"
+    rc="$(cat "$d/$i.rc" 2>/dev/null || echo 1)"; out="$(cat "$d/$i.out" 2>/dev/null || true)"
+    if [ "$kind" = clone ]; then
+      [ -n "$out" ] && { printf '%s\n' "$out" | grep -v 'depth is ignored' | tail -2 || true; }
+      if [ "$rc" = "0" ]; then PACK_CLONED+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name cloned at ${branch:+the tip of $branch, }its HEAD"
+      else
+        err "clone failed: $name (git exit $rc)"; BASE_FAILED+=("pack: $name clone failed")
+        keep=(); for e in ${PACK_DIRS[@]+"${PACK_DIRS[@]}"}; do [ "$e" = "$name|$dir" ] || keep+=("$e"); done   # a failed clone is no pack dir
+        PACK_DIRS=(${keep[@]+"${keep[@]}"})
+      fi
+    else
+      [ -s "$d/$i.err" ] && cat "$d/$i.err" >&2 || true
+      _base_pack_move_post "$name" "$dir" "$before" "$out" "$branch"
+    fi
+  done
+  return 0
+}
+
 base_packs(){ # base_packs git | pip
   local phase="${1:-git}" row name url sha cnr why branch dir out
   if [ "$phase" = "git" ]; then
@@ -224,7 +270,7 @@ base_packs(){ # base_packs git | pip
     [ "$BASE_DRY" = "1" ] || mkdir -p "$CN" 2>/dev/null || true
     PACK_DIRS=(); BASE_PACKS_LATEST_ROWS=()
     local rows; rows="$(_base_pack_rows)" || { err "the pack tables are invalid (see above)"; BASE_FAILED+=("packs: invalid rows"); return 1; }
-    local declared=" " purls=() pu pd
+    local declared=" " purls=() pu pd netq=() latestq=()
     # 3.5.0: every remote's HEAD, asked at once (declared rows and every checkout already in custom_nodes)
     while IFS='|' read -r name url sha cnr why branch; do if [ -n "$url" ]; then purls+=("$(_base_pack_key "$url" "$branch")"); fi; done <<< "$rows"
     for pd in "${CN:-/nonexistent}"/*/; do
@@ -254,11 +300,8 @@ base_packs(){ # base_packs git | pip
           # git's own exit status is the judge. Piping the clone through `grep -v | tail` made an EMPTY output (a quiet
           # clone on an image that prints no warnings) look like a failure under pipefail — every pack "failed" on a
           # pod where every directory was in place (2026-09-05).
-          local cout="" crc=0
-          cout="$(_base_git clone -q --depth 1 ${branch:+--branch "$branch"} "$url" "$CN/$name" 2>&1)" || crc=$?
-          [ -n "$cout" ] && { printf '%s\n' "$cout" | grep -v 'depth is ignored' | tail -2 || true; }
-          if [ "$crc" = "0" ]; then dir="$CN/$name"; PACK_CLONED+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name cloned at ${branch:+the tip of $branch, }its HEAD"
-          else err "clone failed: $name (git exit $crc)"; BASE_FAILED+=("pack: $name clone failed"); continue; fi
+          # 3.11.0: queued, cloned with the others at once below (_base_packs_net), and recorded there by git's own status
+          dir="$CN/$name"; netq+=("clone|$name|$dir|$url|$branch|")
         fi
       elif [ "$BASE_DRY" = "1" ]; then
         would "fetch $name and move it to ${branch:+the tip of its branch $branch, }the HEAD its remote publishes (never backwards; local edits stashed first)"; PACK_PRESENT+=("$name")
@@ -266,12 +309,12 @@ base_packs(){ # base_packs git | pip
       elif _base_runtime_on; then PACK_PRESENT+=("$name (runtime)")
       elif _base_pack_current "$dir" "$url" "$branch"; then
         PACK_PRESENT+=("$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null)"); ok "$name @ $(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null) (its remote HEAD; nothing to fetch)"
-      else _base_pack_move "$name" "$dir" "$url" "$branch"; fi
+      elif _base_pack_move_pre "$name" "$dir"; then
+        netq+=("move|$name|$dir|$url|$branch|$(_base_git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo '?')")   # fetched at once below
+      fi
       declared="$declared$(basename "${dir:-$name}") "
       PACK_DIRS+=("$name|$dir")
-      if [ -n "$dir" ] && [ "$BASE_DRY" != "1" ]; then
-        BASE_PACKS_LATEST_ROWS+=("$name|$url|$(_base_git -C "$dir" rev-parse HEAD 2>/dev/null || echo "$sha")|$cnr|$why${branch:+|$branch}")
-      fi
+      if [ -n "$dir" ] && [ "$BASE_DRY" != "1" ]; then latestq+=("$name|$url|$sha|$cnr|$why|$branch|$dir"); fi
     done <<< "$rows"
     # undeclared git checkouts are software on this machine too: they go to their upstream HEAD the same way
     local ud un uurl
@@ -286,9 +329,17 @@ base_packs(){ # base_packs git | pip
         if [ "$BASE_DRY" = "1" ]; then would "move undeclared $un to its remote HEAD"
         elif [ "$BASE_NO_NET" != "1" ] && ! _base_runtime_on; then
           if _base_pack_current "$ud" "$uurl"; then PACK_PRESENT+=("$un @ $(_base_git -C "$ud" rev-parse --short HEAD 2>/dev/null)"); ok "$un @ $(_base_git -C "$ud" rev-parse --short HEAD 2>/dev/null) (its remote HEAD; nothing to fetch)"
-          else _base_pack_move "$un" "$ud" "$uurl"; fi
+          elif _base_pack_move_pre "$un" "$ud"; then netq+=("move|$un|$ud|$uurl||$(_base_git -C "$ud" rev-parse --short HEAD 2>/dev/null || echo '?')"); fi
         fi
       elif [ -f "$ud/__init__.py" ]; then note "$un: undeclared and not a git checkout: no source to upgrade it from, left alone"; fi
+    done
+    _base_packs_net ${netq[@]+"${netq[@]}"}        # 3.11.0: every clone and fetch at once; each pack's verdict in row order
+    local lq lsha
+    for lq in ${latestq[@]+"${latestq[@]}"}; do       # each pack's HEAD AFTER its move: the record podctl writes back
+      IFS='|' read -r name url sha cnr why branch dir <<< "$lq"
+      [ -d "$dir" ] || continue
+      lsha="$(_base_git -C "$dir" rev-parse HEAD 2>/dev/null || echo "$sha")"
+      BASE_PACKS_LATEST_ROWS+=("$name|$url|$lsha|$cnr|$why${branch:+|$branch}")
     done
     # the last-tested records: printed on EVERY real run, so podctl can write them back after a green install
     if [ "$BASE_DRY" != "1" ] && [ "${#BASE_PACKS_LATEST_ROWS[@]}" -gt 0 ]; then
@@ -323,7 +374,9 @@ base_packs(){ # base_packs git | pip
       miss "py/reqlift.py failed: $(printf '%s' "$out" | tail -2)"; BASE_FAILED+=("requirements: could not derive the requirement set")
     else
       printf '%s\n' "$out" | awk -F'\t' '$1=="summary"{printf "  %s\n", $2}'
-      if _base_run_watched "requirements (one resolve)" _base_derived_install; then ok "ComfyUI + every pack's requirements + PIP_EXTRA installed, newest"
+      if [ -n "$BASE_DERIVED_DONE" ] && [ "$(_base_derived_fp)" = "$BASE_DERIVED_DONE" ]; then
+        ok "ComfyUI + every pack's requirements + PIP_EXTRA: the venv build above installed exactly this set, newest (not resolved twice)"   # 3.11.0
+      elif _base_run_watched "requirements (one resolve)" _base_derived_install; then ok "ComfyUI + every pack's requirements + PIP_EXTRA installed, newest"
         BASE_DERIVED_DONE="$(_base_derived_fp)"      # 3.3.0: the newest pass does not resolve this same set again
       else miss "the derived requirement set failed to install (uv's reason is above)"; BASE_FAILED+=("requirements: the derived set did not install"); fi
     fi

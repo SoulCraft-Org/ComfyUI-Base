@@ -276,6 +276,11 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   _base_reqlift >/dev/null 2>&1 || true
   # (0) prove the whole set resolves BEFORE the old venv is touched — a throwaway venv in a temp dir
   rv="$(_base_mktemp_d)/resolve"
+  if [ "$had" = "0" ]; then
+    # 3.11.0: the dry run guards a venv that is about to be moved aside. A first install has none: the real install below
+    # is the proof, and a set that does not resolve fails it by the same name (22 s and a throwaway venv saved)
+    ok "no venv to protect: the install below is the resolvability proof"
+  else
   echo "  resolvability dry-run for Python $pymm, torch $tv on $backend, the derived requirement set (every upstream pin lifted)…"
   if ! uv venv -q --python "$pymm" "$rv" 2>&1 | tail -3; then
     err "uv cannot provide Python $pymm"; BASE_FAILED+=("venv: uv venv --python $pymm failed"); BASE_VENV_RESULT="failed-python"; return 1
@@ -287,6 +292,7 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
     BASE_FAILED+=("venv: resolvability dry-run failed for $pymm"); BASE_VENV_RESULT="failed-resolve"; return 1
   fi
   ok "every requirement resolves for Python $pymm"
+  fi
   # (1) swap the venv at the SAME path: start.sh only creates one when the path is missing
   _base_venv_swap_aside "$ts"
   if ! uv venv -q --python "$pymm" --seed "$VENV" 2>&1 | tail -3; then
@@ -301,7 +307,9 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   base_torch_constraints
   if [ ! -s "$CONSTRAINTS" ]; then err "no torch in the venv to hold"; BASE_FAILED+=("venv: torch missing after install"); BASE_VENV_RESULT="failed-torch"; _base_venv_rollback || true; return 1; fi
   echo "  constraints: $(wc -l < "$CONSTRAINTS" | tr -d ' ') package(s) of torch's closure held ($(grep -E '^torch==' "$CONSTRAINTS" | head -1))"
-  _base_run_watched "requirements (the derived set, one resolve)" _base_derived_install || { miss "the derived requirement set failed"; step_fail=1; }
+  if _base_run_watched "requirements (the derived set, one resolve)" _base_derived_install; then
+    BASE_DERIVED_DONE="$(_base_derived_fp)"        # 3.11.0: the packs' step resolves again only if the set changed since
+  else miss "the derived requirement set failed"; step_fail=1; fi
   # (d) verify inside the venv → stamp, else roll back
   if ! _base_venv_verify "$pymm" || [ "$step_fail" = "1" ]; then
     err "venv verify failed — rolling back"
@@ -333,7 +341,7 @@ _base_torch_family_upgrade(){ # <torch> <backend>: on a reused venv: torchvision
 }
 _base_xet_check_soft(){ # a silent fall back to plain HTTPS is several times slower and reports no error at all
   local xv; xv="$("$PY" -c 'import hf_xet; print(getattr(hf_xet, "__version__", "present"))' 2>/dev/null || true)"
-  if [ -n "$xv" ]; then ok "hf_xet $xv — chunked Xet transfer, ${HF_XET_NUM_CONCURRENT_RANGE_GETS:-32} concurrent range gets"
+  if [ -n "$xv" ]; then ok "hf_xet $xv: chunked Xet transfer, high performance (concurrency is adaptive since hf_xet 1.3.0)"
   else warn "hf_xet is NOT importable — downloads fall back to plain HTTPS and will be far slower"; fi
 }
 

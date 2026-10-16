@@ -38,7 +38,7 @@ def test_install_real_run_moves_verifies_reports_and_second_run_is_a_noop(tmp_pa
     assert (tmp_path / "comfy-base" / "state" / "packages" / "stub.manifest").exists()
     assert "ONE STEP LEFT" in r.stdout or "not running" in r.stdout or "skipped" in r.stdout
     h = tree_hash(tmp_path, ignore=("logs", "sizes.tsv"))
-    r2 = run_script(SCRIPT, fake_root=tmp_path)
+    r2 = run_script(SCRIPT, fake_root=tmp_path, env={"BASE_FULL": "1"})   # 3.11.0: the full pipeline again (without it the run is ALREADY INSTALLED)
     assert r2.returncode == 0, r2.stdout[-3000:]
     assert tree_hash(tmp_path, ignore=("logs", "sizes.tsv")) == h, "second run changed the tree"
     assert "downloaded 0" in r2.stdout and "reusing our venv" in r2.stdout
@@ -163,7 +163,7 @@ def test_install_tool_venv_is_built_once_and_reused(tmp_path):
     jl = tmp_path / "comfy-base" / "tools" / "bin" / "jupyter-lab"; stamp = tmp_path / "comfy-base" / "tools" / ".comfy-base-tools"
     assert jl.exists() and os.access(jl, os.X_OK) and stamp.exists()
     m = stamp.stat().st_mtime_ns
-    r2 = run_script(SCRIPT, fake_root=tmp_path)
+    r2 = run_script(SCRIPT, fake_root=tmp_path, env={"BASE_FULL": "1"})   # 3.11.0: the full pipeline again (without it the run is ALREADY INSTALLED)
     assert r2.returncode == 0 and "tools venv present" in r2.stdout and stamp.stat().st_mtime_ns == m
 
 

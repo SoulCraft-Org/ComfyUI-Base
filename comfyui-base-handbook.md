@@ -33,13 +33,17 @@ run once per machine as **step one**; then each workflow package is **step two**
    build the machine's driver runs (`uv --torch-backend=auto`), never moved backwards on a shared venv. Python is the
    newest CPython minor that resolves that set, its newest patch, among the minors the torch family (torch,
    torchvision, torchaudio) has wheels for (one small compile each, 3.9.2). uv, JupyterLab, SageAttention (rebuilt when main
-   moves), comfy-cli, pytest and huggingface_hub are upgraded every run. The OS packages and the NVIDIA driver
+   moves), comfy-cli, pytest and huggingface_hub (in the venv, and in the downloader's own `fetch/`, 3.11.0) are upgraded every run. The OS packages and the NVIDIA driver
    (NVIDIA's `nvidia-open`) are upgraded first (§0.15). A pick that cannot be made stops the run. A pack row's sha is
    the last-tested record, printed every run and written back by `podctl` after a green install; never a target.
    **One exception, a buyer's machine** (3.1.0, the maintainer's decision of 2026-09-25): with `BASE_RUNTIME` set, a
    machine installs the newest runtime that passed its maintainer's own sweep (§0.12) and changes nothing else, so a
    newcomer's first run never meets an untested upstream change. Its freshness comes from runtimes being rebuilt and
    swept continuously, and an Update that applies a newer proven one. Every other run is everything newest.
+   **A second exception, a store that already holds the install** (3.11.0, Paul's "as fast as possible" of 2026-10-16):
+   when this package's last run on the store was green with the same package files, the same base and the same GPU arch,
+   and every file it declares is in place, the run starts ComfyUI if nothing serves and stops (§5); `BASE_FULL=1`, or
+   any change, runs everything newest.
 4. **Everything the venv boots from lives on the volume, and the boot cannot brick the machine.**
    `UV_PYTHON_INSTALL_DIR=<volume>/comfy-base/python`, `UV_MANAGED_PYTHON=1`; the probe is HARD on an interpreter
    written to the container disk, so a poisoned venv is never reused. `boot.sh` starts sshd first and never exits,
@@ -509,16 +513,59 @@ init (env · log · volume check · discover, or materialise the tree · declara
 where the driver gate and a new driver's "restart required" stop apply; `BASE_SYSTEM_FOREGROUND=1` keeps the old order)
 → the store's install lock → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate →
 consolidate strays (the volume only) → packs git (every pack to its HEAD; 3.5.0: every remote's HEAD asked at once,
-and a pack already on it is not fetched) → [join the OS stage · driver gate] → the venv snapshot → `pkg_pre_venv` → venv →
+and a pack already on it is not fetched) → [join the OS stage · driver gate] → [start the model downloads in the
+background (3.11.0, below)] → the venv snapshot → `pkg_pre_venv` → venv →
 `pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
 MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
-either version moves) → `pkg_pre_models` →
+either version moves) → `pkg_pre_models` → [join the model downloads] →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
 GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check → hygiene → boot (boot.sh, tools venv, boot.env) → ledger → restart hand-off (or `BASE_RESTART=1`) →
 smoke → combos → the later stage handed to a detached `fetch-later` (a staged run) → the package's suite →
 `pkg_post_install` → summary (exit 0, or 1 when anything failed; the verdict kept in `state/last-run/<id>`).
+
+**The downloads start beside the venv build** (3.11.0, `lib/52-models-early.sh`). Neither needs the other, so once the
+packs are on disk and the OS stage is joined (it installs `python3-venv`, which uv's bootstrap needs), every download the
+model stage would start runs in the background: a URL row whose dest does not exist and that no file on the machine
+supplies by name and size (never a LOCAL row, a staged run's later rows, a partial or a stand-in), through the same
+fetch, size and Hub checks. It overlaps the venv, the toolkit probe, `pkg_post_venv` (a SageAttention build), own packs,
+packs pip, Comfy MCP and the newest pass. The join, just before the model stage, shows its output and folds what it got
+into the run (counted once, as downloaded); the model stage then walks every row as before: a row the early pass left
+alone is fetched there, and a file the early pass could not get fails the run by name with no second round of attempts
+(its three were made, and their output is shown at the join). Its downloader is hf from
+`$BASE_HOME/fetch`, a venv of its own with `huggingface_hub[hf-xet]` at its newest, because the main venv is rebuilt or
+upgraded meanwhile; every download uses it once it exists (the model stage and `fetch-later` too), the main venv's hf
+being the fallback, and it is left as it is while a `fetch-later` still runs from it. A run that stops before the join
+stops its downloads too (they resume from staging next run). The clock shows two rows: `MODELS (in the background,
+beside the venv build)`, the downloads' own seconds, and `MODELS · joining …`, how long they outlasted the venv.
+`BASE_MODELS_FOREGROUND=1` keeps the 3.10 order; a dry run, a seed build and a buyer's runtime machine never start them.
+
+**What waits for what** (3.11.0; Paul, 2026-10-16: "Parallelization of everything. Speed for everything!"). Every step
+that does not need another's output runs beside it, and a join stands only where one truly needs the other:
+
+    init (discover · tree · declarations · banner)
+      ├─ OS stage (apt) ............................ background ─┐ joined before the venv snapshot (it brings python3-venv)
+      └─ lock → tokens → ComfyUI update → gate → consolidate     │
+           → packs git: every remote's HEAD asked at once, then every clone and fetch at once (BASE_PACK_JOBS)
+           ◄────────────────────────────────────────────────────┘
+           ├─ model downloads (BASE_FETCH_JOBS at once, largest first) ... background ─┐ joined before the model stage
+           ├─ JupyterLab's tools venv .................................... background ─┼─┐ joined at BOOT
+           └─ venv snapshot → venv → toolkit → pkg_post_venv (Sage) → own packs        │ │
+                → packs pip (skipped when the venv build installed this exact set)     │ │
+                → Comfy MCP → newest → [local-runtime copy, when lib/84-run-local.sh is in] │
+                → pkg_pre_models ◄─────────────────────────────────────────────────────┘ │
+                → models (every row judged) → prune → sync → pkg_post_models → import     │
+                → hygiene → BOOT ◄───────────────────────────────────────────────────────┘
+                → ledger → restart → smoke → combos → later stage → suite → summary
+
+The serial spine is what really depends on its predecessor: the venv needs uv and Python (the OS stage's python3-venv);
+packs pip needs the venv and every pack on disk; the newest pass needs the installed set; the model stage needs the packs
+(a `custom_nodes/<Pack>` dest is inside its pack) and judges what the downloads left; the import check needs packs, venv
+and models; the restart needs the import check. Not overlapped, and why: consolidate moves stray packs into
+`custom_nodes`, so the pack pass waits for it; the ComfyUI update beside the packs would save about a second on a fresh
+tree. A store that already holds this exact install green (same package files, same base, same GPU arch, every file in
+place) runs none of it: `ALREADY INSTALLED`, ComfyUI started if nothing serves, done in seconds (`BASE_FULL=1` runs it all).
 
 **One pass, and its clock** (3.2.0). Every stage header closes the stage before it with its seconds; the summary prints
 them slowest first and `state/logs/<pkg>_<ts>.timings.tsv` keeps them, which podctl fetches with the console. When the
@@ -588,7 +635,7 @@ verdict), `runtime.json` and `runtime.stamp` (the applied runtime), and for a st
 "present|standin|downloading|failed"}], "later": {"files", "bytes", "done_files", "done_bytes"}}`, every state read
 from the disk and the file replaced whole, never written in place; ComfyUI's environment names the state dir as
 `COMFY_BASE_STATE`, so a package reads `$COMFY_BASE_STATE/progress.json` and treats its absence as "nothing staged"),
-`python/` (the uv-managed interpreter), `tools/` (JupyterLab) and
+`python/` (the uv-managed interpreter), `tools/` (JupyterLab), `fetch/` (3.11.0: hf, the downloader, in a venv of its own) and
 `dead-venvs/` (quarantined venvs). A package manifest records its packs, model claims, superseded names and hooks;
 `bash base.sh status` renders them and prints `state/host.env` when there is one; `bash base.sh latest` asks every
 pinned pack's remote what HEAD is now.
@@ -716,8 +763,23 @@ for any invocation that somehow arrives without the environment. The suite asser
   `--local-dir` metadata (no request), and a file already in place costs nothing on any later run (size + record; one
   HEAD only when its row's pin moved). Measured: `hf cache verify`'s hash runs at 2.6 GB/s on an M4, so the 174 GB
   Video Replacer set is about 70 s of hashing in total on a fresh volume, spread over the parallel downloads, and 0 s
-  on a volume that has it. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
+  on a volume that has it. 3.11.0's downloads beside the venv build take the same path (pins, hash, record) and
+  now also take a file whose row's pin moved, so it no longer waits for the model stage. Exercised on this Mac with a stubbed `hf` and `curl` (suite/test_hub.py) and against the
   real Hub for `hf cache verify` (a flipped byte fails it, exit 1); not on a pod.
+- 3.11.0: the model downloads start beside the venv build (`lib/52-models-early.sh`, §5). Once the packs are on disk and
+  the OS stage is joined, every download the model stage would start runs in the background through hf from the
+  downloader's own venv (`$BASE_HOME/fetch`), and is joined just before the model stage, which still judges every row:
+  an early file is counted once (as downloaded), a row the early pass left alone is fetched there, and a file it could
+  not get fails the run by name with no second round of attempts. A run that stops before the join stops its
+  downloads (they resume from staging). `BASE_MODELS_FOREGROUND=1` keeps the old order. Measured on RunPod, two fresh
+  pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, the MiniMax
+  H3 Video Continuer 1.0.5 with its 41.1 GB of models, `--no-gate --no-suite`), wall clock from `podctl create` to the
+  workflow listed through the pod's public proxy: 3.9.2 1610 s, 3.11.0 1471 s (139 s less; 167 s less from the pod's
+  first ssh to the end of the install, against a 181 s download stage in 3.9.2). The early downloads ran 605 s at 70 MB/s
+  beside the venv, packs pip and newest pass (304 MB/s alone in 3.9.2), and the join waited under a second. Where 3.9.2
+  spent its 1532 s: venv 589, newest 346, downloads 181, packs pip 112, import check 108, restart 61, boot 45, packs git
+  36, consolidate and tree 19, the OS stage 25 in the background. Both runs ended red on the same smoke miss
+  (`LoadImageCrop` not registered), a package matter.
 - 3.10.1: `podctl ensure` on a fresh RunPod pod, and one clearer STOP (three defects from the Video Swapper's pod install,
   2026-10-16). (1) `ensure` reset a fresh pod while its image was still in its own first boot (`runpod/comfyui` copies
   ComfyUI and its venv onto the volume then): no venv, a crash loop, ssh never up (pod wibxqf22v26shv). It now waits,

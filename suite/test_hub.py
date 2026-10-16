@@ -261,3 +261,22 @@ def test_unit_base_models_refetches_a_file_whose_pin_moved_and_keeps_one_whose_d
     out = r.stdout
     assert "a.safetensors: its row now pins a commit whose file differs" in out and "DL=1 OK=1" in out, out + r.stderr
     assert f"hf download x/y a.safetensors --revision {COMMIT}" in log.read_text() and "b.safetensors" not in log.read_text()
+
+
+def test_unit_the_early_pass_also_takes_a_file_whose_pin_moved(tmp_path):
+    """3.11.0's downloads beside the venv build skipped every dest that exists; a moved pin is a download, so it goes early."""
+    c = tmp_path / "ComfyUI"; (c / "models").mkdir(parents=True); (c / "main.py").write_text("")
+    b = tmp_path / "bin"; b.mkdir(); clog = tmp_path / "curl.log"
+    _exe(b / "curl", f"""\
+        echo "curl $*" >> "{clog}"
+        case "$*" in *resolve/{COMMIT}/a.safetensors*) e="{"d" * 64}";; *) e="{ETAG}";; esac
+        printf 'HTTP/2 200\\r\\nx-linked-size: 4096\\r\\nx-linked-etag: "%s"\\r\\n\\r\\n' "$e"
+        """)
+    rows = " ".join('"vae|Example|Real|%s.safetensors|https://huggingface.co/x/y/resolve/%s/%s.safetensors|4096|n|"' % (n, COMMIT, n) for n in "abc")
+    env = {"PATH": f"{b}:{os.environ['PATH']}", "BASE_FAKE_ROOT": str(tmp_path), "BASE_NO_NET": "1", "BASE_SEARCH_ROOTS": str(tmp_path)}
+    r = _bash(f'MODELS=({rows}); base_env_setup; base_discover quiet; d="$M/vae/Example/Real"; mkdir -p "$d" "$BASE_STATE";'
+              f' for n in a b; do python3 -c "open(\'$d/$n.safetensors\',\'wb\').truncate(4096)";'
+              f' printf "%s\\t{OLD}\\t{ETAG}\\n" "$d/$n.safetensors" >> "$BASE_STATE/verified.tsv"; done;'
+              f' _base_build_index; BASE_NO_NET=0 _base_models_early_specs', env=env)
+    specs = [l for l in r.stdout.splitlines() if l.startswith(("FILE|", "SNAP|"))]
+    assert sorted(l.split("|")[1].rsplit("/", 1)[-1] for l in specs) == ["a.safetensors", "c.safetensors"], r.stdout + r.stderr

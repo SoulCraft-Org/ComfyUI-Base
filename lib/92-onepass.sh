@@ -43,3 +43,57 @@ _base_timings_write(){ # the run's stage times beside its log: state/logs/<pkg>_
   for row in "${BASE_STAGE_TIMES[@]}"; do printf '%s\t%s\n' "${row%%|*}" "${row#*|}"; done > "$d/${PKG_ID:-base}_$(_base_ts).timings.tsv" 2>/dev/null || true
   return 0
 }
+
+# ---------------------------------------------------------------- 3.11.0: a volume that already holds this exact install
+# Paul (2026-10-16): "make it so pods are installed as fast as possible"; a later pod on a volume must be usable in under
+# three minutes. When this package's last run on this store was GREEN, for this package version, on this base version and
+# on a GPU of the same arch, and every file it declares is still in place, the install has nothing to do: the run starts
+# ComfyUI if nothing is serving (BASE_RESTART=1) and stops there, in seconds. Like BASE_RUNTIME (§0.3), it is a named
+# exception to "every run takes everything to its newest": BASE_FULL=1 runs the whole pipeline, and so does any change of
+# package, base or GPU arch, a missing file, a dry run, a seed build or a buyer's machine.
+_base_green_fp(){ # → "pkgfp=<sha> basefp=<sha>": every file the package folder ships (its script, workflow, own packs) and the base's
+  # manifest, so a re-upload under the same version (a development round) is never mistaken for what is installed
+  local p b
+  p="$(cd "${PKG_DIR:-/nonexistent}" 2>/dev/null && find . -type f ! -path '*/.git/*' ! -path '*/__pycache__/*' ! -name '*.pyc' ! -path './_build/*' 2>/dev/null \
+       | LC_ALL=C sort | while IFS= read -r x; do _base_sha256 "$x"; done | _base_sha256 | cut -c1-16)" || true
+  b="$(_base_sha256 < "$BASE_DIR/MANIFEST.sha256" 2>/dev/null | cut -c1-16)" || true
+  echo "pkgfp=${p:-?} basefp=${b:-?}"
+}
+_base_already_green(){ # → 0 when this exact install is already in place on this store (the reason it is not: BASE_GREEN_WHY)
+  BASE_GREEN_WHY=""
+  if [ "$BASE_DRY" = "1" ] || [ "${BASE_FULL:-0}" = "1" ] || [ "${BASE_SEED:-0}" = "1" ] || _base_runtime_on; then BASE_GREEN_WHY="a full run was asked for"; return 1; fi
+  local f="${BASE_STATE:-/nonexistent}/last-run/${PKG_ID:-}" w ts ver rest base="" sm="" fp="" x cat fam purp file url bytes mnote alts rel dest
+  if [ ! -f "$f" ]; then BASE_GREEN_WHY="no earlier run of ${PKG_ID:-this package} on this store"; return 1; fi
+  read -r w ts ver rest < "$f" || true
+  for x in $rest; do case "$x" in base=*) base="${x#base=}";; sm=*) sm="${x#sm=}";; pkgfp=*|basefp=*) fp="$fp${fp:+ }$x";; esac; done
+  if [ "$w" != green ]; then BASE_GREEN_WHY="the last run here was not green"; return 1; fi
+  if [ "$ver" != "$PKG_VERSION" ]; then BASE_GREEN_WHY="the last green run here installed ${ver:-?}, this is $PKG_VERSION"; return 1; fi
+  if [ "$base" != "$BASE_VERSION" ]; then BASE_GREEN_WHY="the last green run here was on base ${base:-before 3.11.0}, this is $BASE_VERSION"; return 1; fi
+  if [ "$fp" != "$(_base_green_fp)" ]; then BASE_GREEN_WHY="the package's files or the base's differ from the last green run's"; return 1; fi
+  if [ -n "${BASE_GPU_SM:-}" ] && [ "$sm" != "$BASE_GPU_SM" ]; then BASE_GREEN_WHY="the last green run here was on ${sm:-another GPU}, this GPU is $BASE_GPU_SM"; return 1; fi
+  if [ ! -x "${PY:-/nonexistent}" ] || [ ! -f "$BASE_STATE/boot.env" ] || [ ! -f "$BASE_STATE/packages/$PKG_ID.manifest" ]; then BASE_GREEN_WHY="the venv, boot.env or this package's ledger entry is missing"; return 1; fi
+  while IFS='|' read -r cat fam purp file url bytes mnote alts; do
+    [ -n "$cat" ] || continue
+    if [ "${BASE_STAGED:-0}" = "1" ] && _base_is_later "$file"; then continue; fi
+    rel="$(_base_dest_rel "$cat|$fam|$purp|$file|$url|$bytes|$mnote|$alts")"; dest="$(_base_dest_path "$rel")"
+    if [[ "$file" == */ ]]; then [ -d "$dest" ] && continue
+    elif [ -f "$dest" ] && _base_size_ok "$(_base_fsize "$dest")" "$bytes"; then continue; fi
+    BASE_GREEN_WHY="$rel is no longer in place"; return 1
+  done <<< "$(_base_model_rows 2>/dev/null || true)"
+  return 0
+}
+_base_green_run(){ # the whole run when _base_already_green: the workflow checked, ComfyUI started if nothing serves, a short summary, exit 0
+  local f="$BASE_STATE/last-run/$PKG_ID"
+  hdr "ALREADY INSTALLED · ${PKG_NAME:-this package} V$PKG_VERSION on base $BASE_VERSION, green here since $(awk '{print $2}' "$f" 2>/dev/null)"
+  note "nothing to install: same package, same base, same GPU arch, every declared file in place (BASE_FULL=1 runs everything)"
+  base_require_workflow
+  base_restart || true
+  hdr "SUMMARY · ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION} · base $BASE_VERSION · already installed"
+  echo "  install    skipped: this store already holds it, green ($(cat "$f" 2>/dev/null))"
+  echo "  restart    $BASE_RESTART_RESULT"
+  _base_timings_block; _base_timings_write
+  echo "  log        ${BASE_LOG:-—}"
+  BASE_SUMMARY_DONE=1
+  if [ "${#BASE_FAILED[@]}" -gt 0 ]; then echo -e "${RED}  FAILED     ${#BASE_FAILED[@]}:${NC}"; _base_list "${BASE_FAILED[@]}"; exit 1; fi
+  exit 0
+}

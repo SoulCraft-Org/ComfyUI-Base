@@ -35,8 +35,10 @@ if want_backend and have_backend != want_backend:
     probs.append("torch is built for %s, not the picked %s" % (have_backend, want_backend))
 elif not want_backend and cu == "none":
     probs.append("torch has no CUDA build")
-if want_sm and want_sm not in archs:
-    probs.append("%s not in torch arch list" % want_sm)
+from arch_fit import covering  # noqa: E402  (3.11.0: same family or PTX counts, sm_103 runs sm_100's kernels)
+runs_on = covering(want_sm, archs) if want_sm else ""
+if want_sm and not runs_on:
+    probs.append("no kernel in torch's arch list (%s) runs on %s" % (",".join(archs), want_sm))
 no_gpu = os.environ.get("BASE_NO_GPU") == "1"
 if not no_gpu and not torch.cuda.is_available():
     probs.append("torch.cuda.is_available() is False")
@@ -85,7 +87,7 @@ for m in extra:
     except Exception as e:  # noqa: BLE001
         probs.append("import %s: %r" % (m, e))
 print("python %s · torch %s · CUDA %s · %s · import torch %.1fs%s" % (
-    sys.version.split()[0], torch.__version__, cu, (want_sm if want_sm in archs else "NO " + want_sm) if want_sm else ",".join(archs[-2:]), t_import,
+    sys.version.split()[0], torch.__version__, cu, ((want_sm if runs_on == want_sm else "%s via %s" % (want_sm, runs_on)) if runs_on else "NO " + want_sm) if want_sm else ",".join(archs[-2:]), t_import,
     " · no GPU asked (seed build)" if no_gpu else ""))
 for p in probs:
     print("  ‼ " + p)
