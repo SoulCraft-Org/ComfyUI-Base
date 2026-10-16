@@ -128,3 +128,23 @@ def test_unit_quick_runs_four_steps_and_the_test_command_takes_quick():
     for t in ("install", "comfyui", "server", "snapshot", "runpod", "gpu", "bare"):   # every tier that needs a live machine
         assert t in heavy, t
     assert "unit" not in heavy and "graph" not in heavy and "contract" not in heavy
+
+
+def test_unit_objinfo_leaves_input_files_and_self_validated_inputs_to_the_node(tmp_path):
+    """Run 38934921493 (Video Replacer, 2026-10-16): ComfyUI accepted every lane, while this check refused VHS_LoadVideo's
+    placeholder clip and ModelAttentionBackend's 'comfy kitchen attention' (a CPU server lists PyTorch only); both inputs
+    are judged by the node's own VALIDATE_INPUTS, which /object_info does not show."""
+    oi = _load()
+    types = dict(TYPES, Video={"input": {"required": {"video": [["a.mp4"]]}}, "output": ["IMAGE"], "output_node": False},
+                 Attn={"input": {"required": {"attention": ["COMBO", {"options": ["pytorch"]}]}}, "output": ["MODEL"], "output_node": False})
+    p = _good()
+    p["2"] = {"class_type": "Video", "inputs": {"video": "example.mp4"}}
+    p["1"] = {"class_type": "Attn", "inputs": {"attention": "comfy kitchen attention"}}
+    problems, unjudged = oi.check_prompt(p, types)
+    assert [x for x in problems if "attention" in x] and not [x for x in problems if "video" in x], problems
+    assert any("2.video: input file" in u for u in unjudged)
+    problems, unjudged = oi.check_prompt(p, types, own={"Attn.attention"})
+    assert problems == [] and any("validated by the node itself" in u for u in unjudged), problems
+    pkg = tmp_path / "pkg"; (pkg / "_build").mkdir(parents=True)
+    (pkg / "_build" / "objinfo-self-validated.txt").write_text("# the node's VALIDATE_INPUTS\nAttn.attention   # CPU lists pytorch only\n")
+    assert oi.self_validated(pkg) == {"Attn.attention"}

@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.18.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.18.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -808,6 +808,12 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.18.1: tier 0's prompt check leaves input files and self-validated inputs to the node (2026-10-16). On the Video
+  Replacer's pinned CPU server (cpu-validate run 38934921493) ComfyUI accepted all 12 lanes while `_build/objinfo.py check`
+  refused 30 inputs, every one judged by the node's own `VALIDATE_INPUTS`, which `/object_info` does not show:
+  VHS_LoadVideo's placeholder clip, and ModelAttentionBackend's kitchen backend on a server without CUDA. Media file
+  names and the `Class.input` pairs a package lists in `_build/objinfo-self-validated.txt` are now "unjudged"; on that
+  cache the check says OK. A unit test holds both.
 - 3.18.0: the GPU order past B200 and B300, no volume needed, and the balance projected (Paul, 2026-10-16: rendering
   speed first). `podctl create` with no `--gpu` asks for B200, B300, H200, H100, then the RTX PRO 6000 Server Edition
   (Paul's order), and takes the first GPU with stock: on the reusable network volume where that GPU is free, else as a
