@@ -111,6 +111,7 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     if [ "$src" = 10 ]; then base_summary; fi
     if ! _base_driver_gate; then base_summary; fi
   fi
+  _base_models_early_start || true     # 3.13.0: the model downloads run beside everything from here to the model stage
   base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)
   _base_hook pkg_pre_venv
   if ! base_venv; then err "the venv step failed — stopping before anything else changes"; base_summary; fi
@@ -133,6 +134,7 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     base_summary
   fi
   _base_hook pkg_pre_models
+  _base_models_early_join || true      # 3.13.0: the early downloads, waited for and folded in; the model stage still judges every row
   base_models || true
   base_prune || true
   base_sync || true

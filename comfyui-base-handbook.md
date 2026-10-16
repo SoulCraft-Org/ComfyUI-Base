@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.10.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.13.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -33,7 +33,7 @@ run once per machine as **step one**; then each workflow package is **step two**
    build the machine's driver runs (`uv --torch-backend=auto`), never moved backwards on a shared venv. Python is the
    newest CPython minor that resolves that set, its newest patch, among the minors the torch family (torch,
    torchvision, torchaudio) has wheels for (one small compile each, 3.9.2). uv, JupyterLab, SageAttention (rebuilt when main
-   moves), comfy-cli, pytest and huggingface_hub are upgraded every run. The OS packages and the NVIDIA driver
+   moves), comfy-cli, pytest and huggingface_hub (in the venv, and in the downloader's own `fetch/`, 3.13.0) are upgraded every run. The OS packages and the NVIDIA driver
    (NVIDIA's `nvidia-open`) are upgraded first (§0.15). A pick that cannot be made stops the run. A pack row's sha is
    the last-tested record, printed every run and written back by `podctl` after a green install; never a target.
    **One exception, a buyer's machine** (3.1.0, the maintainer's decision of 2026-09-25): with `BASE_RUNTIME` set, a
@@ -497,16 +497,33 @@ init (env · log · volume check · discover, or materialise the tree · declara
 where the driver gate and a new driver's "restart required" stop apply; `BASE_SYSTEM_FOREGROUND=1` keeps the old order)
 → the store's install lock → require workflow → tokens (validated; a rejected one stops here) → update ComfyUI → version gate →
 consolidate strays (the volume only) → packs git (every pack to its HEAD; 3.5.0: every remote's HEAD asked at once,
-and a pack already on it is not fetched) → [join the OS stage · driver gate] → the venv snapshot → `pkg_pre_venv` → venv →
+and a pack already on it is not fetched) → [join the OS stage · driver gate] → [start the model downloads in the
+background (3.13.0, below)] → the venv snapshot → `pkg_pre_venv` → venv →
 `pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
 MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
-either version moves) → `pkg_pre_models` →
+either version moves) → `pkg_pre_models` → [join the model downloads] →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
 GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check → hygiene → boot (boot.sh, tools venv, boot.env) → ledger → restart hand-off (or `BASE_RESTART=1`) →
 smoke → combos → the later stage handed to a detached `fetch-later` (a staged run) → the package's suite →
 `pkg_post_install` → summary (exit 0, or 1 when anything failed; the verdict kept in `state/last-run/<id>`).
+
+**The downloads start beside the venv build** (3.13.0, `lib/52-models-early.sh`). Neither needs the other, so once the
+packs are on disk and the OS stage is joined (it installs `python3-venv`, which uv's bootstrap needs), every download the
+model stage would start runs in the background: a URL row whose dest does not exist and that no file on the machine
+supplies by name and size (never a LOCAL row, a staged run's later rows, a partial or a stand-in), through the same
+fetch, size and Hub checks. It overlaps the venv, the toolkit probe, `pkg_post_venv` (a SageAttention build), own packs,
+packs pip, Comfy MCP and the newest pass. The join, just before the model stage, shows its output and folds what it got
+into the run (counted once, as downloaded); the model stage then walks every row as before: a row the early pass left
+alone is fetched there, and a file the early pass could not get fails the run by name with no second round of attempts
+(its three were made, and their output is shown at the join). Its downloader is hf from
+`$BASE_HOME/fetch`, a venv of its own with `huggingface_hub[hf-xet]` at its newest, because the main venv is rebuilt or
+upgraded meanwhile; every download uses it once it exists (the model stage and `fetch-later` too), the main venv's hf
+being the fallback, and it is left as it is while a `fetch-later` still runs from it. A run that stops before the join
+stops its downloads too (they resume from staging next run). The clock shows two rows: `MODELS (in the background,
+beside the venv build)`, the downloads' own seconds, and `MODELS · joining …`, how long they outlasted the venv.
+`BASE_MODELS_FOREGROUND=1` keeps the 3.12 order; a dry run, a seed build and a buyer's runtime machine never start them.
 
 **One pass, and its clock** (3.2.0). Every stage header closes the stage before it with its seconds; the summary prints
 them slowest first and `state/logs/<pkg>_<ts>.timings.tsv` keeps them, which podctl fetches with the console. When the
@@ -576,7 +593,7 @@ verdict), `runtime.json` and `runtime.stamp` (the applied runtime), and for a st
 "present|standin|downloading|failed"}], "later": {"files", "bytes", "done_files", "done_bytes"}}`, every state read
 from the disk and the file replaced whole, never written in place; ComfyUI's environment names the state dir as
 `COMFY_BASE_STATE`, so a package reads `$COMFY_BASE_STATE/progress.json` and treats its absence as "nothing staged"),
-`python/` (the uv-managed interpreter), `tools/` (JupyterLab) and
+`python/` (the uv-managed interpreter), `tools/` (JupyterLab), `fetch/` (3.13.0: hf, the downloader, in a venv of its own) and
 `dead-venvs/` (quarantined venvs). A package manifest records its packs, model claims, superseded names and hooks;
 `bash base.sh status` renders them and prints `state/host.env` when there is one; `bash base.sh latest` asks every
 pinned pack's remote what HEAD is now.
@@ -684,6 +701,20 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.13.0: the model downloads start beside the venv build (`lib/52-models-early.sh`, §5). Once the packs are on disk and
+  the OS stage is joined, every download the model stage would start runs in the background through hf from the
+  downloader's own venv (`$BASE_HOME/fetch`), and is joined just before the model stage, which still judges every row:
+  an early file is counted once (as downloaded), a row the early pass left alone is fetched there, and a file it could
+  not get fails the run by name with no second round of attempts. A run that stops before the join stops its
+  downloads (they resume from staging). `BASE_MODELS_FOREGROUND=1` keeps the old order. Measured on RunPod, two fresh
+  pods made side by side (H100 80GB HBM3, EU-FR-1, `runpod/base:1.4.0-cuda1300-ubuntu2404`, a network volume, the MiniMax
+  H3 Video Continuer 1.0.5 with its 41.1 GB of models, `--no-gate --no-suite`), wall clock from `podctl create` to the
+  workflow listed through the pod's public proxy: 3.9.2 1610 s, 3.13.0 1471 s (139 s less; 167 s less from the pod's
+  first ssh to the end of the install, against a 181 s download stage in 3.9.2). The early downloads ran 605 s at 70 MB/s
+  beside the venv, packs pip and newest pass (304 MB/s alone in 3.9.2), and the join waited under a second. Where 3.9.2
+  spent its 1532 s: venv 589, newest 346, downloads 181, packs pip 112, import check 108, restart 61, boot 45, packs git
+  36, consolidate and tree 19, the OS stage 25 in the background. Both runs ended red on the same smoke miss
+  (`LoadImageCrop` not registered), a package matter.
 - 3.10.1: `podctl ensure` on a fresh RunPod pod, and one clearer STOP (three defects from the Video Swapper's pod install,
   2026-10-16). (1) `ensure` reset a fresh pod while its image was still in its own first boot (`runpod/comfyui` copies
   ComfyUI and its venv onto the volume then): no venv, a crash loop, ssh never up (pod wibxqf22v26shv). It now waits,

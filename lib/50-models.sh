@@ -212,7 +212,8 @@ _base_move_into_place(){ # <src> <dest> — same device: mv; else copy + size ch
 }
 _base_rate(){ local b="$1" secs="$2"; if [ "${secs:-0}" -gt 0 ]; then awk -v b="$b" -v s="$secs" 'BEGIN{ printf "%.0f MB/s in %ds", b/1048576/s, s }'; else echo "<1s"; fi; }
 _base_xet_check(){ # a silent fallback to plain HTTPS is several times slower and says nothing anywhere
-  if [ -x "$PY" ] && "$PY" -c "import hf_xet" 2>/dev/null; then ok "hf_xet active (high performance, ${HF_XET_NUM_CONCURRENT_RANGE_GETS:-32} concurrent range gets)"
+  local hpy; hpy="$(dirname "$(_base_hf_bin)")/python"      # 3.13.0: the interpreter of the hf that downloads, not the main venv's
+  if [ -x "$hpy" ] && "$hpy" -c "import hf_xet" 2>/dev/null; then ok "hf_xet active (high performance, ${HF_XET_NUM_CONCURRENT_RANGE_GETS:-32} concurrent range gets)"
   else warn "hf_xet is NOT importable — downloads fall back to plain HTTPS, several times slower"; fi
 }
 _base_curl_dl(){ # <staged file> <url> [curl args] — the GitHub leg: curl, resumable; silent on success, its last lines on failure
@@ -229,7 +230,7 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
   elif [[ "$url" == https://huggingface.co/*/resolve/* ]]; then
     local repo rfile hfbin _dlout
     repo="${url#https://huggingface.co/}"; repo="${repo%%/resolve/*}"; rfile="${url#*/resolve/}"; rfile="${rfile#*/}"
-    hfbin="$VENV/bin/hf"; [ -x "$hfbin" ] || hfbin="$(command -v hf || true)"
+    hfbin="$(_base_hf_bin)"                         # 3.13.0: the fetch venv's hf, else the main venv's, else PATH's
     if [ -z "$hfbin" ]; then err "hf CLI missing — the venv step installs huggingface_hub[hf-xet]"; return 1; fi
     for attempt in 1 2 3; do
       # silent on success (the caller reports file, size, verification and rate); the output is the diagnosis on failure
@@ -259,7 +260,7 @@ _base_snapshot(){ # <hf://owner/repo> <dest dir> <bytes> → a repo snapshot in 
   local repo="${1#hf://}" dest="$2" bytes="$3" hfbin attempt
   mkdir -p "$dest"
   if [ "$BASE_NO_NET" = "1" ]; then _base_sparse "$dest/.fake-snapshot" "$bytes"; return 0; fi
-  hfbin="$VENV/bin/hf"; [ -x "$hfbin" ] || hfbin="$(command -v hf || true)"
+  hfbin="$(_base_hf_bin)"
   if [ -z "$hfbin" ]; then err "hf CLI missing"; return 1; fi
   local _dlout
   for attempt in 1 2 3; do                          # the token rides HF_TOKEN in hf's environment, never argv (2.0.9); its output is the diagnosis on failure
@@ -502,7 +503,8 @@ base_models(){
         if [ "$url" = "LOCAL" ]; then [ -f "$dest/config.json" ] && snap_ok=1
         elif [ "$(_base_dir_size "$dest")" = "$bytes" ]; then snap_ok=1; fi
       fi
-      if [ "$snap_ok" = "1" ]; then
+      if [ "$snap_ok" = "1" ] && _base_early_got "$dest"; then ok "$rel  (snapshot, downloaded beside the venv build)"
+      elif [ "$snap_ok" = "1" ]; then
         sz="$(_base_dir_size "$dest")"; ok "$rel  (snapshot, $(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"
       elif [ "$url" = "LOCAL" ]; then
         # a LOCAL snapshot never downloads: a folder of that name holding a config.json, anywhere on the pod, is moved into place
@@ -529,6 +531,7 @@ base_models(){
       if [ "$staged_later" = "0" ] && [ "$BASE_DRY" != "1" ]; then _base_standin_drop "$dest"; fi   # not staged here: simply absent
     elif [ -f "$dest" ]; then
       sz="$(_base_fsize "$dest")"
+      if _base_size_ok "$sz" "$bytes" && _base_early_got "$dest"; then ok "$rel  ($(_base_bytes_to_gb "$sz") GB, downloaded beside the venv build)"; continue; fi   # counted once, as downloaded
       if _base_size_ok "$sz" "$bytes"; then ok "$rel  ($(_base_bytes_to_gb "$sz") GB)"; MODEL_OK+=("$rel"); MODEL_OK_GB="$(_base_add_gb "$MODEL_OK_GB" "$(_base_bytes_to_gb "$sz")")"; continue; fi
       miss "$rel is $(_base_bytes_to_gb "$sz") GB, expected $(_base_bytes_to_gb "$bytes") GB — partial"
       if [ "$BASE_DRY" = "1" ]; then would "rename to $base.partial and re-fetch"
@@ -579,6 +582,7 @@ base_models(){
     TODO+=("FILE|$rel|$url|$bytes|$dest"); NEED=$((NEED + bytes))
   done <<< "$rows"
 
+  _base_early_settle                     # 3.13.0: what the early pass failed is failed here, by name, not fetched a second time
   # ---- downloads, behind the gate
   if [ "${#TODO[@]}" -gt 0 ]; then
     hdr "DOWNLOADS · ${#TODO[@]} item(s), $(_base_bytes_to_gb "$NEED") GB needed"

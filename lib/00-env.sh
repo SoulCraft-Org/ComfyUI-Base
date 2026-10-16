@@ -68,6 +68,7 @@
 #                        on the first flow's files, and a detached `base.sh fetch-later` brings the rest
 #                        (state/later.queue, state/standins.list, state/progress.json). Every other run ignores it.
 # BASE_FETCH_JOBS=<n>    3.1.0: how many model files download at once (default 1, which is exactly the 3.0 behaviour).
+# BASE_MODELS_FOREGROUND=1  3.13.0: the model downloads wait for the venv build, as before (lib/52-models-early.sh)
 BASE_DRY="${BASE_DRY:-0}"                 # --check
 BASE_FAKE_ROOT="${BASE_FAKE_ROOT:-}"
 BASE_FAKE_IMAGE_ROOT="${BASE_FAKE_IMAGE_ROOT:-}"   # fake: the container disk — a code tree the base must never adopt or scan
@@ -252,6 +253,7 @@ _base_on_err(){ # ERR trap: set -e is about to end the run — say where, and wh
 _base_on_exit(){
   local rc=$? d
   _base_install_unlock                               # 2.5.0: never leave a shared volume locked by a dead run
+  ! declare -F _base_models_early_stop >/dev/null || _base_models_early_stop || true   # 3.13.0: early downloads end with the run that started them (they resume)
   for d in ${BASE_TMPDIRS[@]+"${BASE_TMPDIRS[@]}"}; do if [ -n "$d" ] && [ -d "$d" ]; then rm -rf "$d"; fi; done
   if [ "$rc" -ne 0 ] && [ "$BASE_SUMMARY_DONE" = "0" ] && [ -n "$BASE_LOG" ]; then echo "  aborted (exit $rc) — log: $BASE_LOG"; fi
   [ "$BASE_LOGGING" = "1" ] && sleep 0.3   # let tee flush the last lines
