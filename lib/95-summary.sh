@@ -234,7 +234,7 @@ base_test(){ # [tier] — the package's suite.py beside the script (the base's o
   local _errexit=0; case $- in *e*) _errexit=1;; esac; set +e      # pytest's OWN status, whatever the shell's options (2.0.14: tee's 0 once read as green)
   PYTHONPATH="$BASE_DIR/py${PYTHONPATH:+:$PYTHONPATH}" BASE_WF="${PKG_DIR:-}/${WF_NAME:-}" BASE_SCRIPT="${PKG_SCRIPT:-}" BASE_PKG_DIR="${PKG_DIR:-}" BASE_LIB="$BASE_DIR" \
      BASE_COMFY="${COMFY:-}" BASE_VENV="${VENV:-}" BASE_STATE="${BASE_STATE:-}" BASE_MODELS_DIR="${M:-}" BASE_NODE_SRC="${BASE_NODE_SRC:-}" BASE_SERVER="${BASE_SERVER:-}" BASE_ON_POD="$on_pod" \
-     env ${_scrub[@]+"${_scrub[@]}"} -u HF_TOKEN -u HF_HUB_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HUGGINGFACE_API_KEY \
+     env ${_scrub[@]+"${_scrub[@]}"} -u HF_TOKEN -u HF_HUB_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HUGGINGFACE_API_KEY -u CIVITAI_TOKEN -u CIVITAI_API_KEY -u CIVITAI_API_TOKEN \
      "${runner[@]}" -q -rs -p no:cacheprovider -p basetest ${cargs[@]+"${cargs[@]}"} "$suite" ${mexpr:+-m "$mexpr"} 2>&1 | tee "$out"; rc="${PIPESTATUS[0]}"
   [ "$_errexit" = 1 ] && set -e; true
   BASE_TEST_TABLE="$(awk '/= test tiers =/{f=1;next} f&&/^=+/{exit} f' "$out" || true)"

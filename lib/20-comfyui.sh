@@ -10,13 +10,16 @@ _base_pid1_env(){ # <NAME> — the pod's own environment (PID 1's), which an ssh
   return 0
 }
 _base_token_is_placeholder(){ # the values templates ship as "fill me in"
+  # 3.19.0: and "{{"*, a RunPod Secret reference ({{ RUNPOD_SECRET_HF_TOKEN }}) RunPod left as it was because the account
+  # has no secret of that name. It is the reference, never a value, so naming it in the note shows nothing secret.
   local v; v="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$v" in ""|token_here|replace_with_ids|changeme|your_token|your_api_key|"<"*) return 0;; esac
+  case "$v" in ""|token_here|replace_with_ids|changeme|your_token|your_api_key|"<"*|"{{"*) return 0;; esac
   return 1
 }
 _base_token_aliases(){ # the names other templates use for the same secret; the base's name first
   case "$1" in
     HF_TOKEN)      echo "HF_TOKEN HUGGING_FACE_HUB_TOKEN HF_HUB_TOKEN";;
+    CIVITAI_TOKEN) echo "CIVITAI_TOKEN CIVITAI_API_KEY CIVITAI_API_TOKEN";;   # 3.19.0: the names other tools already read
     *)             echo "$1";;
   esac
 }

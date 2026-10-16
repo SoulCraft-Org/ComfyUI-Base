@@ -304,6 +304,35 @@ def test_unit_crusoe_a_wrong_secret_is_a_401_not_a_silent_pass(tmp_path):
 
 # ---------------------------------------------------------------- credentials and project
 
+def test_unit_crusoe_pair_order_is_env_then_the_keychain_then_the_file_and_never_mixed(tmp_path, keychain_stub, capsys):
+    """3.19.0: CRUSOE_ACCESS_KEY_ID + CRUSOE_SECRET_KEY from the environment, else the login Keychain items whose accounts
+    are those names, else ~/.crusoe/config. A pair counts only when both halves come from the same source."""
+    podctl = _load()
+    mod = _crusoe(podctl)
+    cfg = tmp_path / "config"
+    cfg.write_text("access_key_id = file-id\nsecret_key = file-secret\ndefault_project = proj-file\n", encoding="utf-8")
+    kc = {"CRUSOE_ACCESS_KEY_ID": "kc-id", "CRUSOE_SECRET_KEY": "kc-secret"}
+    keychain_stub.serve(kc)
+    both = {"CRUSOE_ACCESS_KEY_ID": "env-id", "CRUSOE_SECRET_KEY": "env-secret", "CRUSOE_PROJECT": "proj-env"}
+    assert mod.load_credentials(both, cfg) == ("env-id", "env-secret", "proj-env")
+    assert keychain_stub.calls() == []                                                   # the env pair: nothing asked
+    # half in the env: the Keychain's whole pair, never env-id with kc-secret; the project still from the file
+    assert mod.load_credentials({"CRUSOE_ACCESS_KEY_ID": "env-id"}, cfg) == ("kc-id", "kc-secret", "proj-file")
+    assert keychain_stub.calls() == ["find-generic-password -a CRUSOE_ACCESS_KEY_ID -w",
+                                     "find-generic-password -a CRUSOE_SECRET_KEY -w"]
+    # half in the Keychain: the file's whole pair
+    keychain_stub.serve({"CRUSOE_ACCESS_KEY_ID": "kc-id"})
+    assert mod.load_credentials({"CRUSOE_SECRET_KEY": "env-secret"}, cfg) == ("file-id", "file-secret", "proj-file")
+    # half everywhere: no pair at all, and the error names every place
+    cfg.write_text("access_key_id = file-id\n", encoding="utf-8")
+    with pytest.raises(podctl.PodctlError) as ei:
+        mod.load_credentials({"CRUSOE_SECRET_KEY": "env-secret"}, cfg)
+    msg = str(ei.value)
+    assert "CRUSOE_ACCESS_KEY_ID" in msg and "CRUSOE_SECRET_KEY" in msg and "login Keychain" in msg and str(cfg) in msg, msg
+    out = capsys.readouterr()
+    assert "secret" not in (out.out + out.err).replace("CRUSOE_SECRET_KEY", "")
+
+
 def test_unit_crusoe_credentials_come_from_the_env_then_the_file(tmp_path):
     podctl = _load()
     mod = _crusoe(podctl)
@@ -311,9 +340,12 @@ def test_unit_crusoe_credentials_come_from_the_env_then_the_file(tmp_path):
     cfg.write_text("[default]\n# a comment\naccess_key_id = 'from-file'\nsecret_key: from-file-secret\n"
                    "export default_project = \"proj-from-file\"\n", encoding="utf-8")
     assert mod.load_credentials({}, cfg) == ("from-file", "from-file-secret", "proj-from-file")
-    # the env wins per field, and fills only what it names
+    # 3.19.0: a pair comes whole from one source. Half of it in the env is not joined to the file's other half: the
+    # file's own pair is used. The project is a name, not a credential, and still comes from the file.
     got = mod.load_credentials({"CRUSOE_ACCESS_KEY_ID": "from-env"}, cfg)
-    assert got == ("from-env", "from-file-secret", "proj-from-file")
+    assert got == ("from-file", "from-file-secret", "proj-from-file")
+    got = mod.load_credentials({"CRUSOE_ACCESS_KEY_ID": "from-env", "CRUSOE_SECRET_KEY": "from-env-secret"}, cfg)
+    assert got == ("from-env", "from-env-secret", "proj-from-file")
     # and the error names both variables and the path
     with pytest.raises(podctl.PodctlError) as ei:
         mod.load_credentials({}, tmp_path / "absent")

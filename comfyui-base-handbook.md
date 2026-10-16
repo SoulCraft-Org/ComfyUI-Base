@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.18.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.19.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -114,6 +114,19 @@ run once per machine as **step one**; then each workflow package is **step two**
    `podctl status`, `jupyter` and `tunnel` print the link with it, and on RunPod's public bind a token the boot made
    (never one the env set) is written as ONE line to the container log, the start command's own stdout (RunPod's Logs
    tab), which is how a pod from a public template with no ssh key gets its terminal. Never to the boot log.
+   **Keys** (3.19.0). The machine reads `HF_TOKEN` (aliases `HUGGING_FACE_HUB_TOKEN`, `HF_HUB_TOKEN`) and, for a package
+   that lists it, `CIVITAI_TOKEN` (aliases `CIVITAI_API_KEY`, `CIVITAI_API_TOKEN`). The Mac-side driver reads each host's
+   credentials in one order: the environment variable the host's own tool reads (`RUNPOD_API_KEY`, `VERDA_CLIENT_ID` +
+   `VERDA_CLIENT_SECRET`, `CRUSOE_ACCESS_KEY_ID` + `CRUSOE_SECRET_KEY`), else the macOS login Keychain item whose
+   ACCOUNT is that variable's name (`security find-generic-password -a <VAR> -w`, any service name; `BASE_KEYCHAIN=0`
+   turns the lookup off, and the suite runs with it off), else the tool's own config file. A pair counts only when both
+   halves come from the same one of the three. A value that starts with `{{` is a RunPod Secret reference RunPod left
+   unresolved (the account has no secret of that name): a placeholder, named and ignored by the install and dropped by
+   the boot so a saved token applies. `podctl create` on RunPod lists the account's Secret NAMES (REST v2, never a
+   value) and, for `HF_TOKEN` and `CIVITAI_TOKEN`, puts `{{ RUNPOD_SECRET_<VAR> }}` in the new pod's env only when a
+   secret of exactly that name exists; RunPod puts the value in at start. The references resolve inside the account
+   that owns the pod, so a customer's pod, made with the customer's own key, gets the customer's secrets or none and
+   never the operator's keys.
 10. **The base owns ComfyUI's launch flags.** `state/comfyui_args.txt` is the only source. An image's own args file
     (RunPod's `runpod-slim/comfyui_args.txt`) is imported once, on the first real run, and never read again; nothing
     creates a phantom file on images that have none. `HYGIENE_ARGS` entries are ensured present, `HYGIENE_ARGS_REMOVE`
@@ -650,7 +663,7 @@ and a failed import check is a failure, never a rollback.
 | Packs | the base's six + each package's, cloned into `$COMFY/custom_nodes`; other directories there are left alone but their requirements go into the venv |
 | Models | scanned and consolidated on the volume only; the container disk is never read (it is gone at the next start) |
 | Launch flags | `state/comfyui_args.txt` (§0.10) |
-| Tokens | the machine's own environment, then `state/tokens.env` (§0.9) |
+| Tokens | the machine's own environment (a `{{`-prefixed value is an unresolved RunPod Secret reference: a placeholder), then `state/tokens.env` (§0.9); `HF_TOKEN` and `CIVITAI_TOKEN` with their aliases. A RunPod pod `podctl create` made references the account's Secrets of those names when they exist (3.19.0) |
 | The host | `BASE_HOST`, `BASE_VOLUME`, `BASE_VOLUME_KIND`, `BASE_LISTEN` (§1); `state/host.env` when the driver wrote it |
 | The boot | `boot.sh`: PID 1 via podctl's start command on RunPod, the process of `comfy-base-boot.service` on a VM host: sshd (keys only) → JupyterLab (base tools venv, `JUPYTER_TOKEN`/`JUPYTER_PASSWORD`, else generated: never tokenless) → boot extensions (§9) → ComfyUI (base venv, base line, bound to `BASE_LISTEN`) → the app ports (3.9.0) → sleep forever |
 | App ports | `py/app_proxy.py` (standard library, any python3, never the GPU): one process for every row of `state/apps.d/*.list`, bound to `BASE_LISTEN`; on a public bind also ComfyUI's front (`--front 8188` on the machine's non-loopback addresses, ComfyUI on 127.0.0.1), and every link it serves needs the key (`BASE_LINK_TOKEN`: `?token=` once, then a host-only HttpOnly Secure SameSite=Lax cookie; else 401; loopback peers pass; constant-time; never logged; the cookie stripped before ComfyUI). `:<port>/<path>` → `127.0.0.1:8188/apps/<slug>/<path>`, except `ws upload view history queue interrupt`, which pass unchanged; one request per connection (`Connection: close` both ways), then bytes piped both ways, so bodies, streams and the websocket's 101 pass unparsed; `Host` and `Origin` untouched; a page that says ComfyUI is starting while it does not answer. `boot.sh --apps` restarts it (the install runs it) |
@@ -808,6 +821,19 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.19.0: keys from the Mac Keychain, RunPod Secrets on podctl pods (2026-10-16). The Mac-side driver reads each host's
+  credentials from the environment, else the macOS login Keychain item whose account is the variable's name (`keychain()`
+  in `hosts/__init__.py`: `security find-generic-password -a <VAR> -w`, a Mac only, 10 s, off with `BASE_KEYCHAIN=0`),
+  else the tool's config file: `RUNPOD_API_KEY`, `VERDA_CLIENT_ID` + `VERDA_CLIENT_SECRET`, `CRUSOE_ACCESS_KEY_ID` +
+  `CRUSOE_SECRET_KEY`. A Verda or Crusoe pair now comes whole from one source; an id from the environment was joined to
+  a secret from the file before. `podctl create` lists the RunPod account's Secret names (`GET /v2/account/secrets`,
+  names only; `RUNPOD_API_V2_URL` overrides the host, and a REST base that is not RunPod's own uses its own `/v2`) and
+  references `HF_TOKEN` and `CIVITAI_TOKEN` as `{{ RUNPOD_SECRET_<VAR> }}` when a secret of exactly that name exists, on
+  public and private pods; one line says which. A failed listing is a warning. `podctl status` names a reference as one.
+  The install treats a `{{`-prefixed token as a placeholder, `boot.sh` drops one so a saved token applies, and
+  `CIVITAI_TOKEN` is read under `CIVITAI_API_KEY` and `CIVITAI_API_TOKEN` too. The suite runs with the lookup off and a
+  tripwire `security` first on PATH that fails the run if anything calls it; the tests of the lookup use a stub.
+  Exercised on the Mac suite and the CI runner only: no live RunPod, Verda or Crusoe call.
 - 3.18.2: the testbed's torch is the CPU build on Linux (2026-10-16, error log row 108). `testbed.sh --server` said
   "installing torch (CPU)" and installed PyPI's torch, which on Linux is the CUDA build (2.14.1+cu130 and every
   nvidia-* wheel: a 6.7 to 7.2 GB venv on x64 and arm64, measured by the oracle-runner session), downloaded again by

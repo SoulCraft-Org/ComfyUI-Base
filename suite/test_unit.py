@@ -2153,6 +2153,52 @@ def test_unit_boot_sh_exports_the_button_names_and_loads_saved_tokens_without_lo
     assert "hf=hf_pod_value" in launch and "tok=hf_pod_value" in launch and "oth=other_saved_value" in launch, launch   # the pod's HF_TOKEN won; the other saved one loaded
 
 
+def test_unit_an_unresolved_runpod_secret_reference_is_a_placeholder_and_civitai_aliases_are_read(tmp_path):
+    """3.19.0: RunPod leaves "{{ RUNPOD_SECRET_HF_TOKEN }}" in the pod's env as it was when the account has no secret of
+    that name. The install names it as a placeholder and ignores it, like token_here (it is a reference, never a value),
+    and a package's CIVITAI_TOKEN is read under the names other tools use too (CIVITAI_API_KEY, CIVITAI_API_TOKEN)."""
+    r = _bash('for v in "{{ RUNPOD_SECRET_HF_TOKEN }}" "{{RUNPOD_SECRET_X}}" token_here "" hf_real_value; do '
+              'if _base_token_is_placeholder "$v"; then echo "P:$v"; else echo "R:$v"; fi; done; '
+              '_base_token_aliases CIVITAI_TOKEN; _base_token_aliases HF_TOKEN')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == ["P:{{ RUNPOD_SECRET_HF_TOKEN }}", "P:{{RUNPOD_SECRET_X}}", "P:token_here", "P:", "R:hf_real_value",
+                                     "CIVITAI_TOKEN CIVITAI_API_KEY CIVITAI_API_TOKEN", "HF_TOKEN HUGGING_FACE_HUB_TOKEN HF_HUB_TOKEN"], r.stdout
+    from basetest import fake_pod, run_script
+    STUB = _stub()
+    fake_pod(tmp_path, STUB, layout="official")
+    sc = tmp_path / "pkg" / "stub-script.sh"; src = sc.read_text()
+    row = 'TOKENS=( "HF_TOKEN|optional|lifts anonymous rate limits" )'
+    assert row in src
+    sc.write_text(src.replace(row, 'TOKENS=( "HF_TOKEN|optional|lifts anonymous rate limits" "CIVITAI_TOKEN|optional|Civitai downloads" )'))
+    pid1 = tmp_path / "pid1.env"
+    pid1.write_text(pid1.read_text().replace("HF_TOKEN=token_here", "HF_TOKEN={{ RUNPOD_SECRET_HF_TOKEN }}") + "CIVITAI_API_KEY=civ-fake\n")
+    r = run_script(STUB / "stub-script.sh", "--check", fake_root=tmp_path)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
+    assert "is the placeholder '{{ RUNPOD_SECRET_HF_TOKEN }}'" in r.stdout and "HF_TOKEN present" not in r.stdout, r.stdout[-3000:]
+    assert "CIVITAI_TOKEN present (pod env: CIVITAI_API_KEY)" in r.stdout, r.stdout[-3000:]
+    assert "civ-fake" not in r.stdout + r.stderr and not any("civ-fake" in l for l in _run_logs(tmp_path))
+
+
+def test_unit_boot_sh_drops_an_unresolved_runpod_secret_reference_so_the_saved_token_applies(tmp_path):
+    """3.19.0: the boot's twin of the rule above. A pod whose env says HF_TOKEN={{ RUNPOD_SECRET_HF_TOKEN }} (unresolved)
+    starts ComfyUI with the token an earlier install saved, never with the literal, and says which names it dropped."""
+    from basetest import fake_pod, run_script
+    STUB = _stub()
+    fake_pod(tmp_path, STUB, layout="official")
+    assert run_script(STUB / "stub-script.sh", fake_root=tmp_path).returncode == 0
+    st = tmp_path / "comfy-base" / "state"; st.mkdir(parents=True, exist_ok=True)
+    (st / "tokens.env").write_text("HF_TOKEN=hf_saved_value\n")
+    bin_, log = _boot_stubs(tmp_path)
+    py = tmp_path / "ComfyUI" / ".venv-cu130" / "bin" / "python"
+    py.write_text(py.read_text().replace('echo "python $*"', 'echo "python $* ENV hf=${HUGGINGFACE_API_KEY-unset} tok=${HF_TOKEN-unset} civ=${CIVITAI_API_KEY-unset}"'))
+    r, blog = _run_boot_sh(tmp_path, bin_, {"HF_TOKEN": "{{ RUNPOD_SECRET_HF_TOKEN }}", "CIVITAI_API_KEY": "{{ RUNPOD_SECRET_CIVITAI_TOKEN }}"})
+    assert r.returncode == 0, r.stderr + blog
+    assert "unresolved RunPod Secret references ignored (placeholders, not tokens): HF_TOKEN CIVITAI_API_KEY" in blog, blog
+    assert "hf_saved_value" not in blog, blog
+    launch = [ln for ln in log.read_text().splitlines() if ln.startswith("python main.py")][0]
+    assert "tok=hf_saved_value" in launch and "hf=hf_saved_value" in launch and "civ=unset" in launch and "{{" not in launch, launch
+
+
 # ---------------------------------------------------------------- T16: restart finds ComfyUI by what it runs (base V2.0.0)
 
 def test_unit_comfy_pids_match_by_argv_or_cwd_and_never_pid1(tmp_path):

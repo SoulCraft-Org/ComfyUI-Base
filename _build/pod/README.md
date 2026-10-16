@@ -8,8 +8,11 @@
     uv run "base/comfyui-base/_build/pod/podctl.py" upload <file>...    # scp to /workspace/packages, size + sha256 checked both sides
     uv run "base/comfyui-base/_build/pod/podctl.py" stop|start|restart <pod> [--wait]
 
-The API key comes from `RUNPOD_API_KEY`, else runpodctl's `~/.runpod/config.toml` (`runpodctl config --apiKey=…`,
-run once by the user). It rides a bearer header and is never printed or placed in an argument.
+The API key comes from `RUNPOD_API_KEY`, else (3.19.0, on a Mac) the login Keychain item whose account is
+`RUNPOD_API_KEY`, else runpodctl's `~/.runpod/config.toml` (`runpodctl config --apiKey=…`, run once by the user). Verda's
+and Crusoe's pairs follow the same order, each pair whole from one place. `BASE_KEYCHAIN=0` skips the Keychain. A key
+rides a bearer header and is never printed or placed in an argument. `create` on RunPod references the account's
+Secrets `HF_TOKEN` and `CIVITAI_TOKEN` in the new pod's env when they exist (names only; RunPod puts the values in).
 
 `ensure` is idempotent. It exposes `22/tcp` when missing, sets `PUBLIC_KEY` to `~/.ssh/id_ed25519.pub`, waits for the
 pod and its port mapping, probes for an ssh banner (a mapped port proves nothing on images that run no sshd), and when

@@ -6,8 +6,13 @@ folder's `provider.py` is the RunPod half of the driver, moved here verbatim in 
 
 ## What you need on the Mac
 
-- **The API key.** `RUNPOD_API_KEY` in the environment, else `~/.runpod/config.toml` as written by
+- **The API key.** `RUNPOD_API_KEY` in the environment, else (3.19.0) the macOS login Keychain item whose account is
+  `RUNPOD_API_KEY` (any service name; `BASE_KEYCHAIN=0` skips the lookup), else `~/.runpod/config.toml` as written by
   `runpodctl config --apiKey=<key>`. It is sent as a bearer header and is never printed, logged or put in an argument.
+- **Tokens for the pod (optional).** Account Secrets named exactly `HF_TOKEN` and `CIVITAI_TOKEN` (console: Secrets).
+  `podctl create` lists the account's Secret names (REST v2 `GET /v2/account/secrets`, never a value) and gives the new
+  pod `HF_TOKEN={{ RUNPOD_SECRET_HF_TOKEN }}` and the same for `CIVITAI_TOKEN` when the secret exists; RunPod puts the
+  value in at start. A missing secret is never referenced, and a failed listing is a warning, not a failed create.
 - **An ssh key.** `~/.ssh/id_ed25519` and its `.pub`; `--pubkey` names another.
 - `uv` (the driver is a `uv run` script with no dependencies).
 
