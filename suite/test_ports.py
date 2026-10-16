@@ -730,7 +730,7 @@ def test_unit_status_and_deploy_carry_the_pods_key():
                                              "https://p7-8189.proxy.runpod.net/?token=envkey"], lines
     pod2 = _pod(id="p8", ports=["8188/http"], env={})
     assert podctl.status_links(prov, pod2, [], link="machinekey")[0].endswith("/?token=machinekey")
-    assert podctl.status_links(prov, pod2, [])[0].endswith("p8-8188.proxy.runpod.net")
+    assert podctl.status_links(prov, pod2, [])[0].split()[-1] == "https://p8-8188.proxy.runpod.net"
     text = "jtok\n--link--\nlkey\n--apps--\n8189|v|V App\n"
     assert podctl.parse_tunnel_facts(text) == ("jtok", [(8189, "v", "V App")]) and podctl.parse_link_fact(text) == "lkey"
     assert podctl.parse_link_fact("jtok\n--apps--\n") is None and "BASE_LINK_TOKEN" in podctl.tunnel_facts_cmd()
