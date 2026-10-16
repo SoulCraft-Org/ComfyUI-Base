@@ -13,6 +13,10 @@
 #                   restarted on a fresh container disk copies again; the volume is never written by this)
 #   BASE_RUN_JOBS   parallel reads (default 32: the cost is the network's latency per file, not its bandwidth)
 #   BASE_RUN_CHECK  the module the copy's python must import before it is used (default torch)
+#   BASE_RUN_TWIN   3.15.1, off by default: TWIN=SOURCE[,…], a local twin of what the volume holds, e.g. the template's
+#                   /opt/comfy-seed=/workspace; a file whose twin has its size and mtime is read from the twin, not the
+#                   volume (a template pod's first boot otherwise reads back over the network what it just wrote there).
+#                   The pod's own env sets it; an install over ssh reads it from PID 1's.
 # Sourced by base.sh (with every lib) and by boot.sh (beside 85-launch.sh). bash 3.2-clean; never fatal: any failure
 # says why on one line and the process starts from the volume, the pre-3.15.0 behaviour.
 
@@ -31,6 +35,11 @@ _base_run_tool_py(){ # the machine's own python3 (on its own disk) runs the copy
   p="$(command -v python3 2>/dev/null || true)"; if [ -n "$p" ]; then echo "$p"; return 0; fi
   if [ -n "${BASE_HOME:-}" ] && [ -x "$BASE_HOME/tools/bin/python" ]; then echo "$BASE_HOME/tools/bin/python"; return 0; fi
   return 1
+}
+_base_run_twin(){ # → the BASE_RUN_TWIN in force: this shell's, else the machine's own (PID 1's), else nothing
+  if [ -n "${BASE_RUN_TWIN:-}" ]; then echo "$BASE_RUN_TWIN"; return 0; fi
+  if declare -F _base_pid1_env >/dev/null; then _base_pid1_env BASE_RUN_TWIN; fi
+  return 0
 }
 _base_run_gen_bump(){ # the code on the volume may have changed: the next start walks it again instead of trusting the stamps
   local s; s="$(_base_run_state)"
@@ -55,7 +64,7 @@ _base_run_local(){ # sync the copy; sets BASE_RUN_COMFY / BASE_RUN_PY (empty: st
   if ! tool="$(_base_run_tool_py)"; then echo "  ! no python3 to copy with: ComfyUI starts from the volume"; BASE_RUN_VERDICT="no python"; return 0; fi
   out="$("$tool" "$lib" sync --root "$(_base_run_root)" --tree "$COMFY" --venv "$VENV" --state "$(_base_run_state)" \
            --python-root "${BASE_HOME:+$BASE_HOME/python}" --jobs "${BASE_RUN_JOBS:-32}" --check-import "${BASE_RUN_CHECK:-torch}" \
-           $([ "$mode" = auto ] && echo --auto) 2>&1 || true)"
+           --twin "$(_base_run_twin)" $([ "$mode" = auto ] && echo --auto) 2>&1 || true)"
   printf '%s\n' "$out" | grep -v '^RUN_LOCAL ' | grep -v '^$' || true
   line="$(printf '%s\n' "$out" | grep '^RUN_LOCAL ' | tail -1 || true)"
   read -r _ v tree py secs why <<< "$line"
@@ -109,7 +118,7 @@ _base_run_prewarm(){ # 3.15.0: a head start, in the background, beside other wor
   st="$(_base_run_state)"; log="${st:-/tmp}/logs/run-local.log"; mkdir -p "$(dirname "$log")" 2>/dev/null || true
   nohup "$tool" "$lib" prewarm --root "$(_base_run_root)" --tree "$COMFY" --venv "$VENV" --state "$st" \
     --python-root "${BASE_HOME:+$BASE_HOME/python}" --jobs "${BASE_RUN_JOBS:-32}" --check-import "${BASE_RUN_CHECK:-torch}" \
-    --warm-jobs "${BASE_WARM_JOBS:-64}" $([ "$mode" = auto ] && echo --auto) >> "$log" 2>&1 &
+    --warm-jobs "${BASE_WARM_JOBS:-64}" --twin "$(_base_run_twin)" $([ "$mode" = auto ] && echo --auto) >> "$log" 2>&1 &
   BASE_RUN_PREWARM_PID=$!
   echo "  ComfyUI's code: copying to this machine's disk in the background (pid $!, $log)"
 }
