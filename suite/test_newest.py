@@ -1156,5 +1156,11 @@ def test_unit_a_b300_builds_the_qattn_kernels_as_sm_103a(tmp_path):
     exec(textwrap.dedent(body), ns); assert ns["NVCC_FLAGS"] == ["-gencode", "arch=compute_100a,code=sm_100a"]
     own = UPSTREAM_ARCH_TABLE.replace('        elif capability.startswith("12.0")', '        elif capability.startswith("10.3"):\n            num = "103f"\n        elif capability.startswith("12.0")')
     f.write_text(own); _bash(f'_base_sage_patch_setup "{f}"'); assert f.read_text() == own
+    # 3.13.0: the patch runs on every build path. It lives in _base_sage_prepare_src (the published wheels' builder calls
+    # the same function), and the install's one build path prepares the clone BEFORE it decides _fused-only or full.
     src = (BASE / "lib" / "40-packs.sh").read_text()
-    assert '_base_sage_patch_setup "$src/setup.py"' in src[src.index("_base_sage_install()"):src.index("base_consolidate()")]
+    prep = src[src.index("_base_sage_prepare_src(){"):]; prep = prep[:prep.index("\n}\n")]
+    assert '_base_sage_patch_setup "$1/setup.py"' in prep and "s/-std=c++17/-std=c++20/g" in prep, prep
+    inst = src[src.index("_base_sage_install(){"):src.index("base_consolidate()")]
+    assert inst.count("_base_pip wheel ") == 1, "one build path, shared by the _fused-only and the full build"
+    assert inst.index('_base_sage_prepare_src "$src"') < inst.index('_base_sage_fused_only "$src"') < inst.index("_base_pip wheel "), inst[-2500:]

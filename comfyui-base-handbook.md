@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.12.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.13.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -32,8 +32,8 @@ run once per machine as **step one**; then each workflow package is **step two**
    the one thing rolled back (only the packages that run changed). torch is the newest release on the newest CUDA
    build the machine's driver runs (`uv --torch-backend=auto`), never moved backwards on a shared venv. Python is the
    newest CPython minor that resolves that set, its newest patch, among the minors the torch family (torch,
-   torchvision, torchaudio) has wheels for (one small compile each, 3.9.2). uv, JupyterLab, SageAttention (rebuilt when main
-   moves), comfy-cli, pytest and huggingface_hub (in the venv, and in the downloader's own `fetch/`, 3.11.0) are upgraded every run. The OS packages and the NVIDIA driver
+   torchvision, torchaudio) has wheels for (one small compile each, 3.9.2). uv, JupyterLab, SageAttention (a published wheel or a
+   build, whenever main or torch moves), comfy-cli, pytest and huggingface_hub (in the venv, and in the downloader's own `fetch/`, 3.11.0) are upgraded every run. The OS packages and the NVIDIA driver
    (NVIDIA's `nvidia-open`) are upgraded first (§0.15). A pick that cannot be made stops the run. A pack row's sha is
    the last-tested record, printed every run and written back by `podctl` after a green install; never a target.
    **One exception, a buyer's machine** (3.1.0, the maintainer's decision of 2026-09-25): with `BASE_RUNTIME` set, a
@@ -476,7 +476,10 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   `--use-sage-attention`. Upstream's arch table has no 10.3 (B300 got no qattn kernel); the build adds it as
   sm_103a. The proof is kept per GPU, as data: `base_sage_mode` prints the KJ `sage_attention` value for this GPU
   (`auto`, the named mode, or `disabled`), and `$VENV/.comfy-base-sage/<sm>.json` (`sys.prefix` inside ComfyUI) holds
-  `{"sm", "build", "verdict", "mode", "runs", "fails", "version"}`), `$COMFY $CN $M $VENV $PY $PKG_DIR $BASE_STATE`.
+  `{"sm", "build", "verdict", "mode", "runs", "fails", "version"}`. 3.13.0: before any build, the wheel this
+  volume already holds for the key, then the one published for it (release `sage-<commit12>-torch<ver>-<cuda>-<cpXY>`,
+  asset `sm_<arch>.<wheel>`, checked against `sm_<arch>.sha256` beside it), so a fresh volume downloads in seconds what
+  it built in 10-20 minutes; with neither, a GPU whose mode is Triton builds `_fused` alone, about a minute), `$COMFY $CN $M $VENV $PY $PKG_DIR $BASE_STATE`.
   A hook that changed something the running server must reload appends its reason to `PKG_RESTART_WHY` (an array);
   the run's restart hand-off then restarts the server (`BASE_RESTART=1`) or prints the launch line with those reasons,
   never a green summary on a stale server.
@@ -743,6 +746,25 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.13.0: SageAttention is downloaded, not built, on a fresh volume (Paul, 2026-10-16: pods install as fast as
+  possible). With the model downloads in parallel (3.11.0) the source build (10-20 min) was a pod's biggest step. A pod's key
+  (upstream commit, Python, torch and its CUDA build, the GPU's sm) is now built ONCE per arch by
+  `.github/workflows/sage-wheels.yml` (daily and by hand: `_build/sage/resolve.py` asks what a pod would pick today,
+  torch through `py/torch_pick.py`; `_build/sage/build-wheel.sh` builds it in the matching `nvidia/cuda` devel container
+  with the base's own source patch, `_base_sage_prepare_src`, and checks the wheel carries its kernels and imports)
+  and published as a prerelease `sage-<commit12>-torch<ver>-<cuda>-<cpXY>`: per arch (9.0, 10.0, 10.3, 12.0)
+  `sm_<arch>.<wheel>` then `sm_<arch>.sha256`, and `LICENSE-SageAttention.txt` (Apache-2.0). Assets are write-once (the
+  workflow refuses to replace one; the organisation's tag ruleset keeps `sage-*` tags from moving). `_base_sage_install`
+  tries, in order: this volume's wheel cache; that release (the sha256 checked before pip sees the file, a mismatch
+  refused by name); a `_fused`-only build where the GPU's mode is Triton (this volume's kept proof says so, or with no
+  proof yet upstream's `sageattn()` has no branch for the sm: sm_100 and sm_103 today); the full build. `_fused` is the
+  one extension `core.py` imports unconditionally, and the Triton mode calls no qattn kernel, so that build takes about
+  a minute; if its proof then finds Triton does not run, every kernel is built and proven again. The proof's mode is now
+  also kept on the volume (`state/sage/<sm>.mode`), so it outlives a venv rebuild. The cuBLAS probe runs only before a
+  build. `SAGE_WHEELS=0` skips the download, `SAGE_FUSED_ONLY=0` the `_fused`-only build, `SAGE_WHEELS_URL` names
+  another releases root. The Sage step needs no new join with the early downloads: it runs in `pkg_post_venv`, inside
+  their window. Exercised on this Mac against a file:// release mirror and upstream's real setup.py and core.py; the
+  wheels are built by CI; the pod measurement is in the PR.
 - 3.12.0: the Hub, pinned and checked (Paul, 2026-10-16: Hugging Face best practices). (1) A row's revision is what
   downloads: the file leg parsed `resolve/<revision>/` and then dropped it, so a commit-pinned URL silently fetched
   `main`; it now passes `--revision`. Snapshots take `hf://owner/repo@<commit>` (the 40-hex form only), which the

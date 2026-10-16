@@ -74,6 +74,9 @@
 # BASE_PACK_JOBS=<n>     3.11.0: how many packs clone or fetch at once (default 8)
 # BASE_FULL=1            3.11.0: the whole pipeline even when this store already holds this exact install green
 #                        (lib/92-onepass.sh: same package files, same base, same GPU arch, every file in place)
+# SAGE_WHEELS=0          3.13.0: never install a published SageAttention wheel; build it here (lib/40-packs.sh)
+# SAGE_WHEELS_URL=<root> 3.13.0: the releases/download root published wheels come from (default: this repository's)
+# SAGE_FUSED_ONLY=0      3.13.0: never build SageAttention's `_fused` alone for a Triton-mode GPU; build every kernel
 BASE_DRY="${BASE_DRY:-0}"                 # --check
 BASE_FAKE_ROOT="${BASE_FAKE_ROOT:-}"
 BASE_FAKE_IMAGE_ROOT="${BASE_FAKE_IMAGE_ROOT:-}"   # fake: the container disk — a code tree the base must never adopt or scan
