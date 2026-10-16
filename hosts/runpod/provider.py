@@ -696,17 +696,34 @@ def allowed_cuda(floor):
     return [v for v in CUDA_VERSIONS if key(v) >= key(floor)]
 
 
+PRIVATE_UNENCRYPTED = ("note    the pod volume will NOT be encrypted: RunPod's API cannot ask for that (only the console's "
+                       "\"Encrypt volume\" box can, at create time). Private here means no public port: ssh only, ComfyUI "
+                       "through podctl tunnel. The volume is this machine's: at a $0 account balance RunPod terminates the pod "
+                       "and the volume with it (a network-volume pod is only stopped).")
+
+
+def encryption_words(pod, gb=None):
+    """3.9.1: the pod volume as the read-back describes it. True and False are RunPod's word; a missing field is said."""
+    gb = int(gb if gb is not None else pod.get("volumeInGb") or 0)
+    enc = pod.get("volumeEncrypted")
+    kind = "ENCRYPTED pod volume" if enc is True else "pod volume"
+    tail = "" if enc is True else (" (not encrypted)" if enc is False else " (encryption not reported)")
+    return "%s %d GB at %s%s" % (kind, gb, VOLUME_ROOT, tail)
+
+
 def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None, names=None,
                 template_id=None, token=None):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
     data centre, the ports, PUBLIC_KEY, the CUDA floor. No start command: `ensure` installs the base's boot guard from the
     image's own entry, as for every other pod; and no templateId but the port-names one (3.9.0), which carries nothing else.
-    3.7.4 private_gb: an ENCRYPTED POD VOLUME of that size instead (RunPod: "Encryption applies only to volume disk.
-    Container disk and network volumes cannot be encrypted."), 22/tcp the only port (no proxied HTTP), and
+    3.7.4 private_gb: a POD VOLUME of that size instead, 22/tcp the only port (no proxied HTTP), and
     BASE_LISTEN=127.0.0.1 so ComfyUI binds loopback and is reached through `podctl tunnel` alone.
+    3.9.1: never `volumeEncrypted`. REST v1 POST /pods refuses it ("Extra input keys"): it is on the Pod read-back only,
+    and no first-party create input (REST v1 PodCreateInput, REST v2, runpodctl 3.0.1) can ask for an encrypted volume.
+    RunPod's storage docs name one way: the console's "Encrypt volume" box.
     3.9.0 names: [(port, name)], every one an http port (default the base's two); template_id: the template that names
     them in the console; token: the pod's own JUPYTER_TOKEN (JupyterLab is never tokenless). A private pod takes none of
-    the three: no http port, so nothing to name, and the boot makes its token on the encrypted volume."""
+    the three: no http port, so nothing to name, and the boot makes its token on the pod volume."""
     body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
             "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
@@ -717,10 +734,8 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
         if template_id:
             body["templateId"] = template_id
     if private_gb:
-        # volumeEncrypted is on REST v1's Pod ("can only be set when creating a Pod") but in neither documented create
-        # input, so create() reads the pod back and believes only what comes back
         del body["networkVolumeId"]
-        body.update({"volumeInGb": int(private_gb), "volumeEncrypted": True, "ports": list(PRIVATE_PORTS),
+        body.update({"volumeInGb": int(private_gb), "ports": list(PRIVATE_PORTS),
                      "env": {"PUBLIC_KEY": pubkey.strip(), "BASE_LISTEN": "127.0.0.1"}})
     if cuda:
         body["allowedCudaVersions"] = list(cuda)
@@ -823,34 +838,24 @@ def seed_jupyter_token(say=print):
 
 def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep, banner, ssh_config, say,
                     names=None):
-    """3.7.4 `create --private`: an encrypted pod volume, sshd only, ComfyUI on loopback. Read back after the create: a pod
-    that came back UNENCRYPTED is deleted at once (seconds old, nothing written), so the flag can never silently mean less
-    than it says; a pod whose answer does not say is kept and named, and the run stops."""
+    """3.7.4 `create --private`: a pod volume, sshd only, ComfyUI on loopback.
+    3.9.1: the volume is NOT encrypted, and that is said before the pod exists, never after: no create input RunPod
+    documents can ask for encryption (only the console's "Encrypt volume" box can). The summary prints what the read-back
+    says about the volume, never what was hoped for."""
     if volume:
-        raise PodctlError("--private cannot use --volume: RunPod cannot encrypt a network volume (only a pod's volume "
-                          "disk); --private makes an encrypted pod volume of --data-gb")
+        raise PodctlError("--private cannot use --volume: a private pod keeps its data on its own pod volume of --data-gb; "
+                          "pass --public to put a pod on the network volume %s (with proxy URLs)" % volume)
     if not data_gb:
-        raise PodctlError("--private needs --data-gb N: the size of the encrypted pod volume at %s" % VOLUME_ROOT)
+        raise PodctlError("--private needs --data-gb N: the size of the pod volume at %s" % VOLUME_ROOT)
+    say(PRIVATE_UNENCRYPTED)
     body = create_body(name, gpu, dc, None, image, container_gb, pubkey, cuda=cuda, spot=spot, private_gb=data_gb)
     pod_id = api.post("/pods", body)["id"]
     back = api.get("/pods/%s%s" % (pod_id, POD_READ))
-    enc = back.get("volumeEncrypted")
-    if enc is False:
-        try:
-            api.delete("/pods/%s" % pod_id)
-            gone = "deleted again (nothing written, nothing left billing)"
-        except Exception as e:
-            gone = "COULD NOT be deleted (%s): terminate it in the console" % e
-        raise PodctlError("RunPod created %s with its volume NOT encrypted (volumeEncrypted false on the read-back): %s. "
-                          "Encryption could not be requested through this API; use the console's Encrypt volume box" % (pod_id, gone))
-    if enc is not True:
-        raise PodctlError("created %s, but the API's answer does not say whether its volume is encrypted (no volumeEncrypted): "
-                          "it is kept; check it in the console before putting anything on it" % pod_id)
     ports = back.get("ports") or body["ports"]
     if sorted(ports) != sorted(PRIVATE_PORTS):
         say("  !! %s came back with ports %s, not %s" % (pod_id, " ".join(ports), " ".join(PRIVATE_PORTS)))
-    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · ENCRYPTED pod volume %d GB at %s · ports %s only · "
-        "ComfyUI on loopback · CUDA %s%s" % (pod_id, name, image, gpu, dc, int(container_gb), int(data_gb), VOLUME_ROOT,
+    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · %s · ports %s only · "
+        "ComfyUI on loopback · CUDA %s%s" % (pod_id, name, image, gpu, dc, int(container_gb), encryption_words(back, data_gb),
                                               " ".join(PRIVATE_PORTS), (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
     say("  private: no proxy URL; ComfyUI is http://localhost:8188 through podctl tunnel %s, which also names the Jupyter "
         "Terminal (its token made by the boot, on this volume) and each app port. The volume is this machine's (kept across "
@@ -871,7 +876,7 @@ def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pu
     write_ssh_config(ssh_config or pathlib.Path.home() / ".ssh" / "config", host, port)
     say("  ssh answers on %s:%d (Host %s -> %s)" % (host, port, _c().SSH_ALIAS, pod_id))
     # 3.9.0 (simple first, then private): the terminal's token is made here and handed to the pod over ssh's stdin, onto
-    # the encrypted volume (never RunPod's env, which it keeps in the clear, never argv), so the links can be printed now
+    # the pod volume (never RunPod's env, which it keeps in the clear, never argv), so the links can be printed now
     tok = seed_jupyter_token(say=say)
     apps = [(p, "", n) for p, n in (names or []) if int(p) not in (8188, 8888)]
     for line in _c().tunnel_plan(_c().TUNNEL_PORTS, False, [], apps, tok)[1]:

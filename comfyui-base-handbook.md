@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.9.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.9.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -79,7 +79,7 @@ run once per machine as **step one**; then each workflow package is **step two**
    3.9.0: JupyterLab is the pod's named "Jupyter Terminal" link, so the boot generates its token on EVERY bind; 2.1.0's
    public-bind refusal is gone because nothing listens tokenless and the token now has owner-only places to be read:
    `podctl create --public` puts a fresh per-pod `JUPYTER_TOKEN` in a RunPod pod's env and prints the ready link with it
-   (`deploy --like` gives the clone its own; the private default hands it to the encrypted volume over ssh stdin instead),
+   (`deploy --like` gives the clone its own; the private default hands it to the pod volume over ssh stdin instead),
    `podctl status`, `jupyter` and `tunnel` print the link with it, and on RunPod's public bind a token the boot made
    (never one the env set) is written as ONE line to the container log, the start command's own stdout (RunPod's Logs
    tab), which is how a pod from a public template with no ssh key gets its terminal. Never to the boot log.
@@ -208,7 +208,7 @@ it rides a bearer header and is never printed.
 ```bash
 uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>     # facts; env NAMES and placeholder verdicts, never values; the GPU verdict
 uv run "base/comfyui-base/_build/pod/podctl.py" deploy --like <pod> --wait   # a NEW pod cloned onto the same volume (rule 11's redeploy rung)
-uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500   # a first pod: stock check (B200, then B300), PRIVATE: encrypted pod volume, 22/tcp only, ComfyUI via podctl tunnel
+uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500   # a first pod: stock check (B200, then B300), PRIVATE: pod volume (not encrypted), 22/tcp only, ComfyUI via podctl tunnel
 uv run "base/comfyui-base/_build/pod/podctl.py" create --name <n> --image <img> --data-gb 500 --public   # not private: a network volume, ComfyUI and JupyterLab on proxy URLs
 uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg <dir> --no-suite --env KEY=VALUE   # BASE_NO_SUITE=1 and KEY on every run on the machine
 uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>     # 22/tcp · PUBLIC_KEY = the Mac key · the start command · Host runpod · state/host.env
@@ -655,6 +655,21 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.9.1: `podctl create --private` (the default since 3.8.1) works again, and says plainly that its volume is not
+  encrypted. It sent `volumeEncrypted: true`, which REST v1 `POST /pods` refuses ("Extra input keys": the field is on the
+  Pod read-back only), so every private create failed before anything was made; and its summary printed "ENCRYPTED pod
+  volume" without asking. Read 2026-10-16 from RunPod's own sources: REST v1 `PodCreateInput`, REST v2 and runpodctl
+  3.0.1 have no encryption input; GraphQL's deploy inputs carry an undocumented `volumeKey` string (not used: unverified,
+  and the docs say bring-your-own-key is not supported); the storage docs name one way, the console's "Encrypt volume"
+  box. So the body no longer carries the field, a `note` line says "NOT encrypted" before the pod is created, the summary
+  prints what the read-back says, and the seconds-old-pod deletion on `false` is gone (false is now the expected answer).
+  The suite's fake RunPod refuses any `POST /pods` key outside the live `PodCreateInput`, so a field the API does not
+  take fails on the Mac first. Exercised on this Mac against the fake; not against the live API.
+  And a seed build works again: `BASE_SEED=1` (the template image, built where no GPU is) failed its venv verify on
+  "torch.cuda.is_available() is False" and rolled the venv back, so `base-image.yml` had never pushed an image (two runs
+  on 2026-10-16, both red at step one). The install now passes `BASE_NO_GPU=1` to `py/venv_verify.py` for a seed build
+  alone, which drops that one question (the CUDA build, the archs and the closure are still checked); a machine with no
+  visible device still fails. Exercised on this Mac against a fake torch; the image build is CI's to show.
 - 3.9.0: named ports. On RunPod's Connect tab every link has a name: `8188` "ComfyUI", `8888` "Jupyter Terminal", and
   one port per customer app a package declares (`APP_PORTS`, §4), through a private port-names template `podctl
   create` makes once per set of names (§1.1; RunPod names ports only on templates, GraphQL `portsConfig`). The machine

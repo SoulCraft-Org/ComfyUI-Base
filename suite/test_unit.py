@@ -373,6 +373,28 @@ def test_unit_probe_condemns_a_runtime_written_interpreter():
     assert "sm_120" not in code_only(src) and "BASE_WANT_SM" in src         # device sm is a parameter, not a constant
 
 
+def test_unit_verify_asks_for_a_gpu_except_in_a_seed_build(tmp_path):
+    """3.9.1: the template image's seed build (BASE_SEED=1) runs where no GPU is, and "torch.cuda.is_available() is False"
+    rolled its venv back every time, so no image was ever built. BASE_NO_GPU=1 drops that one question; the install sets
+    it for BASE_SEED=1 alone, so a real machine with no visible device still fails."""
+    fake = tmp_path / "fake"; (fake / "torch").mkdir(parents=True)
+    (fake / "torch" / "__init__.py").write_text(
+        "__version__ = '2.14.1+cu130'\n"
+        "class version:\n    cuda = '13.0'\n"
+        "class cuda:\n    @staticmethod\n    def is_available():\n        return False\n"
+        "    @staticmethod\n    def get_arch_list():\n        return ['sm_100', 'sm_120']\n")
+    env = {**os.environ, "VENV": str(fake), "PYTHONPATH": str(fake)}
+    env.pop("BASE_PERSIST_ROOT", None)
+    run = lambda **e: subprocess.run([sys.executable, str(BASE / "py" / "venv_verify.py")], capture_output=True, text=True, env={**env, **e})
+    r = run()
+    assert r.returncode == 1 and "is_available() is False" in r.stdout, r.stdout + r.stderr
+    r = run(BASE_NO_GPU="1")
+    assert r.returncode == 0 and "is_available" not in r.stdout and "no GPU asked (seed build)" in r.stdout, r.stdout + r.stderr
+    py = tmp_path / "py"; py.write_text('#!/bin/sh\necho "BASE_NO_GPU=$BASE_NO_GPU"\n'); py.chmod(0o755)
+    assert "BASE_NO_GPU=1" in _bash(f'PY="{py}"; BASE_SEED=1; _base_venv_verify; echo "$BASE_TORCH_INFO"').stdout
+    assert "BASE_NO_GPU=0" in _bash(f'PY="{py}"; unset BASE_SEED; _base_venv_verify; echo "$BASE_TORCH_INFO"').stdout
+
+
 def test_unit_verify_checks_the_whole_startup_closure_and_extra_imports():
     src = (BASE / "py" / "venv_verify.py").read_text()
     for needle in ("_base_executable", "pyvenv.cfg", ".pth", "sys.path", "BASE_EXTRA_IMPORTS", "BASE_WANT_SM", "BASE_WANT_PY"):

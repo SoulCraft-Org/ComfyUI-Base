@@ -474,7 +474,7 @@ def test_unit_tunnel_forwards_the_machines_app_ports_and_prints_named_localhost_
 
 def test_unit_private_create_hands_the_token_over_ssh_and_prints_the_tunnels_named_links(tmp_path, monkeypatch):
     """A private pod's token never goes into RunPod's env (kept in the clear): once ssh answers, create hands it to the
-    encrypted volume through ssh's STDIN (never argv), keeps one already there, and prints the links the tunnel opens."""
+    pod volume through ssh's STDIN (never argv), keeps one already there, and prints the links the tunnel opens."""
     podctl = _load()
     seen = []
 

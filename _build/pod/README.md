@@ -60,16 +60,21 @@ a consumer's guard hook prompts for it like `deploy`.
 
 **Private is the default (3.8.1)**, on RunPod: Paul's order for everything a person touches is as simple, then as secure,
 then as private as possible, so a plain `create` makes the pod below, and `--public` is the one way to the network-volume
-pod above (`--volume` names a network volume, which cannot be encrypted, so it needs `--public` and is refused without it,
-naming both ways out). `--private` is still accepted and means the default. A host whose create has no private mode
+pod above (`--volume` names a network volume, which a private pod does not use, so it needs `--public` and is refused
+without it, naming both ways out). `--private` is still accepted and means the default. A host whose create has no private mode
 (Verda) is unchanged; asking it for `--private` is refused by name.
 
-`--private` (3.7.4): an **encrypted pod volume** of `--data-gb` at `/workspace` (`volumeInGb` + `volumeEncrypted`; RunPod
-cannot encrypt a network volume or a container disk, so `--volume` is refused), `22/tcp` the only port (no proxy URL, no
-JupyterLab), and `BASE_LISTEN=127.0.0.1` in the pod's env so ComfyUI binds loopback; `podctl tunnel <pod>` is the way in
-(http://localhost:8188), and `install` carries that `BASE_LISTEN` into its runs. `volumeEncrypted` is in no documented
-create input, so the pod is read back: one that came back unencrypted is deleted at once and the run fails; one whose
-answer does not say is kept and named. The volume is the machine's: kept across stop/start, deleted with the pod.
+`--private` (3.7.4): a **pod volume** of `--data-gb` at `/workspace` (`volumeInGb`; `--volume` is refused), `22/tcp` the
+only port (no proxy URL, no JupyterLab), and `BASE_LISTEN=127.0.0.1` in the pod's env so ComfyUI binds loopback;
+`podctl tunnel <pod>` is the way in (http://localhost:8188), and `install` carries that `BASE_LISTEN` into its runs. The
+volume is the machine's: kept across stop/start, deleted with the pod.
+
+**The volume is not encrypted (3.9.1).** RunPod encrypts a pod's volume disk only when the console's "Encrypt volume"
+box is ticked at create time. No create input RunPod documents can ask for it: REST v1 `POST /pods` refuses
+`volumeEncrypted` ("Extra input keys", it is on the Pod read-back only), REST v2 and runpodctl 3.0.1 have no such field,
+and GraphQL's deploy inputs carry only an undocumented `volumeKey` string. So `create` says so before the pod exists,
+and its summary prints what the read-back says (`ENCRYPTED pod volume`, `pod volume … (not encrypted)`, or
+`(encryption not reported)`). An encrypted pod is made in the console; podctl then works on it like any other pod.
 
 ## tunnel
 

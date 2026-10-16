@@ -1805,9 +1805,9 @@ def cmd_create(prov, args):
         raise PodctlError("--public and --private contradict each other: a pod is private unless --public")
     private = not public and (offers_private or bool(getattr(args, "private", False)))
     if private and volume:
-        raise PodctlError("--volume is a network volume and RunPod cannot encrypt a network volume, so a pod on it cannot be "
-                          "private (the default since base 3.8.1): drop --volume for an encrypted pod volume of --data-gb, or pass "
-                          "--public to put this pod on the network volume with proxy URLs")
+        raise PodctlError("--volume is a network volume, and a private pod (the default since base 3.8.1) keeps its data on its "
+                          "own pod volume instead: drop --volume for a pod volume of --data-gb, or pass --public to put this pod "
+                          "on the network volume with proxy URLs")
     if volume:
         _offered(prov, "volume_location")                # 3.7.3: reuse an existing volume (RunPod); its data centre is fixed
         vloc = prov.volume_location(volume)
@@ -1967,9 +1967,9 @@ def build_parser():
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
-    p.add_argument("--private", action="store_true", help="the default since 3.8.1 (RunPod): an ENCRYPTED pod volume of --data-gb "
-                   "(network volumes cannot be encrypted), ports 22/tcp only (no proxy URL), ComfyUI, JupyterLab and the apps on loopback: "
-                   "podctl tunnel names them")
+    p.add_argument("--private", action="store_true", help="the default since 3.8.1 (RunPod): a pod volume of --data-gb, NOT "
+                   "encrypted (RunPod's API cannot ask for that; only the console's Encrypt volume box can), ports 22/tcp only "
+                   "(no proxy URL), ComfyUI, JupyterLab and the apps on loopback: podctl tunnel names them")
     p.add_argument("--public", action="store_true", help="RunPod: NOT private: a network volume (new, or --volume), ComfyUI, "
                    "the Jupyter Terminal and each app on RunPod's proxy URLs, named in the Connect tab")
     p.add_argument("--no-names", dest="no_names", action="store_true", help="RunPod: no port-names template (the Connect tab "

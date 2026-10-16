@@ -36,6 +36,17 @@ def _load():
     return mod
 
 
+# 3.9.1: REST v1 PodCreateInput as https://rest.runpod.io/v1/openapi.json listed it on 2026-10-16. The live POST /pods
+# answers 400 "Extra input keys" for anything else (volumeEncrypted made every `create --private` fail that way), so the
+# fake refuses the same keys and a field the API does not take fails here first.
+POD_CREATE_INPUT = frozenset((
+    "allowedCudaVersions cloudType computeType containerDiskInGb containerRegistryAuthId countryCodes cpuFlavorIds "
+    "cpuFlavorPriority dataCenterIds dataCenterPriority dockerEntrypoint dockerStartCmd env globalNetworking gpuCount "
+    "gpuTypeIds gpuTypePriority imageName interruptible locked minDiskBandwidthMBps minDownloadMbps minRAMPerGPU "
+    "minUploadMbps minVCPUPerGPU name networkVolumeId ports supportPublicIp templateId vcpuCount volumeInGb "
+    "volumeMountPath").split())
+
+
 class FakeRunPod:
     """An in-memory RunPod REST v1: GET/PATCH /pods/{id}, POST /pods/{id}/start|stop, GET /pods. Records PATCH
     bodies in order. `on_patch` lets a test react (e.g. open the fake sshd once the start command lands)."""
@@ -51,7 +62,7 @@ class FakeRunPod:
         self.on_patch = None
         self.gql = gql or {}                              # 3.7.3: what POST /graphql answers under "data"
         self.refuse_pods = False                          # 3.7.3: POST /pods answers 400 (sold out between check and create)
-        self.pod_override = {}                            # 3.7.4: what RunPod changes on the created pod (volumeEncrypted false)
+        self.pod_override = {}                            # 3.7.4: what RunPod adds or changes on the created pod (volumeEncrypted)
         self.pod_drop = ()                                # 3.7.4: keys the created pod's answer leaves out
         self.rest = rest                                  # 3.9.0: (method, path, body) -> (code, body) | None, before the defaults
         srv = self
@@ -118,6 +129,9 @@ class FakeRunPod:
                     srv.volumes[vol["id"]] = vol
                     return self._send(200, vol)
                 if self.path == "/pods":
+                    extra = sorted(set(body) - POD_CREATE_INPUT)
+                    if extra:                             # 3.9.1: the live API's answer to a key it does not take
+                        return self._send(400, {"error": "Extra input keys: %s" % ", ".join(extra)})
                     if srv.refuse_pods:
                         return self._send(400, {"error": "There are no longer any instances available with the requested specifications."})
                     srv.pod = dict(body, id="newpod0000001", desiredStatus="RUNNING", publicIp="127.0.0.1", portMappings={"22": 15270})
@@ -1884,48 +1898,53 @@ def test_unit_podctl_install_no_suite_and_env_reach_every_run_on_the_machine(tmp
 
 # ---------------------------------------------------------------- 3.7.4: create --private
 
-def test_unit_runpod_create_private_is_an_encrypted_pod_volume_behind_ssh_only(tmp_path, capsys):
-    """--private: RunPod cannot encrypt a network volume ("Encryption applies only to volume disk"), so the volume is an
-    encrypted POD volume; 22/tcp is the only port (no proxy URL, no JupyterLab) and ComfyUI binds loopback, reached
-    through `podctl tunnel`. volumeEncrypted is in no documented create input, so the pod is read back and believed."""
+def test_unit_runpod_create_private_is_an_unencrypted_pod_volume_behind_ssh_only(tmp_path, capsys):
+    """--private: a POD volume, 22/tcp the only port (no proxy URL, no JupyterLab), ComfyUI on loopback through `podctl
+    tunnel`. 3.9.1: no create input RunPod documents can ask for encryption (REST v1 refuses volumeEncrypted), so the body
+    never carries it, "NOT encrypted" is said before the pod exists, and the summary prints what the read-back says."""
     podctl = _load()
     pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
     srv = FakeRunPod(_pod(), gql=B200_STOCK)
     try:
-        # a network volume cannot be encrypted: refused before any call
+        # a network volume is not a private pod's: refused before any call
         with pytest.raises(podctl.PodctlError) as e:
             _create(podctl, srv, pub, "--private", "--volume", "oldvol")
-        assert "cannot encrypt a network volume" in str(e.value) and srv.posts == [] and srv.gets == []
+        assert "--public" in str(e.value) and srv.posts == [] and srv.gets == []
         assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
         out = capsys.readouterr().out
         assert srv.posts == ["/graphql", "/pods"], srv.posts                   # no network volume is made
         body = srv.bodies[-1][1]
-        assert "networkVolumeId" not in body and body["volumeInGb"] == 200 and body["volumeEncrypted"] is True
+        assert "networkVolumeId" not in body and body["volumeInGb"] == 200 and "volumeEncrypted" not in body, body
+        assert set(body) <= POD_CREATE_INPUT, sorted(set(body) - POD_CREATE_INPUT)
         assert body["ports"] == ["22/tcp"] and body["cloudType"] == "SECURE" and body["volumeMountPath"] == "/workspace"
         assert body["env"] == {"PUBLIC_KEY": "ssh-ed25519 AAAAMAC mac@key", "BASE_LISTEN": "127.0.0.1"}
         assert not any(k.startswith("JUPYTER") for k in body["env"])
         assert any("includeNetworkVolume=true" in g for g in srv.gets if g.startswith("/pods/newpod0000001")), srv.gets
-        assert "ENCRYPTED pod volume 200 GB" in out and "podctl tunnel newpod0000001" in out and "localhost:8188" in out, out
-        # status names it, and says JupyterLab is not exposed rather than "anyone with the URL"
+        # the warning comes before the pod exists, and the summary says what the read-back said (no field: not reported)
+        assert "NOT be encrypted" in out and out.index("NOT be encrypted") < out.index("created newpod0000001"), out
+        assert "pod volume 200 GB at /workspace (encryption not reported)" in out and "ENCRYPTED" not in out, out
+        assert "podctl tunnel newpod0000001" in out and "localhost:8188" in out, out
         facts = podctl.pod_facts(srv.pod)
-        assert "encrypted pod volume 200 GB at /workspace" in facts and "jupyter    not exposed" in facts and "auth: NONE" not in facts, facts
-        # RunPod ignored the flag: the seconds-old pod is deleted, and the run fails loudly
+        assert "pod volume 200 GB at /workspace" in facts and "encrypted" not in facts and "jupyter    not exposed" in facts, facts
+        assert "auth: NONE" not in facts, facts
+        # RunPod says false (the expected answer now): kept, nothing deleted, the summary says so
         srv.pod_override = {"volumeEncrypted": False}; srv.deletes.clear()
-        with pytest.raises(podctl.PodctlError) as e:
-            _create(podctl, srv, pub, "--private", "--data-gb", "200")
-        assert "NOT encrypted" in str(e.value) and srv.deletes == ["/pods/newpod0000001"], (str(e.value), srv.deletes)
-        # the answer does not say: kept (nothing to judge by), named, and the run stops
-        srv.pod_override = {}; srv.pod_drop = ("volumeEncrypted",); srv.deletes.clear()
-        with pytest.raises(podctl.PodctlError) as e:
-            _create(podctl, srv, pub, "--private", "--data-gb", "200")
-        assert "does not say" in str(e.value) and srv.deletes == []
+        assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
+        out = capsys.readouterr().out
+        assert "pod volume 200 GB at /workspace (not encrypted)" in out and srv.deletes == [], (out, srv.deletes)
+        # RunPod says true (a future API, or the console's flag on a template): believed, and said in capitals
+        srv.pod_override = {"volumeEncrypted": True}
+        assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
+        out = capsys.readouterr().out
+        assert "ENCRYPTED pod volume 200 GB at /workspace" in out and "(not encrypted)" not in out.split("created")[1], out
+        assert "encrypted pod volume 200 GB at /workspace" in podctl.pod_facts(srv.pod)
     finally:
         srv.close()
 
 
 def test_unit_runpod_create_is_private_unless_public(tmp_path, capsys):
     """3.8.1, Paul's order (as simple, then as secure, then as private as possible): `podctl create` with no flag makes the
-    private pod (an encrypted pod volume, 22/tcp only, ComfyUI on loopback) on Secure Cloud, B200 first. --public is the
+    private pod (a pod volume, 22/tcp only, ComfyUI on loopback) on Secure Cloud, B200 first. --public is the
     one way to a network volume and proxy URLs; --volume without it is refused with both ways out, never silently public.
     A host whose create has no private mode (Verda) keeps working without a flag; asking it for --private is refused."""
     podctl = _load()
@@ -1938,12 +1957,12 @@ def test_unit_runpod_create_is_private_unless_public(tmp_path, capsys):
     try:
         assert create("--data-gb", "300") in (None, 0)
         body = srv.bodies[-1][1]
-        assert srv.posts == ["/graphql", "/pods"] and body["volumeEncrypted"] is True and body["ports"] == ["22/tcp"], (srv.posts, body)
+        assert srv.posts == ["/graphql", "/pods"] and "volumeEncrypted" not in body and body["ports"] == ["22/tcp"], (srv.posts, body)
         assert body["cloudType"] == "SECURE" and body["gpuTypeIds"] == ["NVIDIA B200"] and body["env"]["BASE_LISTEN"] == "127.0.0.1"
         assert "podctl tunnel" in capsys.readouterr().out
         with pytest.raises(podctl.PodctlError) as e:
             create("--volume", "oldvol")
-        assert "cannot encrypt a network volume" in str(e.value) and "--public" in str(e.value) and "--data-gb" in str(e.value)
+        assert "network volume" in str(e.value) and "--public" in str(e.value) and "--data-gb" in str(e.value)
         with pytest.raises(podctl.PodctlError) as e:
             create("--data-gb", "300", "--public", "--private")
         assert "contradict" in str(e.value)
