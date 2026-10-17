@@ -2761,15 +2761,19 @@ def _cgroup(tmp_path, v2=None, v1=None):
 def test_unit_the_cpu_quota_is_the_cgroups_not_the_hosts(tmp_path):
     """3.10.0: a RunPod container is a slice of a big host. nproc and torch see the HOST's CPUs while the CFS quota lets
     the container run its own, so a thread pool sized by the host is throttled. The quota is cpu.max (v2) or
-    cpu.cfs_quota_us / cpu.cfs_period_us (v1), rounded up, never more than the CPUs online; unlimited says nothing."""
+    cpu.cfs_quota_us / cpu.cfs_period_us (v1), rounded up, never more than the CPUs online; unlimited says nothing.
+    3.20.3: the rounding cases run with 64 CPUs online (a stub of _base_cpus_online), so they prove the rounding on any host;
+    on the 2-CPU soulcraft-hf runner the cap turned 250000/100000 into 2. The cap is proved with the host's own count and
+    with a stubbed 2-CPU host."""
     online = int(_bash("_base_cpus_online").stdout.strip())
-    cases = [({"v2": "250000 100000"}, "3"), ({"v2": "100000 100000"}, "1"), ({"v2": "50000 100000"}, "1"),
-             ({"v2": "max 100000"}, ""), ({"v1": (200000, 100000)}, "2"), ({"v1": (-1, 100000)}, ""),
-             ({"v2": "%d 100000" % ((online + 7) * 100000)}, str(online)), ({}, "")]
-    for i, (kw, want) in enumerate(cases):
+    cases = [({"v2": "250000 100000"}, "3", 64), ({"v2": "100000 100000"}, "1", 64), ({"v2": "50000 100000"}, "1", 64),
+             ({"v2": "max 100000"}, "", 64), ({"v1": (200000, 100000)}, "2", 64), ({"v1": (-1, 100000)}, "", 64), ({}, "", 64),
+             ({"v2": "250000 100000"}, "2", 2), ({"v2": "%d 100000" % ((online + 7) * 100000)}, str(online), None)]
+    for i, (kw, want, cpus) in enumerate(cases):
         root = _cgroup(tmp_path / str(i), **kw) if kw else tmp_path / "none"
-        r = _bash("_base_cpu_quota", env={"BASE_CGROUP_ROOT": str(root)})
-        assert r.returncode == 0 and r.stdout.strip() == want, (kw, r.stdout, r.stderr)
+        stub = "_base_cpus_online(){ echo %d; }; " % cpus if cpus else ""      # None: the host's own count
+        r = _bash(stub + "_base_cpu_quota", env={"BASE_CGROUP_ROOT": str(root)})
+        assert r.returncode == 0 and r.stdout.strip() == want, (kw, cpus, r.stdout, r.stderr)
 
 
 def test_unit_launch_env_is_a_contract_not_a_free_for_all():
@@ -2796,14 +2800,27 @@ def test_unit_launch_env_is_a_contract_not_a_free_for_all():
     assert "RC=0" in r.stdout and "LAUNCHENV OMP_NUM_THREADS=8" in r.stdout, r.stdout + r.stderr
 
 
-def test_unit_launch_env_precedence_machine_then_packages_then_the_quota(tmp_path):
+_CPUS64 = "_base_cpus_online(){ echo 64; }; "     # 3.20.3: a host whose CPUs never cap the fake quota (the runner has 2)
+
+
+def _no_launch_env(monkeypatch):
+    """3.20.3: the machine's own launch variables out of the suite's environment (the soulcraft-hf runner exports
+    OMP_NUM_THREADS=2, which then won, rightly, over every value these tests expect). The keys come from the base."""
+    keys = _bash("echo $BASE_LAUNCH_ENV_KEYS").stdout.split()
+    assert "OMP_NUM_THREADS" in keys, keys
+    for k in keys + [k for k in os.environ if k.startswith("CT2_")]:
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_unit_launch_env_precedence_machine_then_packages_then_the_quota(tmp_path, monkeypatch):
     """The machine's own environment wins (a pod env var someone set on purpose); then the packages' files in name order,
     the first naming a key winning and a different later value named; then the base's OMP_NUM_THREADS from the quota.
     A line a package file should never hold (the folder is on a shared volume) is left out and said."""
+    _no_launch_env(monkeypatch)
     state = tmp_path / "state"; d = state / "launch.d"; d.mkdir(parents=True); cg = _cgroup(tmp_path, v2="300000 100000")
     (d / "a-pkg.env").write_text("# a\nOMP_NUM_THREADS=8\nCT2_VERBOSE=1\n")
     (d / "b-pkg.env").write_text("OMP_NUM_THREADS=4\nPYTORCH_CUDA_ALLOC_CONF=expandable_segments:True\nPATH=/evil\nCT2_VERBOSE=1")
-    env = {"BASE_CGROUP_ROOT": str(cg)}; le = 'BASE_STATE="%s"; _base_launch_env' % state      # base.sh resets BASE_STATE on source
+    env = {"BASE_CGROUP_ROOT": str(cg)}; le = 'BASE_STATE="%s"; %s_base_launch_env' % (state, _CPUS64)    # base.sh resets BASE_STATE on source
     r = _bash(le, env=env)
     assert r.stdout.splitlines() == ["OMP_NUM_THREADS=8", "CT2_VERBOSE=1", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"], r.stdout + r.stderr
     assert "a-pkg sets 8, b-pkg sets 4: 8 is used" in r.stderr and "'PATH=/evil' is not an allowed launch variable" in r.stderr, r.stderr
@@ -2823,10 +2840,11 @@ def test_unit_launch_env_precedence_machine_then_packages_then_the_quota(tmp_pat
     assert r.stdout == "OMP_NUM_THREADS=6\n", r.stdout + r.stderr
 
 
-def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path):
+def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path, monkeypatch):
     """The variables are exported into ComfyUI's process (the subshell that starts it), printed on the hand-off line in a
     form nohup runs verbatim, and never exported into the installing shell, which would then read the base's own value
     back as the machine's at the next install."""
+    _no_launch_env(monkeypatch)
     bin_ = tmp_path / "bin"; bin_.mkdir(); log = tmp_path / "calls.log"; up = tmp_path / "up"
     (bin_ / "python").write_text('#!/bin/bash\necho "python env OMP=${OMP_NUM_THREADS:-unset} CT2=${CT2_VERBOSE:-unset} argv=$*" >> "%s"; touch "%s"\n' % (log, up))
     (bin_ / "curl").write_text('#!/bin/bash\n[ -e "%s" ]\n' % up)
@@ -2834,12 +2852,12 @@ def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path):
     comfy = tmp_path / "ComfyUI"; comfy.mkdir(); state = tmp_path / "state"; (state / "launch.d").mkdir(parents=True)
     (state / "launch.d" / "pkg.env").write_text("CT2_VERBOSE=1\n"); cg = _cgroup(tmp_path, v2="200000 100000")
     env = {"PATH": "%s:/usr/bin:/bin" % bin_, "BASE_CGROUP_ROOT": str(cg)}
-    r = _bash('BASE_STATE="%s"; PY="%s"; COMFY="%s"; PORT=8188; HOSTPORT=127.0.0.1:8188; ARGS_FILE=/nonexistent; COMFY_LOG="%s"; BASE_START_TRIES=3; '
+    r = _bash(_CPUS64 + 'BASE_STATE="%s"; PY="%s"; COMFY="%s"; PORT=8188; HOSTPORT=127.0.0.1:8188; ARGS_FILE=/nonexistent; COMFY_LOG="%s"; BASE_START_TRIES=3; '
               '_base_start_comfy; echo RC=$? PARENT_OMP=${OMP_NUM_THREADS:-unset}' % (state, bin_ / "python", comfy, tmp_path / "comfyui.log"), env=env)
     assert "RC=0 PARENT_OMP=unset" in r.stdout and "launch env: CT2_VERBOSE=1 OMP_NUM_THREADS=2" in r.stdout, r.stdout + r.stderr
     assert "python env OMP=2 CT2=1 argv=main.py --listen" in log.read_text(), log.read_text()
     log.unlink()
-    r = _bash('BASE_STATE="%s"; PY="%s"; PORT=8188; ARGS_FILE=/nonexistent; line="$(_base_start_cmd)"; echo "LINE=$line"; cd "%s" && nohup $line > "%s" 2>&1; echo RC=$?'
+    r = _bash(_CPUS64 + 'BASE_STATE="%s"; PY="%s"; PORT=8188; ARGS_FILE=/nonexistent; line="$(_base_start_cmd)"; echo "LINE=$line"; cd "%s" && nohup $line > "%s" 2>&1; echo RC=$?'
               % (state, bin_ / "python", comfy, tmp_path / "nohup.out"), env=env)
     assert "LINE=env CT2_VERBOSE=1 OMP_NUM_THREADS=2 %s main.py" % (bin_ / "python") in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
     assert "python env OMP=2 CT2=1" in log.read_text()

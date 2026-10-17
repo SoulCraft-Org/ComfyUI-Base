@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.20.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.20.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -822,6 +822,13 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.20.3: the CPU-quota and launch-environment tests hold on any machine (2026-10-17). On the free `soulcraft-hf` runner
+  (a 2-CPU Hugging Face CPU Space that exports `OMP_NUM_THREADS=2`, workspace integration run 39049424709) three unit
+  tests failed while the code was right. The cap to the CPUs online turned the fake 250000/100000 quota into 2, and the
+  runner's own `OMP_NUM_THREADS` won, as the contract says the machine's value must, over every value the launch tests
+  expect. The rounding cases now run with `_base_cpus_online` stubbed to 64, and the cap is proved with the host's own
+  count and a stubbed 2-CPU host. The launch tests drop every key of `BASE_LAUNCH_ENV_KEYS` (read from the base) and
+  `CT2_*` from their environment. Only the suite changed; the base's code is as in 3.20.2.
 - 3.20.2: the testbed links the newest copy of a pack two packages vendor (2026-10-17). FLUX 3 Klein and the Video
   Replacer both vendor ComfyUI-Content-Gate (one folder name, one set of node classes), and `testbed.sh` linked each
   package's copy into `custom_nodes` by folder name, so whichever package was walked last won (the Replacer's 1.5.0 in
