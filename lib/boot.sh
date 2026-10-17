@@ -194,6 +194,7 @@ boot_comfy(){ # ComfyUI from the base's venv with the base's launch line, only w
   if [ ! -f "$f" ]; then echo "boot: no $f — the base has not installed ComfyUI on this volume yet; nothing to start"; return 0; fi
   . "$f"
   PY="$VENV/bin/python"; HOSTPORT="127.0.0.1:$PORT"; COMFY_LOG="$BOOT_HOME/state/logs/comfyui.log"
+  BASE_STATE="$BOOT_HOME/state"             # 3.20.0: the boot's state is its own (servers.list, pid files), never an inherited one
   BASE_PERSIST_ROOT="${PERSIST:-}"; BASE_PREVIEW_SIZE="${PREVIEW_SIZE:-1024}"; ARGS_IMPORT=""
   if [ ! -x "$PY" ]; then echo "boot: $PY is missing — not starting ComfyUI. Fix: bash '<package>-script.sh' rescue"; return 0; fi
   boot_launch_lib || return 0

@@ -2128,7 +2128,8 @@ def test_unit_boot_sh_starts_one_comfyui_per_gpu(tmp_path):
     bin_, log = _boot_stubs(tmp_path)
     (bin_ / "nvidia-smi").write_text("#!/bin/bash\ncase \"$*\" in *--query-gpu=index*) printf '0\\n1\\n2\\n3\\n' ;; esac\nexit 0\n")
     (bin_ / "nvidia-smi").chmod(0o755)
-    r, blog = _run_boot_sh(tmp_path, bin_, {"BASE_CGROUP_ROOT": str(tmp_path / "no-cgroup")})
+    r, blog = _run_boot_sh(tmp_path, bin_, {"BASE_CGROUP_ROOT": str(tmp_path / "no-cgroup"), "BASE_SERVERS": None,
+                                            "BASE_NVIDIA_SMI": str(bin_ / "nvidia-smi")})
     assert r.returncode == 0, r.stderr + blog
     assert "4 servers, one per GPU: 127.0.0.1:8188,127.0.0.1:18189,127.0.0.1:18190,127.0.0.1:18191" in blog, blog
     assert "boot: starting ComfyUI: env CUDA_VISIBLE_DEVICES=0 " in blog and "boot: ComfyUI answers on 127.0.0.1:8188" in blog, blog

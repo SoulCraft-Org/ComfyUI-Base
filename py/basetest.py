@@ -417,9 +417,14 @@ def boot_fake_pod(root, bin_, extra_env=None):
     root = pathlib.Path(root)
     env = {**os.environ, "PATH": "%s:/usr/bin:/bin" % bin_, "BOOT_HOME": str(root / "comfy-base"), "BOOT_ROOT": str(root / "fs"),
            "BOOT_ONCE": "1", "BASE_START_TRIES": "1", "PUBLIC_KEY": "ssh-ed25519 AAAAC3fake mac@key", "RUNPOD_POD_ID": "fakepod"}
-    for k in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD"):
+    # 3.20.0: and never the runner's own state or GPUs (verify.sh's suite runs with the runner's BASE_STATE exported)
+    for k in ("JUPYTER_TOKEN", "JUPYTER_PASSWORD", "BASE_STATE", "BASE_HOME", "CUDA_VISIBLE_DEVICES", "BASE_NVIDIA_SMI"):
         env.pop(k, None)
-    env.update(extra_env or {})
+    for k, v in (extra_env or {}).items():         # None unsets
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     try:
         r = subprocess.run(["bash", str(root / "comfy-base" / "boot.sh")], capture_output=True, text=True, env=env, timeout=120)
     finally:                                     # 3.10.1: a forwarder the boot started outlives BOOT_ONCE; never leave it listening
