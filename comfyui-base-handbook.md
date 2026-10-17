@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.20.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.20.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -822,6 +822,13 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.20.2: the testbed links the newest copy of a pack two packages vendor (2026-10-17). FLUX 3 Klein and the Video
+  Replacer both vendor ComfyUI-Content-Gate (one folder name, one set of node classes), and `testbed.sh` linked each
+  package's copy into `custom_nodes` by folder name, so whichever package was walked last won (the Replacer's 1.5.0 in
+  workspace integration run 39045535460, failing Klein's comfyui and server tiers). It now keeps the newest version,
+  the rule a pod already follows (`lib/62-own-packs.sh`): `py/own_packs.py newest` picks one folder per pack name, a
+  copy with no version loses to one with a version, the same version keeps the first and names two different contents
+  under it. `--status` lists each vendored pack's version and the package it comes from.
 - 3.20.1: the testbed names a port's holder on Linux without lsof (2026-10-17). On the free `soulcraft-hf` runner (a
   Hugging Face CPU Space container, workspace integration run 39045535460) there is no lsof, so `testbed.sh` named every
   holder of a port "pid ?" and two unit tests that expect the pid failed there while GitHub's ubuntu runners passed.

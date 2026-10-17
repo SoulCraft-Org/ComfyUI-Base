@@ -184,6 +184,13 @@ derive_vendored(){
   done
 }
 derive_vendored
+# Two packages may vendor the same pack (one folder name, one set of node classes), and only one copy can be linked.
+# 3.20.2: the newest version, the copy a pod keeps (lib/62-own-packs.sh), never whichever package is walked last: the
+# workspace's integration run linked the Video Replacer's Content Gate 1.5.0 over FLUX 3 Klein's, by name order alone.
+if [ "${#VENDORED[@]}" -gt 1 ]; then
+  _own="$(python3 "$(dirname "$BASE_SH")/py/own_packs.py" newest "${VENDORED[@]}")" || die "py/own_packs.py could not choose among the vendored packs (above)"
+  VENDORED=(); while IFS= read -r _d; do [ -n "$_d" ] && VENDORED+=("$_d"); done <<< "$_own"
+fi
 
 # PACKS rows are dir|url|sha|branch (sha empty = unpinned; branch empty = the remote's HEAD, else the branch a base or
 # package row names to track, 3.6.1). Derived first, EXTRA appended for dirs not yet covered.
@@ -422,6 +429,10 @@ status() {
   # what a provision WOULD install, and where the packages were found. Silent derivation is how 2.6.0 shipped
   # a testbed that quietly provisioned the base's packs and none of a consumer repository's.
   note "packs: ${#PACKS[@]} derived${REPO_ROOT:+ · packages under $REPO_ROOT (${#PKGS[@]})}${REPO_ROOT:+ · ${#VENDORED[@]} vendored}"
+  local v
+  for v in ${VENDORED[@]+"${VENDORED[@]}"}; do      # which copy of each vendored pack gets linked, and from where
+    note "  vendored $(basename "$v") $(python3 "$(dirname "$BASE_SH")/py/own_packs.py" version "$v" 2>/dev/null || echo '?') from $(basename "$(dirname "$v")")"
+  done
   echo; note "BASE_NODE_SRC=\"$COMFY\"   BASE_SERVER=127.0.0.1:$PORT"
 }
 
