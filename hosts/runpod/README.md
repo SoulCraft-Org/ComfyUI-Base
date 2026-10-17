@@ -30,6 +30,12 @@ folder's `provider.py` is the RunPod half of the driver, moved here verbatim in 
 - **Network volumes exist only in Secure Cloud and pin a data centre**: the pod lands where its volume is, so the GPU must
   be in stock THERE. `podctl create` checks that first.
 - **22/tcp exposed.** `ensure` adds it when missing (the pod resets).
+- **Several GPUs (3.20.0).** `podctl create --gpus N` (1 to 8): the boot runs one ComfyUI per GPU, 8188 for GPU 0 (the
+  links) and `127.0.0.1:18188+i` for the others, which a package's runner reaches on the pod (the handbook's §6 Servers).
+  The stock check asks for N per data centre (`gpuTypes.lowestPrice(gpuCount, dataCenterId)`): a data centre with one
+  free GPU of the type is not one with four. RunPod sizes RAM and vCPUs with the count (B200, 2026-10-17: x1 188 GB and
+  24 vCPU, x2 502 GB and 48 vCPU), so each server has at least what a 1-GPU pod gives it. Every create prints the pod's
+  price and refuses when the projected balance covers under one hour of it plus today's spend.
 
 ## Which GPU
 

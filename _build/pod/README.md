@@ -124,5 +124,5 @@ which repositories may use it, and a group that refuses public repositories keep
 - **Removal.** `stop`, `pause` and `put-away` first remove the runner through GitHub's API when this Mac registered one
   (a mark in `~/.cache/podctl/runners/`, holding the scope's API path only); a machine that never ran one stops as
   before, with no call to GitHub. `--remove` does it on demand.
-- **The GPU.** A job on the machine reaches the GPU only through the machine's own ComfyUI (`127.0.0.1:8188`), never as
-  a second GPU process beside it; `runner` refuses while another session holds the GPU lease (`--force-lease`).
+- **The GPU.** A job on the machine reaches the GPU only through the machine's own ComfyUI (`127.0.0.1:8188`, and on a
+  multi-GPU pod each server in `state/servers.list`, 3.20.0), never as a second GPU process beside one; `runner` refuses while another session holds the GPU lease (`--force-lease`).

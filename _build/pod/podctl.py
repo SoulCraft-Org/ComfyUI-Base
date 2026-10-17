@@ -75,7 +75,8 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "save_port_names", "names_template", "template_state", "http_ports", "jupyter_token", "proxy_url",   # 3.9.0
            "link_token", "named_volumes", "DEFAULT_VOLUME_NAME",                                               # 3.14.0
            "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB",                                            # 3.18.0
-           "REF_VARS", "env_ref", "env_refs", "refs_line", "DEFAULT_API_V2_URL"):                  # 3.19.0
+           "REF_VARS", "env_ref", "env_refs", "refs_line", "DEFAULT_API_V2_URL",                   # 3.19.0
+           "stock_count", "count_rows", "COUNT_FIELDS", "pod_rate", "pods_spend", "unit_price"):   # 3.20.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -603,22 +604,41 @@ def gpu_verdict(total, used, apps):
     return ours, foreign, ("ours" if foreign <= GPU_FOREIGN_LIMIT_MIB else "NOT-OURS")
 
 
+def gpu_verdict_many(cards, apps):
+    """3.20.0, py/gpu_facts.py's verdict_many: each card judged by its own processes (by uuid), the sums, one bad card bad."""
+    if len(cards) <= 1 or not all(c[2] for c in cards):
+        total, used = (cards[0][0], cards[0][1]) if cards else (0, 0)
+        return (total, used) + gpu_verdict(total, used, [(p, m) for p, m, _ in apps])
+    sums, bad = [0, 0, 0, 0], False
+    for total, used, uuid in cards:
+        ours, foreign, v = gpu_verdict(total, used, [(p, m) for p, m, u in apps if u == uuid])
+        for i, n in enumerate((total, used, ours, foreign)):
+            sums[i] += n
+        bad = bad or v != "ours"
+    return tuple(sums) + ("NOT-OURS" if bad else "ours",)
+
+
 def gpu_probe(io):
-    """(line, verdict) from the pod: 'verdict=no-gpu' when nvidia-smi does not answer (a GPU-less pod, or the stand-in)."""
-    rc, out, err = io.remote("nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null; echo ---; "
-                             "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null")
+    """(line, verdict) from the pod: 'verdict=no-gpu' when nvidia-smi does not answer (a GPU-less pod, or the stand-in).
+    3.20.0: every card of a multi-GPU pod, each judged by its own processes (gpu_verdict_many)."""
+    rc, out, err = io.remote("nvidia-smi --query-gpu=memory.total,memory.used,uuid --format=csv,noheader,nounits 2>/dev/null; echo ---; "
+                             "nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid --format=csv,noheader,nounits 2>/dev/null")
     head, _, tail = (out or "").partition("---")
-    nums = [x.strip() for x in head.strip().splitlines()[0].split(",")] if head.strip() else []
-    if rc != 0 or len(nums) < 2 or not all(n.isdigit() for n in nums[:2]):
+    cards = []
+    for line in head.strip().splitlines():
+        nums = [x.strip() for x in line.split(",")]
+        if len(nums) >= 2 and all(n.isdigit() for n in nums[:2]):
+            cards.append((int(nums[0]), int(nums[1]), nums[2] if len(nums) > 2 else ""))
+    if rc != 0 or not cards:
         return "verdict=no-gpu", "no-gpu"
-    total, used = int(nums[0]), int(nums[1])
     apps = []
     for line in tail.splitlines():
         parts = [x.strip() for x in line.split(",")]
         if len(parts) >= 2 and parts[0].isdigit():
-            apps.append((int(parts[0]), int(parts[1]) if parts[1].isdigit() else 0))
-    ours, foreign, v = gpu_verdict(total, used, apps)
-    return "total=%d used=%d ours=%d foreign=%d procs=%d verdict=%s" % (total, used, ours, foreign, len(apps), v), v
+            apps.append((int(parts[0]), int(parts[1]) if parts[1].isdigit() else 0, parts[2] if len(parts) > 2 else ""))
+    total, used, ours, foreign, v = gpu_verdict_many(cards, apps)
+    many = (" gpus=%d" % len(cards)) if len(cards) > 1 else ""
+    return "total=%d used=%d ours=%d foreign=%d procs=%d%s verdict=%s" % (total, used, ours, foreign, len(apps), many, v), v
 
 
 def gpu_gate(io, say, uploading=True):
@@ -1890,6 +1910,24 @@ def gpu_line_over_ssh():
     return "\n".join(lines)
 
 
+def servers_line(listing):
+    """3.20.0: state/servers.list (`index|port|gpu` per server) as one status line; None for one server or none."""
+    rows = [l.strip().split("|") for l in (listing or "").splitlines() if l.strip().count("|") == 2]
+    if len(rows) < 2:
+        return None
+    return "servers  %d, one per GPU: %s (8188 is the one the links open; the others answer on the machine's loopback)" % (
+        len(rows), " · ".join("GPU %s :%s" % (g or "?", p) for _, p, g in rows))
+
+
+def servers_line_over_ssh():
+    """servers_line from the machine, best-effort: no answer is no line."""
+    try:
+        r = ssh_run("cat %s/state/servers.list 2>/dev/null; true" % REMOTE_HOME, timeout=20)
+    except Exception:
+        return None
+    return servers_line(r.stdout) if r.returncode == 0 else None
+
+
 def status_links(prov, pod, declared, machine=None, link=None):
     """3.9.0: the named links a status prints for a pod its host proxies: [lines]. machine is (token, apps) read over
     ssh, or None. The pod's own JUPYTER_TOKEN wins over the machine's saved one. 3.14.0 link: the machine's saved key;
@@ -1927,6 +1965,9 @@ def cmd_status(prov, args):
     for line in status_links(prov, pod, declared, machine, link=link):
         print(line)
     print(gpu_line_over_ssh())
+    line = servers_line_over_ssh()
+    if line:
+        print(line)
 
 
 def cmd_pods(prov, args):
@@ -1993,10 +2034,49 @@ def balance_line(b, lag_min, floor=None):
     if spend is None:
         return line + " (this host states no spend rate, so nothing is projected)"
     p = projected_balance(b, lag_min)
-    line += " · spending %.2f/h · projected %.2f (%g min of spend not booked yet taken off)" % (spend, p, float(lag_min))
+    line += " · spending %.2f/h%s · projected %.2f (%g min of spend not booked yet taken off)" % (
+        spend, " (the running pods at N x their GPU's price: above RunPod's own figure)" if b.get("pods_spend_per_hr") else "", p, float(lag_min))
     if floor is not None and spend > 0 and p > floor:
         line += " · %.1f h to the %.2f floor" % ((p - floor) / spend, floor)
     return line
+
+
+def money_guard(prov, gpu, n=1, location=None, spot=False, floor=GUARD_FLOOR, lag_min=BALANCE_LAG_MIN, say=print):
+    """3.20.0: before a pod is created, what it costs an hour (the host's own price for N x the GPU), what RAM and vCPUs
+    come with it, and whether the projected balance carries it. 1 (refused) when the balance, past the host's booking lag
+    and above `floor` (podctl guard's), covers less than ONE hour of today's spend plus this pod: N GPUs spend N times as
+    fast, and a pod with no network volume is terminated at $0. 0 otherwise, also when the host states no price or no
+    balance (said, never a reason to have no pod). A host with no price at all (no `price`) prints nothing."""
+    if not hasattr(prov, "price"):
+        return 0
+    try:
+        p = prov.price(gpu, n, location, spot=spot)
+    except Exception as e:                             # a price is a projection; it never blocks a pod by being unreadable
+        say("price   unreadable (%s): nothing projected" % e); return 0
+    if not p:
+        say("price   %s names no price for %d x %s%s: nothing projected" % (getattr(prov, "name", "the host"), n, gpu,
+                                                                          (" in %s" % location) if location else "")); return 0
+    ram, cpu = p.get("ram_gb"), p.get("vcpu")
+    with_it = (" · %s GB RAM, %s vCPU (%s GB, %s vCPU per GPU)" % (ram, cpu, int(ram) // n if isinstance(ram, int) else "?",
+                                                                  int(cpu) // n if isinstance(cpu, int) else "?")) if ram or cpu else ""
+    say("price   %d x %s = %.2f/h (%.2f per GPU%s)%s" % (n, gpu, p["per_hr"], p["per_hr"] / n, ", spot" if spot else "", with_it))
+    if not hasattr(prov, "balance"):
+        return 0
+    try:
+        b = prov.balance()
+        proj = projected_balance(b, lag_min)
+    except Exception as e:
+        say("money   the balance is unreadable (%s): nothing projected" % e); return 0
+    now = b.get("spend_per_hr") or 0.0
+    rate = now + p["per_hr"]
+    hours = (proj - floor) / rate
+    say("money   projected balance %.2f · spending %.2f/h now, %.2f/h with this pod · %.1f h to the %.2f floor" % (
+        proj, now, rate, max(hours, 0.0), floor))
+    if hours < 1.0:
+        say("STOP: the projected balance %.2f covers under one hour at %.2f/h above the %.2f floor (podctl guard stops every "
+            "pod there): top up first" % (proj, rate, floor))
+        return 1
+    return 0
 
 
 def cmd_balance(prov, args):
@@ -2052,6 +2132,12 @@ def cmd_create(prov, args):
     if public and getattr(args, "private", False):
         raise PodctlError("--public and --private contradict each other: a pod is public unless --private")
     private = bool(getattr(args, "private", False))
+    # 3.20.0: N GPUs on one pod, one ComfyUI on each (the boot's). The stock check asks for N of them, the price is N x.
+    n = int(getattr(args, "gpus", None) or 1)
+    if not 1 <= n <= 8:
+        raise PodctlError("--gpus %d: a pod has 1 to 8 GPUs" % n)
+    if n > 1 and "count" not in inspect.signature(prov.availability).parameters:
+        raise PodctlError("--gpus: not offered by host %s" % getattr(prov, "name", "?"))
     if private and volume:
         raise PodctlError("--volume is a network volume, and a private pod keeps its data on its own pod volume instead: drop "
                           "--volume for a pod volume of --data-gb, or drop --private to put this pod on the network volume")
@@ -2100,9 +2186,10 @@ def cmd_create(prov, args):
     for gpu in gpus:
         # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one;
         # 3.18.0: a fresh pod makes none (and a reusable volume's data centre takes them), so then every one counts
-        locs = (prov.availability(gpu, spot=args.spot, volume=not private and not can_fresh) if takes_volume
-                else prov.availability(gpu, spot=args.spot))
-        print("stock   %s%s free now in: %s" % (gpu, spot, ", ".join(locs) if locs else "no location"))
+        many = {"count": n} if n > 1 else {}
+        locs = (prov.availability(gpu, spot=args.spot, volume=not private and not can_fresh, **many) if takes_volume
+                else prov.availability(gpu, spot=args.spot, **many))
+        print("stock   %s%s%s free now in: %s" % (("%d x " % n) if n > 1 else "", gpu, spot, ", ".join(locs) if locs else "no location"))
         for dc, why in getattr(prov, "skipped", None) or []:
             print("stock   %s%s also free in %s, left out: %s" % (gpu, spot, dc, why))
         seen.append((gpu, locs))
@@ -2138,9 +2225,12 @@ def cmd_create(prov, args):
     if fresh:
         print("volume  none: a fresh pod in %s on a %d GB pod volume (%s); the models download again" % (
             loc, int(fresh_gb), ("%s is only in %s" % (vname, ", ".join(sorted(reuse)))) if reuse else "no %s to reuse" % vname))
+    if money_guard(prov, args.gpu, n, loc, spot=args.spot):     # 3.20.0: before anything is made or billed
+        return 1
     pub = pathlib.Path(args.pubkey).read_text(encoding="utf-8").strip() if args.pubkey else None
     extra = {k: v for k, v in (("image", getattr(args, "image", None)), ("volume", volume), ("min_cuda", getattr(args, "min_cuda", None)), ("private", private),
-                               ("pod_gb", int(fresh_gb) if fresh else None), ("lock", bool(getattr(args, "lock", False)))) if v}
+                               ("pod_gb", int(fresh_gb) if fresh else None), ("lock", bool(getattr(args, "lock", False))),
+                               ("gpus", n if n > 1 else None)) if v}
     if not private and not volume and not fresh and "volume_name" in inspect.signature(prov.create_machine).parameters:
         extra["volume_name"] = vname                    # 3.14.0: the new volume gets the name the next create reuses
     takes = inspect.signature(prov.create_machine).parameters
@@ -2291,6 +2381,9 @@ def build_parser():
     p.add_argument("--image", help="the machine image (RunPod: required, the container image)")
     p.add_argument("--min-cuda", dest="min_cuda", help="RunPod: the lowest host CUDA the pod accepts, e.g. 13.0 (default: the image tag's, never below 13.0)")
     p.add_argument("--os-gb", dest="os_gb", type=int, default=100, help="Verda: the OS volume; RunPod: the container disk (default 100)")
+    p.add_argument("--gpus", type=int, default=1, help="RunPod (3.20.0): GPUs on the pod, 1 to 8 (default 1). The boot runs one "
+                   "ComfyUI on each (8188 is GPU 0's; the others on the pod's loopback, 18189 and up, for a package's runner), "
+                   "the stock check asks for that many and the price is that many times one")
     p.add_argument("--lock", action="store_true", help="RunPod (3.19.1): lock every Connect link with the pod's own key "
                    "(BASE_LINK_LOCK=1; the printed links carry it once, then a cookie) and JupyterLab with a token. Without "
                    "it the links open on one click, as RunPod's proxy URLs do")

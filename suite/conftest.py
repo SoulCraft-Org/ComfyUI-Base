@@ -19,6 +19,10 @@ KEYCHAIN_TRIPWIRE = pathlib.Path(tempfile.mkdtemp(prefix="base-keychain-tripwire
 (KEYCHAIN_TRIPWIRE / "security").write_text('#!/bin/sh\nprintf \'%%s\\n\' "$*" >> "%s/calls"\nexit 44\n' % KEYCHAIN_TRIPWIRE)
 (KEYCHAIN_TRIPWIRE / "security").chmod(0o755)
 os.environ["PATH"] = str(KEYCHAIN_TRIPWIRE) + os.pathsep + os.environ.get("PATH", "")
+# 3.20.0: one ComfyUI per GPU. The suite runs with ONE server unless a test asks for more (the servers tests drop it and
+# bring their own nvidia-smi), so a multi-GPU pod running the suite, or a runner whose environment names GPUs, tests the
+# same launch line as a Mac.
+os.environ["BASE_SERVERS"] = "1"
 
 
 def pytest_sessionfinish(session, exitstatus):

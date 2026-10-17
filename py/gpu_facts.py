@@ -4,7 +4,9 @@ processes: memory used that no visible process holds belongs to another containe
 Renders then die at their first node with the card idle — 2026-09-06, pod fakepod0000003: 95.3 GB of 97.9 used, 0 %
 utilisation, our ComfyUI holding 1.7 GB, 93.5 GB held outside (2.0.26). Every check before that had passed.
 
-Prints one line:  total=<MiB> used=<MiB> ours=<MiB> foreign=<MiB> procs=<n> verdict=ours|NOT-OURS|no-gpu
+Prints one line:  total=<MiB> used=<MiB> ours=<MiB> foreign=<MiB> procs=<n> [gpus=<n>] verdict=ours|NOT-OURS|no-gpu
+3.20.0: on several GPUs (one ComfyUI on each) every card is judged by ITS OWN processes (nvidia-smi's uuid ties a process
+to its card), the numbers are the cards' sums, and one card with foreign memory makes the verdict NOT-OURS.
 Exit 0 always; the caller reads the verdict. Standalone: no torch, no imports beyond the standard library."""
 import subprocess, sys
 
@@ -16,6 +18,21 @@ def verdict(total, used, apps):
     ours = sum(m for _, m in apps)
     foreign = max(0, used - ours)
     return ours, foreign, ("ours" if foreign <= FOREIGN_LIMIT_MIB else "NOT-OURS")
+
+
+def verdict_many(cards, apps):
+    """3.20.0: ([(total, used, uuid)…], [(pid, MiB, uuid)…]) → (total, used, ours, foreign, verdict) summed over the cards,
+    each card judged by its own processes. One card, or an nvidia-smi that names no uuid: verdict() over every process."""
+    if len(cards) <= 1 or not all(c[2] for c in cards):
+        total, used = (cards[0][0], cards[0][1]) if cards else (0, 0)
+        return (total, used) + verdict(total, used, [(p, m) for p, m, _ in apps])
+    sums, bad = [0, 0, 0, 0], False
+    for total, used, uuid in cards:
+        ours, foreign, v = verdict(total, used, [(p, m) for p, m, u in apps if u == uuid])
+        for i, n in enumerate((total, used, ours, foreign)):
+            sums[i] += n
+        bad = bad or v != "ours"
+    return tuple(sums) + ("NOT-OURS" if bad else "ours",)
 
 
 def _query(args):
@@ -32,24 +49,29 @@ def parse_int(s):
 
 
 def facts():
-    mem = _query(["--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"])
+    mem = _query(["--query-gpu=memory.total,memory.used,uuid", "--format=csv,noheader,nounits"])
     if not mem or not mem.strip():
         return None
-    total, used = [parse_int(x) for x in mem.strip().splitlines()[0].split(",")[:2]]
+    cards = []
+    for line in mem.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2:
+            cards.append((parse_int(parts[0]), parse_int(parts[1]), parts[2] if len(parts) > 2 else ""))
     apps = []
-    for line in (_query(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]) or "").splitlines():
+    for line in (_query(["--query-compute-apps=pid,used_memory,gpu_uuid", "--format=csv,noheader,nounits"]) or "").splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) >= 2 and parts[0].isdigit():
-            apps.append((int(parts[0]), parse_int(parts[1])))
-    ours, foreign, v = verdict(total, used, apps)
-    return {"total": total, "used": used, "ours": ours, "foreign": foreign, "procs": len(apps), "verdict": v}
+            apps.append((int(parts[0]), parse_int(parts[1]), parts[2] if len(parts) > 2 else ""))
+    total, used, ours, foreign, v = verdict_many(cards, apps)
+    return {"total": total, "used": used, "ours": ours, "foreign": foreign, "procs": len(apps), "gpus": len(cards), "verdict": v}
 
 
 def main():
     f = facts()
     if f is None:
         print("verdict=no-gpu"); return 0
-    print("total=%d used=%d ours=%d foreign=%d procs=%d verdict=%s" % (f["total"], f["used"], f["ours"], f["foreign"], f["procs"], f["verdict"]))
+    print("total=%d used=%d ours=%d foreign=%d procs=%d%s verdict=%s" % (f["total"], f["used"], f["ours"], f["foreign"], f["procs"],
+                                                                        (" gpus=%d" % f["gpus"]) if f["gpus"] > 1 else "", f["verdict"]))
     return 0
 
 

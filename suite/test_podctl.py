@@ -824,6 +824,8 @@ def test_unit_podctl_install_refuses_a_gpu_that_is_not_ours(tmp_path, monkeypatc
     sys.path.insert(0, str(BASE / "py")); import gpu_facts
     assert podctl.gpu_verdict(97887, 95258, [(1903, 1698)]) == gpu_facts.verdict(97887, 95258, [(1903, 1698)])
     assert podctl.gpu_verdict(97887, 620, []) == gpu_facts.verdict(97887, 620, [])
+    cards, apps = [(183000, 90000, "GPU-a"), (183000, 91000, "GPU-b")], [(11, 89500, "GPU-a")]      # 3.20.0: per card
+    assert podctl.gpu_verdict_many(cards, apps) == gpu_facts.verdict_many(cards, apps) == (366000, 181000, 89500, 91500, "NOT-OURS")
 
 
 def test_unit_podctl_install_warns_when_the_pod_gpu_is_below_a_packages_gpu_prefer(tmp_path, monkeypatch, capsys):
@@ -1757,8 +1759,8 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
         out = capsys.readouterr().out
     finally:
         srv.close()
-    assert srv.posts == ["/graphql", "/networkvolumes", "/pods"], srv.posts
-    vol, body = srv.bodies[1][1], srv.bodies[2][1]
+    assert srv.posts == ["/graphql", "/graphql", "/networkvolumes", "/pods"], srv.posts      # 3.20.0: the stock, then the price
+    vol, body = srv.bodies[2][1], srv.bodies[3][1]
     assert vol == {"name": "comfy-base-data", "size": 500, "dataCenterId": "EU-RO-1"}     # 3.14.0: the name the next create reuses
     assert body["cloudType"] == "SECURE" and body["dataCenterIds"] == ["EU-RO-1"] and body["networkVolumeId"] == "newvol1"
     assert body["volumeMountPath"] == "/workspace" and body["ports"] == ["8188/http", "8888/http", "22/tcp"]
@@ -1879,6 +1881,65 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
     assert podctl.create_floor("x/y:cu128", "12.8") == "12.8"
 
 
+def test_unit_runpod_create_gpus_asks_for_that_many_and_projects_the_price(tmp_path, capsys):
+    """3.20.0: `create --gpus N` puts N GPUs on the pod (the boot runs one ComfyUI on each). The stock check keeps only the
+    data centres where N are free (lowestPrice with the count, one query for every candidate), the price is RunPod's for
+    the N, the RAM and vCPUs are said, and the money guard refuses before anything is made when the projected balance
+    covers under one hour of today's spend plus this pod."""
+    podctl = _load()
+    pub = tmp_path / "id.pub"; pub.write_text("ssh-ed25519 AAAAMAC mac@key\n")
+    row = {"stockStatus": "Low", "uninterruptablePrice": 15.98, "minimumBidPrice": 9.0, "minMemory": 502, "minVcpu": 48}
+    gql = dict(B200_STOCK, gpuTypes=[{"dc_EU_RO_1": None, "dc_US_CA_2": row, "lowestPrice": row}],
+               myself={"clientBalance": 100.0, "currentSpendPerHr": 2.0, "spendLimit": None})
+    srv = FakeRunPod(_pod(), gql=gql)
+    try:
+        assert _create(podctl, srv, pub, "--data-gb", "500", "--gpus", "2") in (None, 0)
+        out = capsys.readouterr().out
+        body = srv.bodies[-1][1]
+        assert body["gpuCount"] == 2 and body["dataCenterIds"] == ["US-CA-2"], body
+        assert "stock   2 x NVIDIA B200 free now in: US-CA-2" in out, out
+        assert "also free in EU-RO-1, left out: NVIDIA B200 is free there, but not 2 of them" in out, out
+        assert "price   2 x NVIDIA B200 = 15.98/h (7.99 per GPU) · 502 GB RAM, 48 vCPU (251 GB, 24 vCPU per GPU)" in out, out
+        # projected 100 - 2.00/h x 30 min = 99; (99 - 5) / (2 + 15.98) = 5.2 h
+        assert "money   projected balance 99.00 · spending 2.00/h now, 17.98/h with this pod · 5.2 h to the 5.00 floor" in out, out
+        assert "NVIDIA B200 × 2 · US-CA-2" in out, out
+        queries = [b.get("query", "") for p, b in srv.bodies if p == "/graphql" and isinstance(b, dict)]
+        assert any('dc_EU_RO_1: lowestPrice(input:{gpuCount:2, secureCloud:true, dataCenterId:"EU-RO-1"})' in q and "dc_US_CA_2:" in q for q in queries), queries
+        # one GPU (the default) still asks the stock view alone, and its body says 1
+        assert _create(podctl, srv, pub, "--data-gb", "500") in (None, 0)
+        out = capsys.readouterr().out
+        assert srv.bodies[-1][1]["gpuCount"] == 1 and "price   1 x NVIDIA B200 = 15.98/h" in out, out
+        # a balance that covers under an hour: STOP before the volume or the pod is made
+        srv.gql["myself"] = {"clientBalance": 20.0, "currentSpendPerHr": 0.0, "spendLimit": None}
+        n = len(srv.bodies)
+        assert _create(podctl, srv, pub, "--data-gb", "500", "--gpus", "2") == 1
+        out = capsys.readouterr().out
+        assert "STOP: the projected balance 20.00 covers under one hour at 15.98/h above the 5.00 floor" in out, out
+        assert [p for p, _ in srv.bodies[n:] if p != "/graphql"] == [], "a STOP makes nothing"
+        with pytest.raises(podctl.PodctlError):
+            _create(podctl, srv, pub, "--data-gb", "500", "--gpus", "9")
+    finally:
+        srv.close()
+    assert podctl.servers_line("0|8188|0\n1|18189|1\n") == ("servers  2, one per GPU: GPU 0 :8188 · GPU 1 :18189 (8188 is the one "
+                                                          "the links open; the others answer on the machine's loopback)")
+    assert podctl.servers_line("0|8188|0\n") is None and podctl.servers_line("") is None
+
+
+def test_unit_create_gpus_is_refused_by_a_host_that_cannot_count(tmp_path):
+    """--gpus 2 on a host whose stock check takes no count is refused by name, before anything is asked or made."""
+    podctl = _load()
+    class OneGpu:
+        name = "onegpu"
+        default_gpus = ("G",)
+        def availability(self, gpu, spot=False): return ["FIN-01"]
+        def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True, ssh_config=None, say=print):
+            raise AssertionError("never reached")
+    args = podctl.build_parser().parse_args(["create", "--name", "x", "--data-gb", "10", "--gpus", "2", "--no-wait"])
+    with pytest.raises(podctl.PodctlError) as e:
+        podctl.cmd_create(OneGpu(), args)
+    assert "--gpus: not offered by host onegpu" in str(e.value)
+
+
 def test_unit_runpod_create_order_goes_past_b300_and_says_what_each_gpu_means():
     """3.18.0 (Paul, 2026-10-16: rendering speed first, his order): B200, B300, H200, H100, RTX PRO 6000, RunPod's exact
     ids (the SXM H100 and H200, the PRO 6000 Server Edition, never a MIG slice), and a note for each GPU past the B200."""
@@ -1966,6 +2027,34 @@ def test_unit_balance_is_projected_past_the_lag_and_guard_stops_running_pods_at_
         srv.close()
 
 
+def test_unit_balance_spend_is_never_below_the_running_pods_at_n_times_the_price(tmp_path, capsys):
+    """3.20.0: every projection (podctl balance, guard, create's money guard) reads balance()'s spend, and that spend is
+    never below what the running pods cost at gpuCount x their GPU's list price (gpuTypes.securePrice). A 2-GPU pod whose
+    record counts one GPU's price, or that RunPod's figure has not caught up with yet, is projected at 2 x the price."""
+    podctl = _load()
+    me = {"clientBalance": 30.0, "currentSpendPerHr": 7.99, "spendLimit": 80}
+    def gql(body):
+        q = body.get("query") or ""
+        return {"myself": dict(me)} if "myself" in q else ({"gpuTypes": [{"securePrice": 7.99}]} if "securePrice" in q else {})
+    srv = FakeRunPod(_pod(name="Two", gpu={"id": "NVIDIA B200", "count": 2}, gpuCount=2, costPerHr=7.99), gql=gql)
+    prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    try:
+        b = prov.balance()
+        assert b["spend_per_hr"] == 15.98 and b["pods_spend_per_hr"] == 15.98, b          # 2 x 7.99, not RunPod's 7.99
+        assert podctl.projected_balance(b, 30) == 30.0 - 15.98 / 2
+        podctl.cmd_balance(prov, podctl.build_parser().parse_args(["balance"]))
+        assert "spending 15.98/h (the running pods at N x their GPU's price" in capsys.readouterr().out
+        srv.pod["costPerHr"] = 15.98                                                      # a record that counts both: no double count
+        assert prov.balance()["spend_per_hr"] == 15.98
+        me["currentSpendPerHr"] = 20.0                                                    # RunPod's figure above the pods' (a volume too): it stands
+        assert prov.balance() == {"amount": 30.0, "currency": "USD", "spend_per_hr": 20.0, "spend_limit": 80}
+        srv.pod["desiredStatus"] = "EXITED"; me["currentSpendPerHr"] = 0.1                # a stopped pod costs nothing here
+        assert prov.balance()["spend_per_hr"] == 0.1
+    finally:
+        srv.close()
+    assert podctl.pod_rate(None, {"costPerHr": 3.0}) == 3.0, "no GPU named: the record's own rate"
+
+
 def test_unit_create_flags_a_host_does_not_take_are_refused_by_name(tmp_path):
     """Verda's create_machine takes no --volume or --min-cuda: a clear refusal, never a TypeError traceback."""
     podctl = _load()
@@ -2031,7 +2120,7 @@ def test_unit_runpod_create_private_is_an_unencrypted_pod_volume_behind_ssh_only
         assert "drop --private" in str(e.value) and srv.posts == [] and srv.gets == []
         assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
         out = capsys.readouterr().out
-        assert srv.posts == ["/graphql", "/pods"], srv.posts                   # no network volume is made
+        assert srv.posts == ["/graphql", "/graphql", "/pods"], srv.posts       # no network volume is made (3.20.0: the price read)
         body = srv.bodies[-1][1]
         assert "networkVolumeId" not in body and body["volumeInGb"] == 200 and "volumeEncrypted" not in body, body
         assert set(body) <= POD_CREATE_INPUT, sorted(set(body) - POD_CREATE_INPUT)
@@ -2077,7 +2166,7 @@ def test_unit_runpod_create_is_public_unless_private(tmp_path, capsys):
     try:
         assert create("--data-gb", "300") in (None, 0)
         body = srv.bodies[-1][1]
-        assert srv.posts == ["/graphql", "/networkvolumes", "/pods"] and "8188/http" in body["ports"], (srv.posts, body)
+        assert srv.posts == ["/graphql", "/graphql", "/networkvolumes", "/pods"] and "8188/http" in body["ports"], (srv.posts, body)
         assert body["cloudType"] == "SECURE" and body["gpuTypeIds"] == ["NVIDIA B200"] and "BASE_LISTEN" not in body["env"]
         assert "BASE_LINK_TOKEN" not in body["env"] and "token=" not in capsys.readouterr().out      # 3.19.1: open by default
         assert create("--data-gb", "300", "--lock") in (None, 0)                                     # the opt-in
