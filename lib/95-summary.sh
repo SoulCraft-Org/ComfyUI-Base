@@ -115,10 +115,11 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
   fi
   _base_models_early_start || true     # 3.11.0: the model downloads run beside everything from here to the model stage
   _base_tools_start || true            # 3.11.0: and JupyterLab's tools venv, joined at the BOOT stage
+  _base_cuda_toolchain_start || true   # 3.22.0: and the cuBLAS probe with its apt install (lib/40-packs.sh)
   base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)
   _base_hook pkg_pre_venv
   if ! base_venv; then err "the venv step failed — stopping before anything else changes"; base_summary; fi
-  base_cuda_toolchain || true          # before the hook that builds, so a broken toolkit is named (and fixed) up front
+  _base_cuda_toolchain_join || true    # before the hook that builds, so a broken toolkit is named (and fixed) up front
   _base_hook pkg_post_venv
   base_own_packs || true               # 3.2.0: mirrored before the resolve, so an own pack's requirements file is in it
   base_packs pip || true

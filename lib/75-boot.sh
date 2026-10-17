@@ -167,7 +167,7 @@ _base_tools_start(){ # → 0 when the tools venv now builds in the background
       printf 'BASE_TOOLS_RESULT=%q\n' "${BASE_TOOLS_RESULT:-}"
       printf '_t_changed=('; for x in ${BASE_CHANGED[@]+"${BASE_CHANGED[@]:$nc}"}; do printf ' %q' "$x"; done; printf ' )\n'
       printf '_t_warn=('; for x in ${BASE_WARN[@]+"${BASE_WARN[@]:$nw}"}; do printf ' %q' "$x"; done; printf ' )\n'
-      printf '_t_secs=%q\n' "$(( SECONDS - t0 ))"
+      printf '_t_t0=%q\n_t_secs=%q\n' "$t0" "$(( SECONDS - t0 ))"
     } > "$dir/vars.sh"
   ) > "$dir/out" 2>&1 &
   _BASE_TOOLS_PID=$!
@@ -175,7 +175,7 @@ _base_tools_start(){ # → 0 when the tools venv now builds in the background
 }
 _base_tools_join(){ # → 0 when a background build was joined (its output shown, its results in this run); 1 when there was none
   [ -n "$_BASE_TOOLS_PID" ] || return 1
-  local _t_changed=() _t_warn=() _t_secs=0 x
+  local _t_changed=() _t_warn=() _t_t0=0 _t_secs=0 x
   wait "$_BASE_TOOLS_PID" 2>/dev/null || true
   _BASE_TOOLS_PID=""
   cat "$_BASE_TOOLS_DIR/out" 2>/dev/null || true
@@ -184,6 +184,7 @@ _base_tools_join(){ # → 0 when a background build was joined (its output shown
   for x in ${_t_changed[@]+"${_t_changed[@]}"}; do BASE_CHANGED+=("$x"); done
   for x in ${_t_warn[@]+"${_t_warn[@]}"}; do BASE_WARN+=("$x"); done
   BASE_STAGE_TIMES+=("$_t_secs|TOOLS VENV (in the background)")
+  _base_span "$_t_t0" "$(( _t_t0 + _t_secs ))" "TOOLS VENV (in the background)"
   return 0
 }
 _base_tools_stop(){ [ -n "${_BASE_TOOLS_PID:-}" ] || return 0; _base_kill_tree "$_BASE_TOOLS_PID"; _BASE_TOOLS_PID=""; }

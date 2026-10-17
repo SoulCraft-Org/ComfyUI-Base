@@ -729,7 +729,9 @@ def item_for_zip(zip_path, logs=None):
 class PodIO:
     """The real pod: ssh (no forwards), scp, the packager. `say` prints progress lines."""
     def __init__(self, api, pod, env=None, packager=None):
+        import time
         self.api, self.pod, self.env = api, pod, env or os.environ
+        self._t0 = time.monotonic()        # 3.22.0: PODCTL_TIMES=1 stamps each line from here
         self.provider = api if isinstance(api, Provider) else RunPodProvider(api)      # an Api is RunPod's; a provider is any host's
         self.packager = packager or (pathlib.Path(__file__).resolve().parents[1] / "package.py")
     def check_zip(self, d):
@@ -869,7 +871,17 @@ class PodIO:
         import time
         time.sleep(s)
     def say(self, *a):
-        print(*a, flush=True)
+        print(*(_stamp(self.env, getattr(self, "_t0", None)) + list(a)), flush=True)
+
+
+def _stamp(env, t0):
+    """3.22.0: PODCTL_TIMES=1 → ["[15:00:06Z +46.2s]"] (UTC wall time and seconds since the PodIO was made), so the Mac's
+    half of an install (lease, uploads, preflight, the poll that sees STEP RC) lines up with the pod's own timeline.tsv;
+    otherwise []. Off by default: every caller that parses podctl's lines reads them unchanged."""
+    import datetime, time
+    if (env or {}).get("PODCTL_TIMES") != "1" or t0 is None:
+        return []
+    return ["[%sZ +%.1fs]" % (datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"), time.monotonic() - t0)]
 
 
 def _tail(text, n=25):

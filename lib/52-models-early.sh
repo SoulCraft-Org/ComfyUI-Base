@@ -97,7 +97,7 @@ _base_models_early_start(){ # → 0 when the downloads now run in the background
   # this one into the same bootstrap venv
   if [ "$BASE_NO_NET" != "1" ] && ! _base_ensure_uv; then return 1; fi
   _base_tmp; _BASE_EARLY_DIR="$BASE_TMPD/models-early"; mkdir -p "$_BASE_EARLY_DIR"
-  local dir="$_BASE_EARLY_DIR" nw="${#BASE_WARN[@]}"
+  local dir="$_BASE_EARLY_DIR" nw="${#BASE_WARN[@]}" nf="${#BASE_FILE_SPANS[@]}"
   (
     trap - ERR EXIT; set +e
     export TMPDIR="$dir"                               # every temp dir it makes is inside the run's own, removed with it
@@ -108,7 +108,8 @@ _base_models_early_start(){ # → 0 when the downloads now run in the background
       printf '_e_dests=('; for x in ${_BASE_EARLY_GOT[@]+"${_BASE_EARLY_GOT[@]}"}; do printf ' %q' "$x"; done; printf ' )\n'
       printf '_e_bad=('; for x in ${_BASE_EARLY_BAD[@]+"${_BASE_EARLY_BAD[@]}"}; do printf ' %q' "$x"; done; printf ' )\n'
       printf '_e_warn=('; for x in ${BASE_WARN[@]+"${BASE_WARN[@]:$nw}"}; do printf ' %q' "$x"; done; printf ' )\n'
-      printf '_e_bytes=%q\n_e_time=%q\n_e_gb=%q\n_e_secs=%q\n' "$BASE_DL_BYTES" "$BASE_DL_TIME" "$MODEL_DL_GB" "$(( SECONDS - t0 ))"
+      printf '_e_spans=('; for x in ${BASE_FILE_SPANS[@]+"${BASE_FILE_SPANS[@]:$nf}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_e_bytes=%q\n_e_time=%q\n_e_gb=%q\n_e_t0=%q\n_e_secs=%q\n' "$BASE_DL_BYTES" "$BASE_DL_TIME" "$MODEL_DL_GB" "$t0" "$(( SECONDS - t0 ))"
     } > "$dir/vars.sh"
   ) > "$dir/out" 2>&1 &
   _BASE_EARLY_PID=$!
@@ -118,7 +119,7 @@ _base_models_early_start(){ # → 0 when the downloads now run in the background
 _base_models_early_join(){ # before the model stage: wait for the early downloads, show their output, and fold what they got in
   [ -n "$_BASE_EARLY_PID" ] || return 0
   hdr "MODELS · joining the downloads started beside the venv build"     # its seconds are how long the downloads outlasted the venv
-  local _e_dl=() _e_dests=() _e_bad=() _e_warn=() _e_bytes=0 _e_time=0 _e_gb=0 _e_secs=0 x
+  local _e_dl=() _e_dests=() _e_bad=() _e_warn=() _e_spans=() _e_bytes=0 _e_time=0 _e_gb=0 _e_t0=0 _e_secs=0 x
   if kill -0 "$_BASE_EARLY_PID" 2>/dev/null; then note "the venv is done; waiting for the downloads"; fi
   wait "$_BASE_EARLY_PID" 2>/dev/null || true
   _BASE_EARLY_PID=""
@@ -129,8 +130,10 @@ _base_models_early_join(){ # before the model stage: wait for the early download
   for x in ${_e_dests[@]+"${_e_dests[@]}"}; do _BASE_EARLY_DESTS+=("$x"); done
   for x in ${_e_bad[@]+"${_e_bad[@]}"}; do _BASE_EARLY_FAILED+=("$x"); done
   for x in ${_e_warn[@]+"${_e_warn[@]}"}; do BASE_WARN+=("$x"); done
+  for x in ${_e_spans[@]+"${_e_spans[@]}"}; do BASE_FILE_SPANS+=("$x"); done
   BASE_DL_BYTES=$(( BASE_DL_BYTES + _e_bytes )); BASE_DL_TIME=$(( BASE_DL_TIME + _e_time )); MODEL_DL_GB="$(_base_add_gb "$MODEL_DL_GB" "$_e_gb")"
   BASE_STAGE_TIMES+=("$_e_secs|MODELS (in the background, beside the venv build)")
+  _base_span "$_e_t0" "$(( _e_t0 + _e_secs ))" "MODELS (in the background, beside the venv build)"
   if [ "${#_e_bad[@]}" -gt 0 ]; then note "${#_e_bad[@]} early download(s) failed after their attempts (above): the model stage fails the run by their names"; fi
   return 0
 }

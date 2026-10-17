@@ -308,8 +308,9 @@ _base_curl_dl(){ # <staged file> <url> [curl args] — the GitHub leg: curl, res
   tail -3 "$out"; rm -f "$out"; return 1
 }
 _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets BASE_DL_SECS
-  local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS rfile=""
+  local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS rfile="" tv
   base="$(basename "$dest")"; stage="$STAGING/$base.d"; mkdir -p "$stage"
+  BASE_VERIFY_SECS=0                                # 3.22.0: how long the sha256 re-read took (the timeline's "sha256" span)
   if [ "$BASE_NO_NET" = "1" ] && [ "${BASE_FAKE_DL:-}" != "real" ]; then   # BASE_FAKE_DL=real: the real branches with stubbed tools on PATH
     if [ "${BASE_FAKE_DL:-}" = "fail" ]; then err "fake download failed (BASE_FAKE_DL=fail)"; rm -rf "$stage"; return 1; fi
     staged="$stage/$base"; _base_sparse "$staged" "$bytes"      # fake: a sparse file at the declared size
@@ -332,9 +333,13 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
     done
     staged="$stage/$rfile"
     # the Hub's own sha256 for this revision, before the file goes anywhere (3.12.0); a mismatch is deleted, never resumed
-    if [ -f "$staged" ] && _base_size_ok "$(_base_fsize "$staged")" "$bytes" && ! _base_hf_verify "$hfbin" "$repo" "$rev" "$stage"; then
-      err "$base does not match the sha256 the Hub states for ${rev:-main}: deleted (a corrupt transfer, or the file changed on the Hub; pin the row)"
-      rm -rf "$stage"; return 1
+    if [ -f "$staged" ] && _base_size_ok "$(_base_fsize "$staged")" "$bytes"; then
+      tv=$SECONDS
+      if ! _base_hf_verify "$hfbin" "$repo" "$rev" "$stage"; then
+        err "$base does not match the sha256 the Hub states for ${rev:-main}: deleted (a corrupt transfer, or the file changed on the Hub; pin the row)"
+        rm -rf "$stage"; return 1
+      fi
+      BASE_VERIFY_SECS=$(( SECONDS - tv ))
     fi
   else
     staged="$stage/$base"      # github releases and the like: curl, resumable
@@ -357,7 +362,8 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
 }
 _base_snapshot(){ # <hf://owner/repo[@commit]> <dest dir> <bytes> → a repo snapshot in place, verified by total size and by
   # the Hub's own hashes for that revision (3.12.0)
-  local repo rev dest="$2" bytes="$3" hfbin attempt rargs=() ok=0
+  local repo rev dest="$2" bytes="$3" hfbin attempt rargs=() ok=0 tv
+  BASE_VERIFY_SECS=0
   IFS='|' read -r repo rev _ <<< "$(_base_hf_ref "$1")"
   [ -n "$rev" ] && rargs=(--revision "$rev")
   mkdir -p "$dest"
@@ -375,9 +381,11 @@ _base_snapshot(){ # <hf://owner/repo[@commit]> <dest dir> <bytes> → a repo sna
   if [ "$(_base_dir_size "$dest")" != "$bytes" ]; then
     err "${1#hf://}: $(_base_dir_size "$dest") bytes on disk, the row says $bytes (an unpinned snapshot follows main: pin it)"; return 1
   fi
+  tv=$SECONDS
   if ! _base_hf_verify "$hfbin" "$repo" "$rev" "$dest" --fail-on-missing-files; then
     err "${1#hf://} does not match the hashes the Hub states for ${rev:-main}: kept in $dest for a resumed re-run"; return 1
   fi
+  BASE_VERIFY_SECS=$(( SECONDS - tv ))
   local meta; meta="$(find "$dest/.cache/huggingface/download" -name '*.metadata' 2>/dev/null | head -1)"
   [ -z "$meta" ] || _base_verified_meta "$dest" "$meta"
   return 0
@@ -507,24 +515,30 @@ _base_fetch_one(){ # <spec KIND|rel|url|bytes|dest> → rc of the download
   local kind rel url bytes dest; IFS='|' read -r kind rel url bytes dest <<<"$1"
   if [ "$kind" = "SNAP" ]; then _base_snapshot "$url" "$dest" "$bytes"; else _base_download "$url" "$dest" "$bytes"; fi
 }
-_base_fetch_fold(){ # <rc> <secs> <spec> → the verdict line and the run's counters, in the caller's shell
-  local rc="$1" secs="$2" kind rel url bytes dest _sz; IFS='|' read -r kind rel url bytes dest <<<"$3"
+_base_fetch_fold(){ # <rc> <secs> <spec> [<t0> <sha256 secs>] → the verdict line and the run's counters, in the caller's shell
+  local rc="$1" secs="$2" kind rel url bytes dest _sz t0="${4:-}" vs="${5:-0}"; IFS='|' read -r kind rel url bytes dest <<<"$3"
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=0; [[ "$vs" =~ ^[0-9]+$ ]] || vs=0
+  [ "$vs" -le "$secs" ] || vs="$secs"              # the re-read is inside the job's own seconds
+  if [[ "$t0" =~ ^[0-9]+$ ]]; then                 # 3.22.0: the timeline's spans; the re-read is the job's last step
+    BASE_FILE_SPANS+=("$t0|$(( t0 + secs ))|download $rel")
+    [ "$vs" -eq 0 ] || BASE_FILE_SPANS+=("$(( t0 + secs - vs ))|$(( t0 + secs ))|sha256 $rel")
+  fi
   if [ "$rc" = "0" ]; then
     if [ "$kind" = "SNAP" ]; then _sz="$bytes"; else _sz="$(_base_fsize "$dest")"; fi
     BASE_DL_BYTES=$(( BASE_DL_BYTES + _sz )); BASE_DL_TIME=$(( BASE_DL_TIME + secs ))
-    ok "$rel downloaded ($(_base_bytes_to_gb "$_sz") GB, verified) · $(_base_rate "$_sz" "$secs")"
+    ok "$rel downloaded ($(_base_bytes_to_gb "$_sz") GB, verified) · $(_base_rate "$_sz" "$secs")$( [ "$vs" -eq 0 ] || echo " (sha256 ${vs}s of it)")"
     MODEL_DL+=("$rel"); DL_DESTS+=("$dest"); MODEL_DL_GB="$(_base_add_gb "$MODEL_DL_GB" "$(_base_bytes_to_gb "$bytes")")"
   else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); fi
 }
 _base_alive(){ local p c=0; for p in "$@"; do if kill -0 "$p" 2>/dev/null; then c=$((c + 1)); fi; done; echo "$c"; }   # <pid>... → how many still run
 _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE_FETCH_JOBS at a time, reported in queue order
-  local n spec i=0 rc t0 logd rel pids=()
+  local n spec i=0 rc t0 logd rel secs ts vs pids=()
   n="$(_base_fetch_jobs)"
   if [ "$n" = "1" ]; then                          # exactly the 3.0 behaviour: live output, one file after another
     for spec in "$@"; do
       IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
-      BASE_DL_SECS=0; t0=$SECONDS; rc=0; _base_fetch_one "$spec" || rc=$?
-      _base_fetch_fold "$rc" "$(( SECONDS - t0 ))" "$spec"
+      BASE_DL_SECS=0; BASE_VERIFY_SECS=0; t0=$SECONDS; rc=0; _base_fetch_one "$spec" || rc=$?
+      _base_fetch_fold "$rc" "$(( SECONDS - t0 ))" "$spec" "$t0" "${BASE_VERIFY_SECS:-0}"
     done
     return 0
   fi
@@ -535,7 +549,7 @@ _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE
     spec="${!i}"                                   # the i-th argument: queue order is kept for the report below
     # 3.11.0: only this queue's own jobs fill a slot or are waited for; the run has other background work by now
     while [ "$(_base_alive ${pids[@]+"${pids[@]}"})" -ge "$n" ]; do sleep 1; done
-    ( t0=$SECONDS; rc=0; _base_fetch_one "$spec" > "$logd/$i.log" 2>&1 || rc=$?; echo "$rc|$(( SECONDS - t0 ))" > "$logd/$i.rc" ) &
+    ( t0=$SECONDS; rc=0; BASE_VERIFY_SECS=0; _base_fetch_one "$spec" > "$logd/$i.log" 2>&1 || rc=$?; echo "$rc|$(( SECONDS - t0 ))|$t0|${BASE_VERIFY_SECS:-0}" > "$logd/$i.rc" ) &
     pids+=("$!")
   done
   wait ${pids[@]+"${pids[@]}"} 2>/dev/null || true
@@ -543,8 +557,8 @@ _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE
   for spec in "$@"; do
     i=$((i + 1)); IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
     [ -f "$logd/$i.log" ] && cat "$logd/$i.log"
-    IFS='|' read -r rc t0 < "$logd/$i.rc" 2>/dev/null || { rc=1; t0=0; }
-    _base_fetch_fold "$rc" "$t0" "$spec"
+    IFS='|' read -r rc secs ts vs < "$logd/$i.rc" 2>/dev/null || { rc=1; secs=0; ts=""; vs=0; }
+    _base_fetch_fold "$rc" "$secs" "$spec" "$ts" "$vs"
   done
   return 0
 }
