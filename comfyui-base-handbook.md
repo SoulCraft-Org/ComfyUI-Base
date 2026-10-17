@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.20.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.20.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -822,6 +822,13 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.20.1: the testbed names a port's holder on Linux without lsof (2026-10-17). On the free `soulcraft-hf` runner (a
+  Hugging Face CPU Space container, workspace integration run 39045535460) there is no lsof, so `testbed.sh` named every
+  holder of a port "pid ?" and two unit tests that expect the pid failed there while GitHub's ubuntu runners passed.
+  `port_holders` now falls back to /proc: the LISTEN rows of `/proc/net/tcp` and `tcp6` give the socket inodes, and the
+  `/proc/<pid>/fd` links that name them give the pids (every process of this user). "?" remains for a port that answers
+  when neither lsof nor /proc can say who, and the two tests expect it only on such a host; anywhere either can see the
+  holder they still demand its pid.
 - 3.20.0: one ComfyUI per GPU, so a multi-GPU pod renders several parts of one job at once (2026-10-17). The Video
   Replacer renders about 1 s of B200 per output frame and a two-person swap is two passes, so a 45 s, 7-shot clip took
   about 18 min of B200 per person on one GPU; split at its cuts, the shots are independent, and N GPUs finish it in the

@@ -432,6 +432,22 @@ def _free_port():
         s.bind(("127.0.0.1", 0)); return s.getsockname()[1]
 
 
+def _holder(p, port):
+    """What testbed.sh must name as the holder of <port>: the pid when this host can see who listens (lsof names it, or
+    /proc/<pid>/fd links a socket, as on Linux without lsof), "?" only when neither can (3.20.1: a container runner with
+    no lsof read "?" for every holder, also where /proc could have named it)."""
+    if shutil.which("lsof"):
+        r = subprocess.run(["lsof", "-t", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN"], capture_output=True, text=True)
+        if str(p.pid) in r.stdout.split():
+            return str(p.pid)
+    try:
+        if any(os.readlink("/proc/%d/fd/%s" % (p.pid, fd)).startswith("socket:") for fd in os.listdir("/proc/%d/fd" % p.pid)):
+            return str(p.pid)
+    except OSError:
+        pass
+    return "?"
+
+
 def _listen(tmp_path, script, port, wrap=False):
     """A process listening on 127.0.0.1:<port> until killed, its command line `python3 <script> --cpu --port <port>`;
     wrap=True runs it under a bash that waits for it (the shape a pid file written before 3.9.2 recorded)."""
@@ -479,7 +495,7 @@ def test_unit_testbed_stops_only_the_server_it_started_and_refuses_a_foreign_por
         r = subprocess.run(["bash", "-c", 'source "$1"; refuse_foreign_port; echo started', "bash", str(here / "testbed.sh")],
                            capture_output=True, text=True, env=e, timeout=60)
         assert r.returncode == 1 and "started" not in r.stdout and foreign.poll() is None, r.stdout + r.stderr
-        assert ("port %d is already in use by pid %d" % (port, foreign.pid)) in r.stdout and "TESTBED_PORT=" in r.stdout, r.stdout
+        assert ("port %d is already in use by pid %s" % (port, _holder(foreign, port))) in r.stdout and "TESTBED_PORT=" in r.stdout, r.stdout
     finally:
         _end(foreign)
     for wrap in (False, True):
@@ -527,7 +543,7 @@ def test_unit_testbed_owned_names_only_its_own_server_and_each_run_folder_gets_i
     try:
         (here / ".testbed-server.port").write_text("%d\n" % port); (here / ".testbed-server.pid").write_text("999999\n")
         r = tb("--owned")
-        assert r.returncode == 1 and not r.stdout and ("held by pid %d" % foreign.pid) in r.stderr, r.stdout + r.stderr
+        assert r.returncode == 1 and not r.stdout and ("held by pid %s," % _holder(foreign, port)) in r.stderr, r.stdout + r.stderr
         assert foreign.poll() is None
     finally:
         _end(foreign)
