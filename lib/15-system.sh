@@ -208,7 +208,7 @@ _base_system_start(){ # → 0 when the OS stage is now running in the background
       printf 'BASE_SYSTEM_ROWS=('; for x in ${BASE_SYSTEM_ROWS[@]+"${BASE_SYSTEM_ROWS[@]}"}; do printf ' %q' "$x"; done; printf ' )\n'
       printf '_base_sys_failed=('; for x in ${BASE_FAILED[@]+"${BASE_FAILED[@]:$nf}"}; do printf ' %q' "$x"; done; printf ' )\n'
       printf '_base_sys_warn=('; for x in ${BASE_WARN[@]+"${BASE_WARN[@]:$nw}"}; do printf ' %q' "$x"; done; printf ' )\n'
-      printf '_base_sys_secs=%q\n_base_sys_rc=%q\n' "$(( SECONDS - t0 ))" "$rc"
+      printf '_base_sys_t0=%q\n_base_sys_secs=%q\n_base_sys_rc=%q\n' "$t0" "$(( SECONDS - t0 ))" "$rc"
     } > "$dir/vars.sh"
   ) > "$dir/out" 2>&1 &
   _BASE_SYSTEM_PID=$!
@@ -217,7 +217,7 @@ _base_system_start(){ # → 0 when the OS stage is now running in the background
 }
 _base_system_join(){ # → the OS stage's status (10: the machine must restart first); its output shown, its results in this run
   [ -n "$_BASE_SYSTEM_PID" ] || return 0
-  local _base_sys_failed=() _base_sys_warn=() _base_sys_secs=0 _base_sys_rc=0 x
+  local _base_sys_failed=() _base_sys_warn=() _base_sys_t0=0 _base_sys_secs=0 _base_sys_rc=0 x
   wait "$_BASE_SYSTEM_PID" 2>/dev/null || true
   _BASE_SYSTEM_PID=""
   cat "$_BASE_SYSTEM_DIR/out" 2>/dev/null || true
@@ -226,5 +226,6 @@ _base_system_join(){ # → the OS stage's status (10: the machine must restart f
   for x in ${_base_sys_failed[@]+"${_base_sys_failed[@]}"}; do BASE_FAILED+=("$x"); done
   for x in ${_base_sys_warn[@]+"${_base_sys_warn[@]}"}; do BASE_WARN+=("$x"); done
   BASE_STAGE_TIMES+=("$_base_sys_secs|SYSTEM (in the background)")
+  _base_span "$_base_sys_t0" "$(( _base_sys_t0 + _base_sys_secs ))" "SYSTEM (in the background)"
   return "$_base_sys_rc"
 }

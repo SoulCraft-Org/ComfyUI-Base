@@ -154,6 +154,26 @@ start and the fake pod's boot; the fake RunPod for `--gpus 2`, the count query, 
 - One shot rendered on server 1 is byte-identical in content to the same shot on server 0 (same seed).
 - Host RAM with both servers loaded (the 4/8 rows of `lowestPrice` once they have stock).
 
+## 8. The cuBLAS probe beside the venv build; the install's timeline (3.22.0)   (2026-10-17, no pod used)
+
+**Why.** Paul's priority 3, install speed. The last Video Replacer pod (yswh3tkypxhxev, 1x B200, base 3.20.0, every row:
+42 files, 295.5 GB) took about 5:17 from create to the App on its fresh attempt (its 16:55 includes a failed first
+attempt and the pod stopped for about 11 minutes). The long pole was the 66.3 GB B300-only file (147 s with its sha256),
+with VENV (116 s) beside it, and VENV held an apt install of `cuda-libraries-dev-13-0` (2,251 MB, 33 packages) on an
+install that built nothing. The stage clock had seconds only, so what ran beside what was inferred, not read.
+
+**What changed.** `lib/40-packs.sh`: `_base_cuda_toolchain_start` / `_join` / `_stop`; `lib/95-summary.sh` starts the
+probe with the venv and joins it before `pkg_post_venv`. `lib/00-env.sh`: `_base_span`, `BASE_SPANS`, `BASE_FILE_SPANS`,
+`BASE_EPOCH0`, `BASE_CUDA_FOREGROUND`; `lib/92-onepass.sh`: `_base_timeline_write` (`<pkg>_<ts>.timeline.tsv`);
+`lib/50-models.sh`: each download's `BASE_VERIFY_SECS` and spans; the background joins (system, models, tools) add
+theirs. `_build/pod/podctl.py`: `PODCTL_TIMES=1`.
+
+**Proven, and how.** `suite/test_critical_path.py` in CI (nothing ran on this Mac but `bash -n` and the packager).
+
+**Owed (the next pod).** The VENV stage without the apt, the `CUDA TOOLCHAIN (in the background…)` row's seconds, and the
+timeline's critical path; the measurement plan is in the PR. The ranked levers and the sources are in the orchestrator's
+notes (`install-speed-ranked.md`, `install-speed-sources.md`).
+
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port

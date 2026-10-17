@@ -38,9 +38,26 @@ _base_timings_write(){ # the run's stage times beside its log: state/logs/<pkg>_
   # podctl fetches back to the Mac with the console after every install; never in a dry run
   [ "$BASE_DRY" = "1" ] && return 0
   [ -n "${BASE_STATE:-}" ] && [ "${#BASE_STAGE_TIMES[@]}" -gt 0 ] || return 0
-  local d="$BASE_STATE/logs" row
+  local d="$BASE_STATE/logs" row ts
   mkdir -p "$d" 2>/dev/null || return 0
-  for row in "${BASE_STAGE_TIMES[@]}"; do printf '%s\t%s\n' "${row%%|*}" "${row#*|}"; done > "$d/${PKG_ID:-base}_$(_base_ts).timings.tsv" 2>/dev/null || true
+  ts="$(_base_ts)"
+  for row in "${BASE_STAGE_TIMES[@]}"; do printf '%s\t%s\n' "${row%%|*}" "${row#*|}"; done > "$d/${PKG_ID:-base}_$ts.timings.tsv" 2>/dev/null || true
+  _base_timeline_write "$d/${PKG_ID:-base}_$ts.timeline.tsv"
+  return 0
+}
+_base_timeline_write(){ # <file> → 3.22.0: every span as wall-clock time, earliest first: what ran beside what, read, not inferred.
+  # "start TAB end TAB seconds TAB what", epoch seconds; a background stage is one span from its start to its end, and each
+  # model file is two: "download <rel>" (the whole job) and "sha256 <rel>" (its re-read, the job's last seconds).
+  [ "${#BASE_SPANS[@]}" -gt 0 ] || [ "${#BASE_FILE_SPANS[@]}" -gt 0 ] || return 0
+  local row t0 t1 what
+  {
+    printf '# start\tend\tseconds\twhat  (epoch seconds; ComfyUI Base %s, %s)\n' "${BASE_VERSION:-?}" "${PKG_NAME:-${PKG_ID:-base}}"
+    for row in ${BASE_SPANS[@]+"${BASE_SPANS[@]}"} ${BASE_FILE_SPANS[@]+"${BASE_FILE_SPANS[@]}"}; do
+      IFS='|' read -r t0 t1 what <<< "$row"
+      [[ "$t0" =~ ^[0-9]+$ ]] && [[ "$t1" =~ ^[0-9]+$ ]] || continue
+      printf '%s\t%s\t%s\t%s\n' "$(( BASE_EPOCH0 + t0 ))" "$(( BASE_EPOCH0 + t1 ))" "$(( t1 - t0 ))" "$what"
+    done | sort -t"$(printf '\t')" -k1,1n -k2,2n
+  } > "$1" 2>/dev/null || true
   return 0
 }
 

@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.21.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.22.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -628,7 +628,8 @@ that does not need another's output runs beside it, and a join stands only where
            ◄────────────────────────────────────────────────────┘
            ├─ model downloads (BASE_FETCH_JOBS at once, largest first) ... background ─┐ joined before the model stage
            ├─ JupyterLab's tools venv .................................... background ─┼─┐ joined at BOOT
-           └─ venv snapshot → venv → toolkit → pkg_post_venv (Sage) → own packs        │ │
+           ├─ cuBLAS probe and its apt install (3.22.0) ................... background │ │ joined before pkg_post_venv
+           └─ venv snapshot → venv → pkg_post_venv (Sage) → own packs                  │ │
                 → packs pip (skipped when the venv build installed this exact set)     │ │
                 → Comfy MCP → newest → [local-runtime copy, when lib/84-run-local.sh is in] │
                 → pkg_pre_models ◄─────────────────────────────────────────────────────┘ │
@@ -645,7 +646,12 @@ tree. A store that already holds this exact install green (same package files, s
 place) runs none of it: `ALREADY INSTALLED`, ComfyUI started if nothing serves, done in seconds (`BASE_FULL=1` runs it all).
 
 **One pass, and its clock** (3.2.0). Every stage header closes the stage before it with its seconds; the summary prints
-them slowest first and `state/logs/<pkg>_<ts>.timings.tsv` keeps them, which podctl fetches with the console. When the
+them slowest first and `state/logs/<pkg>_<ts>.timings.tsv` keeps them, which podctl fetches with the console. 3.22.0:
+beside it, `<pkg>_<ts>.timeline.tsv` keeps WHEN: `start TAB end TAB seconds TAB what` in epoch seconds, earliest first,
+for every stage, every background stage (from its start to its end, not just its seconds) and every model file twice
+(`download <rel>`, the whole job, and `sha256 <rel>`, its re-read at the end), so the critical path of an install is read
+from the run; each file's line in the console also says how many of its seconds were the sha256. `PODCTL_TIMES=1` stamps
+podctl's own lines with the UTC time and the seconds since the install began, so the Mac's half lines up with it. When the
 only change a run makes is the package's own packs (ComfyUI, every other pack and the venv's package list unchanged), the
 import check loads ComfyUI with just those packs (`--disable-all-custom-nodes --whitelist-custom-nodes`); anything short
 of a pass there is judged again by the full check. `<script> preflight` is what podctl runs before an install: seconds,
@@ -831,6 +837,19 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.22.0: install speed on the critical path, and a clock that shows it (Paul's priority 3, 2026-10-17). Read from the
+  last Video Replacer pod (1x B200, EU-RO-1, base 3.20.0, every row: 42 files, 295.5 GB): about 5:17 from create to the
+  App for a fresh install, with the 66.3 GB B300-only file the long pole (147 s with its sha256) and VENV 116 s beside
+  it, `cuda-libraries-dev-13-0` installed inside VENV although nothing built (33 packages, 2,251 MB fetched one file at
+  a time, 4,146 MiB unpacked). (1) `base_cuda_toolchain` starts with the venv build in the background
+  (`_base_cuda_toolchain_start`, lib/40-packs.sh) and is joined before `pkg_post_venv`, the first place a build can start,
+  so every build still finds the toolkit fixed or is told why not; the clock shows `CUDA TOOLCHAIN (in the background,
+  beside the venv build)`. A dry run, runtime mode and `BASE_CUDA_FOREGROUND=1` keep the old order. (2)
+  `state/logs/<pkg>_<ts>.timeline.tsv` beside the timings (§5, "One pass, and its clock"): wall-clock spans for every
+  stage, background stage and model file, with each file's sha256 seconds in its console line too. (3) `PODCTL_TIMES=1`
+  stamps podctl's lines. The unit tier covers the background probe (its verdict, its warning, the foreground forms, a
+  probe that died, the pipeline's order), the timeline's order and format, the per-file spans from the serial, the
+  parallel and the early pass, and podctl's stamp. Not run on hardware: the next pod measures it.
 - 3.21.0: which test lane a smoke takes (2026-10-17). `py/gpu_fit.py` gains `LANES`, `fast_dtypes()` and
   `pick_lane(peak_gib, minutes, needs)`, which builds on `fits()` for GPU classes instead of a second rule, and a
   `--peak-gib/--minutes/--needs` mode on the command line (§1, "Which test lane"). The unit tier covers the order, the
@@ -1077,7 +1096,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   one extension `core.py` imports unconditionally, and the Triton mode calls no qattn kernel, so that build takes about
   a minute; if its proof then finds Triton does not run, every kernel is built and proven again. The proof's mode is now
   also kept on the volume (`state/sage/<sm>.mode`), so it outlives a venv rebuild. The cuBLAS probe runs only before a
-  build. `SAGE_WHEELS=0` skips the download, `SAGE_FUSED_ONLY=0` the `_fused`-only build, `SAGE_WHEELS_URL` names
+  build (3.22.0: the install's own probe now runs beside the venv build and is joined before `pkg_post_venv`). `SAGE_WHEELS=0` skips the download, `SAGE_FUSED_ONLY=0` the `_fused`-only build, `SAGE_WHEELS_URL` names
   another releases root. The Sage step needs no new join with the early downloads: it runs in `pkg_post_venv`, inside
   their window. Exercised on this Mac against a file:// release mirror and upstream's real setup.py and core.py; the
   wheels are built by CI; the pod measurement is in the PR.

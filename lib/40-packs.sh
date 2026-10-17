@@ -437,6 +437,56 @@ base_cuda_toolchain(){ # CAN THIS TOOLKIT LINK WHAT PACKAGES BUILD? "nvcc exists
   return 0
 }
 
+# ---------------------------------------------------------------- 3.22.0: the toolchain probe beside the venv build
+# On an image without cuBLAS (runpod/comfyui ships nvcc + cudart only) the probe apt-installs cuda-libraries-dev, one
+# file at a time from NVIDIA's repository, and it ran in the foreground right after the venv on every fresh pod, although
+# nothing until pkg_post_venv can build: the venv's own install meets the toolkit as the image left it either way (it
+# runs before the probe). So the probe starts when the venv build does and is joined before pkg_post_venv, the first
+# place a build can start: every build still finds the toolkit fixed, or is told why not, exactly as before; the probe
+# just stops costing the critical path (pod 2026-10-17: VENV 116 s with the apt inside it, PKG_NO_SAGE=1, nothing built).
+# A dry run, runtime mode and BASE_CUDA_FOREGROUND=1 keep it in the foreground. Its output is shown whole at the join.
+_BASE_CUDA_PID=""; _BASE_CUDA_DIR=""
+_base_cuda_toolchain_start(){ # → 0 when the probe now runs in the background, 1 when the join runs it in the foreground
+  if [ -n "$BASE_CUDA_BUILD_OK" ] || [ "$BASE_DRY" = "1" ] || _base_runtime_on || [ "${BASE_CUDA_FOREGROUND:-0}" = "1" ]; then return 1; fi
+  _base_tmp; _BASE_CUDA_DIR="$BASE_TMPD/cuda-bg"; mkdir -p "$_BASE_CUDA_DIR"   # the probe's files go in the run's own temp dir
+  local dir="$_BASE_CUDA_DIR" nc="${#BASE_CHANGED[@]}" nw="${#BASE_WARN[@]}"
+  (
+    trap - ERR EXIT; set +e
+    t0="$SECONDS"; base_cuda_toolchain
+    {
+      printf 'BASE_CUDA_BUILD_OK=%q\n' "${BASE_CUDA_BUILD_OK:-0}"
+      printf '_c_changed=('; for x in ${BASE_CHANGED[@]+"${BASE_CHANGED[@]:$nc}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_c_warn=('; for x in ${BASE_WARN[@]+"${BASE_WARN[@]:$nw}"}; do printf ' %q' "$x"; done; printf ' )\n'
+      printf '_c_t0=%q\n_c_secs=%q\n' "$t0" "$(( SECONDS - t0 ))"
+    } > "$dir/vars.sh"
+  ) > "$dir/out" 2>&1 &
+  _BASE_CUDA_PID=$!
+  return 0
+}
+_base_cuda_toolchain_join(){ # before pkg_post_venv: the background probe waited for and folded in; with none, the probe itself
+  if [ -z "$_BASE_CUDA_PID" ]; then base_cuda_toolchain; return 0; fi
+  local _c_changed=() _c_warn=() _c_t0=0 _c_secs=0 x
+  wait "$_BASE_CUDA_PID" 2>/dev/null || true
+  _BASE_CUDA_PID=""
+  cat "$_BASE_CUDA_DIR/out" 2>/dev/null || true
+  if [ ! -f "$_BASE_CUDA_DIR/vars.sh" ]; then   # it died without a verdict: ask again here rather than guess
+    note "the background toolchain probe ended without a result: probing again"; BASE_CUDA_BUILD_OK=""; base_cuda_toolchain; return 0
+  fi
+  . "$_BASE_CUDA_DIR/vars.sh"
+  for x in ${_c_changed[@]+"${_c_changed[@]}"}; do BASE_CHANGED+=("$x"); done
+  for x in ${_c_warn[@]+"${_c_warn[@]}"}; do BASE_WARN+=("$x"); done
+  BASE_STAGE_TIMES+=("$_c_secs|CUDA TOOLCHAIN (in the background, beside the venv build)")
+  _base_span "$_c_t0" "$(( _c_t0 + _c_secs ))" "CUDA TOOLCHAIN (in the background, beside the venv build)"
+  return 0
+}
+_base_cuda_toolchain_stop(){ # the run ends before the join (a failed venv): the probe is waited for, never killed
+  [ -n "${_BASE_CUDA_PID:-}" ] || return 0
+  # unlike a download (it resumes), an apt install stopped half way leaves dpkg needing `dpkg --configure -a` before any
+  # apt works again; the probe ends by itself within a minute or two, so a failed run only ends that much later
+  wait "$_BASE_CUDA_PID" 2>/dev/null || true
+  _BASE_CUDA_PID=""
+}
+
 _base_sage_covers(){ # <key> <prefix> <sm token, e.g. 12-0> → 0 when <key> is <prefix>archs-<list> and the list holds this GPU
   # 3.0.1: an image built with no GPU stamps SageAttention for SAGE_ARCHS="9.0;12.0". On the machine it serves, the same
   # source, Python and torch built for a list that holds this GPU's sm IS current; before, the keys never matched and

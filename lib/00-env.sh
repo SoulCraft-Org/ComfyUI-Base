@@ -71,6 +71,7 @@
 #                        largest first; 1 is the one-at-a-time behaviour of 3.0 to 3.10.
 # BASE_MODELS_FOREGROUND=1  3.11.0: the model downloads wait for the venv build, as before (lib/52-models-early.sh)
 # BASE_TOOLS_FOREGROUND=1   3.11.0: JupyterLab's tools venv builds in the BOOT stage, as before (lib/75-boot.sh)
+# BASE_CUDA_FOREGROUND=1    3.22.0: the cuBLAS probe (and its apt install) runs after the venv, as before (lib/40-packs.sh)
 # BASE_PACK_JOBS=<n>     3.11.0: how many packs clone or fetch at once (default 8)
 # BASE_FULL=1            3.11.0: the whole pipeline even when this store already holds this exact install green
 #                        (lib/92-onepass.sh: same package files, same base, same GPU arch, every file in place)
@@ -133,9 +134,16 @@ hdr(){   _base_stage_mark "$*"; echo -e "\n${CYA}══ $* ══${NC}"; }
 BASE_STAGE_NAME=""; BASE_STAGE_T0=0; BASE_STAGE_TIMES=()
 _base_stage_mark(){
   local now="$SECONDS"
-  if [ -n "$BASE_STAGE_NAME" ]; then BASE_STAGE_TIMES+=("$(( now - BASE_STAGE_T0 ))|$BASE_STAGE_NAME"); fi
+  if [ -n "$BASE_STAGE_NAME" ]; then BASE_STAGE_TIMES+=("$(( now - BASE_STAGE_T0 ))|$BASE_STAGE_NAME"); _base_span "$BASE_STAGE_T0" "$now" "$BASE_STAGE_NAME"; fi
   BASE_STAGE_NAME="$1"; BASE_STAGE_T0="$now"
 }
+# 3.22.0: and WHEN each stage ran. Seconds alone cannot say what ran beside what, so the critical path of an install was
+# inferred. Every span (a stage, a background stage at its join, each model file's download and its sha256 re-read) keeps
+# its two ends as this shell's SECONDS (a background job's subshell counts on the same clock), and the summary writes them
+# as wall-clock times: state/logs/<pkg>_<ts>.timeline.tsv (lib/92-onepass.sh). BASE_EPOCH0 is the epoch SECONDS counts from.
+BASE_SPANS=(); BASE_FILE_SPANS=()   # the stages; each model file (download, then its sha256 re-read)
+BASE_EPOCH0="$(( ${EPOCHSECONDS:-$(date +%s)} - SECONDS ))"
+_base_span(){ BASE_SPANS+=("$1|$2|$3"); }   # <t0> <t1> <label>, both ends in SECONDS
 would(){ echo -e "${CYA}  → would $*${NC}"; }   # --check wording
 todo(){  echo -e "${CYA}  → $*${NC}"; }          # queued work, not a fault: this run is about to do it
 warn(){  echo -e "${YEL}  ! $*${NC}"; BASE_WARN+=("$*"); }   # reported in the summary, never blocks
@@ -265,6 +273,7 @@ _base_on_exit(){
   _base_install_unlock                               # 2.5.0: never leave a shared volume locked by a dead run
   ! declare -F _base_models_early_stop >/dev/null || _base_models_early_stop || true   # 3.11.0: early downloads end with the run that started them (they resume)
   ! declare -F _base_tools_stop >/dev/null || _base_tools_stop || true                 # 3.11.0: and so does the background tools venv
+  ! declare -F _base_cuda_toolchain_stop >/dev/null || _base_cuda_toolchain_stop || true   # 3.22.0: the background cuBLAS probe (lib/40-packs.sh)
   for d in ${BASE_TMPDIRS[@]+"${BASE_TMPDIRS[@]}"}; do if [ -n "$d" ] && [ -d "$d" ]; then rm -rf "$d"; fi; done
   if [ "$rc" -ne 0 ] && [ "$BASE_SUMMARY_DONE" = "0" ] && [ -n "$BASE_LOG" ]; then echo "  aborted (exit $rc) — log: $BASE_LOG"; fi
   [ "$BASE_LOGGING" = "1" ] && sleep 0.3   # let tee flush the last lines
