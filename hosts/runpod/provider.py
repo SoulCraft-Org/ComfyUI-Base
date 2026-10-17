@@ -894,6 +894,57 @@ def stock(api, gpu, volume=False, skipped=None):
     return rows
 
 
+# 3.20.0: N GPUs on one pod. dataCenters.gpuAvailability says a data centre has the GPU TYPE free, not how many: one free
+# B200 passes a 4-GPU create, which RunPod then refuses. gpuTypes.lowestPrice takes the count (and a data centre), and
+# one query asks every candidate at once under an alias each. Read 2026-10-17: B200 x2 had a price and stock in US-CA-2
+# and US-NC-2 (502 GB RAM, 48 vCPU, $15.98/h); x4 and x8 answered null everywhere, which is "none free".
+COUNT_FIELDS = "{ stockStatus uninterruptablePrice minimumBidPrice minMemory minVcpu }"
+
+
+def _dc_alias(dc):
+    return "dc_" + re.sub(r"[^A-Za-z0-9]", "_", dc)
+
+
+def count_rows(api, gpu, n, dcs):
+    """{data centre: lowestPrice row} for each of `dcs` where `n` x `gpu` can be rented now (one GraphQL call)."""
+    if not dcs:
+        return {}
+    q = "query { gpuTypes(input:{id:%s}) { %s } }" % (json.dumps(gpu), " ".join(
+        '%s: lowestPrice(input:{gpuCount:%d, secureCloud:true, dataCenterId:%s}) %s' % (_dc_alias(dc), int(n), json.dumps(dc), COUNT_FIELDS)
+        for dc in dcs))
+    types = api.graphql(q).get("gpuTypes") or [{}]
+    row = types[0] if isinstance(types, list) and types and isinstance(types[0], dict) else {}
+    return {dc: row[_dc_alias(dc)] for dc in dcs if isinstance(row.get(_dc_alias(dc)), dict) and row[_dc_alias(dc)].get("stockStatus")}
+
+
+def stock_count(api, gpu, n, volume=False, skipped=None):
+    """stock() for a pod of `n` GPUs: the data centres stock() names (the type is free there, a pod and its volume can be
+    made there), kept only where lowestPrice says `n` of them are free. Each one dropped for the count joins `skipped`."""
+    rows = stock(api, gpu, volume=volume, skipped=skipped)
+    if int(n) <= 1:
+        return rows
+    have = count_rows(api, gpu, n, [dc for dc, _ in rows])
+    for dc, _ in rows:
+        if dc not in have and skipped is not None:
+            skipped.append((dc, "%s is free there, but not %d of them" % (gpu, int(n))))
+    return [(dc, have[dc].get("stockStatus") or st) for dc, st in rows if dc in have]
+
+
+def price(api, gpu, n=1, dc=None, spot=False):
+    """3.20.0: what `n` x `gpu` costs an hour on Secure Cloud ({"per_hr", "ram_gb", "vcpu"}), in `dc` when given; None when
+    RunPod names no price (none free, or an answer without one). RunPod prices the pod, so per_hr is already the N GPUs'."""
+    q = "query { gpuTypes(input:{id:%s}) { lowestPrice(input:{gpuCount:%d, secureCloud:true%s}) %s } }" % (
+        json.dumps(gpu), int(n), (", dataCenterId:%s" % json.dumps(dc)) if dc else "", COUNT_FIELDS)
+    types = api.graphql(q).get("gpuTypes") or []
+    row = (types[0] or {}).get("lowestPrice") if isinstance(types, list) and types and isinstance(types[0], dict) else None
+    if not isinstance(row, dict):
+        return None
+    per = row.get("minimumBidPrice") if spot else row.get("uninterruptablePrice")
+    if not isinstance(per, (int, float)) or per <= 0:
+        return None
+    return {"per_hr": float(per), "ram_gb": row.get("minMemory"), "vcpu": row.get("minVcpu")}
+
+
 def cuda_floor(image, min_cuda=None):
     """The lowest host CUDA the pod accepts: --min-cuda, else what the image's tag says it was built for (cuda13.0,
     cu130), else None (any). A cu130 image on a 12.x driver starts and then fails at the first kernel."""
@@ -938,7 +989,7 @@ def encryption_words(pod, gb=None):
 
 
 def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None, names=None,
-                template_id=None, token=None, link=None, start=None, pod_gb=None, refs=None):
+                template_id=None, token=None, link=None, start=None, pod_gb=None, refs=None, gpu_count=1):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
     data centre, the ports, PUBLIC_KEY, the CUDA floor. No start command: `ensure` installs the base's boot guard from the
     image's own entry, as for every other pod; and no templateId but the port-names one (3.9.0), which carries nothing else.
@@ -955,8 +1006,9 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
     3.18.0 pod_gb: a PUBLIC pod on a POD VOLUME of that size instead of a network volume (a fresh pod where the GPU is
     and no network volume is): the same ports, names, tokens and key as a network-volume pod.
     3.19.0 refs: {VAR: "{{ RUNPOD_SECRET_VAR }}"} from env_refs, joined to the env of every kind of pod: references
-    by name, which RunPod resolves at the pod's start; never a value."""
-    body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": 1, "cloudType": "SECURE", "computeType": "GPU",
+    by name, which RunPod resolves at the pod's start; never a value.
+    3.20.0 gpu_count: the GPUs on the pod (1 to 8); the base's boot runs one ComfyUI on each."""
+    body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": int(gpu_count), "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
             "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
     if not private_gb:
@@ -1016,7 +1068,7 @@ def refs_line(refs):
 
 def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_gb=100, pubkey=None, min_cuda=None, spot=False,
            wait=True, sleep=None, banner=ssh_banner, ssh_config=None, say=print, private=False, names=None, name_ports=True,
-           volume_name=None, pod_gb=None, lock=False):
+           volume_name=None, pod_gb=None, lock=False, gpu_count=1):
     """A pod from nothing: a network volume of `data_gb` in `dc` named `volume_name` (default <name>-data; podctl create
     passes comfy-base-data, the one a later create reuses), or the existing `volume`, then the pod on it. A refused
     pod (sold out between the stock check and the create) takes a volume THIS call made with it, so nothing is left
@@ -1032,7 +1084,7 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     cuda = allowed_cuda(create_floor(image, min_cuda))
     if private:
         return _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep,
-                               banner, ssh_config, say, names=names)
+                               banner, ssh_config, say, names=names, gpu_count=gpu_count)
     made = None
     if pod_gb:
         if volume or data_gb:
@@ -1061,7 +1113,7 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
                        # 3.19.1: open links by default (one click on the Connect tab); --lock mints the terminal's token
                        # and the links' key, and sets BASE_LINK_LOCK=1, and only then do the printed links carry them
                        token=jupyter_token() if lock else None, link=link_token() if lock else None,
-                       start=create_start(sshd_bootstrap_text()), pod_gb=pod_gb, refs=refs)
+                       start=create_start(sshd_bootstrap_text()), pod_gb=pod_gb, refs=refs, gpu_count=gpu_count)
     if lock:
         body["env"]["BASE_LINK_LOCK"] = "1"
     try:
@@ -1075,8 +1127,8 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
             except Exception as e:  # the refusal is the news; a leftover volume is named so it can be removed
                 say("  !! could not delete the new network volume %s after the refusal: %s" % (made, e))
         raise
-    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · %s at %s · ports %s · CUDA %s%s" % (
-        pod_id, name, image, gpu, dc, int(container_gb), ("pod volume %d GB" % int(pod_gb)) if pod_gb else "network volume %s" % vid,
+    say("created %s (%s): %s · %s × %d · %s · %d GB container disk · %s at %s · ports %s · CUDA %s%s" % (
+        pod_id, name, image, gpu, int(gpu_count), dc, int(container_gb), ("pod volume %d GB" % int(pod_gb)) if pod_gb else "network volume %s" % vid,
         VOLUME_ROOT, " ".join(body["ports"]),
         (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
     say("  names    %s%s" % (" · ".join("%d %s" % (int(p), n) for p, n in names),
@@ -1131,7 +1183,7 @@ def seed_jupyter_token(say=print):
 
 
 def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep, banner, ssh_config, say,
-                    names=None):
+                    names=None, gpu_count=1):
     """3.7.4 `create --private`: a pod volume, sshd only, ComfyUI on loopback.
     3.9.1: the volume is NOT encrypted, and that is said before the pod exists, never after: no create input RunPod
     documents can ask for encryption (only the console's "Encrypt volume" box can). The summary prints what the read-back
@@ -1144,14 +1196,14 @@ def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pu
     say(PRIVATE_UNENCRYPTED)
     refs = env_refs(api, say=say)
     body = create_body(name, gpu, dc, None, image, container_gb, pubkey, cuda=cuda, spot=spot, private_gb=data_gb,
-                       start=create_start(sshd_bootstrap_text()), refs=refs)
+                       start=create_start(sshd_bootstrap_text()), refs=refs, gpu_count=gpu_count)
     pod_id = api.post("/pods", body)["id"]
     back = api.get("/pods/%s%s" % (pod_id, POD_READ))
     ports = back.get("ports") or body["ports"]
     if sorted(ports) != sorted(PRIVATE_PORTS):
         say("  !! %s came back with ports %s, not %s" % (pod_id, " ".join(ports), " ".join(PRIVATE_PORTS)))
-    say("created %s (%s): %s · %s × 1 · %s · %d GB container disk · %s · ports %s only · "
-        "ComfyUI on loopback · CUDA %s%s" % (pod_id, name, image, gpu, dc, int(container_gb), encryption_words(back, data_gb),
+    say("created %s (%s): %s · %s × %d · %s · %d GB container disk · %s · ports %s only · "
+        "ComfyUI on loopback · CUDA %s%s" % (pod_id, name, image, gpu, int(gpu_count), dc, int(container_gb), encryption_words(back, data_gb),
                                               " ".join(PRIVATE_PORTS), (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
     say(refs_line(refs))
     say("  private: no proxy URL; ComfyUI is http://localhost:8188 through podctl tunnel %s, which also names the Jupyter "
@@ -1252,12 +1304,15 @@ class RunPodProvider(Provider):
         return record_volume(self.api, pod, env=env)
 
     # 3.7.3: `podctl create` (the verb Verda already had) and the stock check behind it
-    def availability(self, gpu, spot=False, volume=False):
+    def availability(self, gpu, spot=False, volume=False, count=1):
         """The data centres where `gpu` can be rented now AND a pod can be created (3.10.1: with volume, one that takes a
         network volume too), in RunPod's order (spot shares the on-demand stock view). The ones left out, and why, are
-        in self.skipped afterwards."""
+        in self.skipped afterwards. 3.20.0 count: where that many are free (stock_count)."""
         self.skipped = []
-        return [dc for dc, _ in stock(self.api, gpu, volume=volume, skipped=self.skipped)]
+        return [dc for dc, _ in stock_count(self.api, gpu, count, volume=volume, skipped=self.skipped)]
+
+    def price(self, gpu, count=1, location=None, spot=False):
+        return price(self.api, gpu, count, location, spot=spot)
 
     def balance(self):
         return balance(self.api)
@@ -1278,12 +1333,12 @@ class RunPodProvider(Provider):
 
     def create_machine(self, name, gpu, location, data_gb, os_gb=100, image=None, pubkey=None, spot=False, wait=True,
                        ssh_config=None, say=print, volume=None, min_cuda=None, private=False, names=None, name_ports=True,
-                       volume_name=None, pod_gb=None, lock=False):
+                       volume_name=None, pod_gb=None, lock=False, gpus=1):
         if not pubkey:
             pubkey = _c().mac_public_key(None)
         return create(self.api, name, gpu, location, data_gb=data_gb, volume=volume, image=image, container_gb=os_gb, pubkey=pubkey,
                       min_cuda=min_cuda, spot=spot, wait=wait, ssh_config=ssh_config, say=say, private=private, names=names,
-                      name_ports=name_ports, volume_name=volume_name, pod_gb=pod_gb, lock=lock)
+                      name_ports=name_ports, volume_name=volume_name, pod_gb=pod_gb, lock=lock, gpu_count=gpus)
 
     def http_url(self, pod, port):
         """3.9.0: the URL a browser opens for one of the pod's ports, or None when the host does not proxy it."""

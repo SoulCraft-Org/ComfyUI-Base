@@ -184,7 +184,7 @@ _base_cpu_quota(){ # → the whole CPUs this container's cgroup quota allows (ro
 }
 _base_launch_env_dir(){ local s="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; [ -n "$s" ] && echo "$s/launch.d"; }
 _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedence above); what was dropped, and why, on stderr
-  local dir f kv k v seen="" n first
+  local dir f kv k v seen="" n s first
   dir="$(_base_launch_env_dir)"
   if [ -n "$dir" ] && [ -d "$dir" ]; then
     for f in "$dir"/*.env; do
@@ -205,7 +205,13 @@ _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedenc
   fi
   case "$seen" in
     *"|OMP_NUM_THREADS="*) ;;
-    *) n="$(_base_cpu_quota)"; if [ -n "$n" ]; then seen="$seen|OMP_NUM_THREADS=$n@the CPU quota"; fi ;;
+    *) n="$(_base_cpu_quota)"
+       if [ -n "$n" ]; then
+         # 3.20.0: N servers share the quota, so each one's pool is its share (at least 1), never the whole of it N times
+         s="$(_base_server_count)"
+         if [ "$s" -gt 1 ]; then n=$(( n / s )); [ "$n" -ge 1 ] || n=1; seen="$seen|OMP_NUM_THREADS=$n@the CPU quota over $s servers"
+         else seen="$seen|OMP_NUM_THREADS=$n@the CPU quota"; fi
+       fi ;;
   esac
   printf '%s\n' "$seen" | tr '|' '\n' | while IFS= read -r kv; do         # KEY=value@source, one per line (the last one too)
     [ -n "$kv" ] || continue
@@ -217,17 +223,85 @@ _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedenc
 _base_comfy_listen(){ # 3.14.0: where ComfyUI binds: BASE_LISTEN when that is loopback; on any public bind 127.0.0.1, behind the key's front
   case "${BASE_LISTEN:-0.0.0.0}" in 127.*|localhost|::1) echo "$BASE_LISTEN" ;; *) echo 127.0.0.1 ;; esac
 }
-_base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints what would actually run
-  local extra pv hf ff le
+# 3.20.0: ONE COMFYUI PER GPU. A machine with N GPUs runs N servers, each on its own GPU, so a package can render N parts of
+# one job at once (a video's shots) at the speed of one GPU each, and every part's output is what one GPU makes of it.
+#   server 0      $PORT (8188), everything as before: the args file, BASE_LISTEN behind the front, the app ports, the links
+#   server i>0    127.0.0.1:$((BASE_EXTRA_PORT_BASE + i)) only (18189…): never a host port, never a link; the runner on the
+#                 machine reaches it. Not 8188+i: 8189 and up are the packages' app ports (APP_PORTS).
+# Every server: CUDA_VISIBLE_DEVICES its own GPU (when N > 1), the same tree, venv, packs, models, launch env and args file,
+# the SAME input, output and user folders (a part's input is written once, its output lands where server 0 joins the parts,
+# and every server's packs see the same apps), but its OWN temp folder and database: ComfyUI empties its temp folder at
+# start (app/assets/lifecycle.py, 0.38) and N processes would migrate one SQLite file at once. Its own log and pid file.
+# ComfyUI's environment names them all, the same string in every process, server 0 first:
+#   COMFY_BASE_SERVERS=127.0.0.1:8188,127.0.0.1:18189,...    COMFY_BASE_SERVER_INDEX=<i>
+# and state/servers.list holds `index|port|gpu` per server. BASE_SERVERS (the machine's env or the pod's) caps N: 1 is the
+# single server of every base before 3.20.0. No GPU at all (a Mac, the testbed) is one server, as before.
+BASE_EXTRA_PORT_BASE=18188
+_base_gpu_ids(){ # → the device ids ComfyUI may use, one per line: the machine's own CUDA_VISIBLE_DEVICES when set, else nvidia-smi's
+  local v
+  if [ -n "${CUDA_VISIBLE_DEVICES+x}" ]; then
+    printf '%s\n' "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | tr -d ' ' | grep -v -e '^$' -e '^-' || true     # "" or -1: no GPU
+    return 0
+  fi
+  command -v "${BASE_NVIDIA_SMI:-nvidia-smi}" >/dev/null 2>&1 || return 0                                  # the suite's stub
+  "${BASE_NVIDIA_SMI:-nvidia-smi}" --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -E '^[0-9]+$' || true
+}
+_base_servers_cap(){ # → BASE_SERVERS from this shell, else from the pod's own environment (an install's ssh shell does not inherit it)
+  local v="${BASE_SERVERS:-}"
+  if [ -z "$v" ] && declare -F _base_pid1_env >/dev/null; then v="$(_base_pid1_env BASE_SERVERS)"; fi
+  if [ -z "$v" ] && declare -F boot_pid1_env >/dev/null; then v="$(boot_pid1_env BASE_SERVERS)"; fi
+  echo "$v"
+}
+_base_server_count(){ # → how many ComfyUI servers this machine runs: one per GPU, at least one, at most BASE_SERVERS
+  local n cap
+  if [ -n "${_BASE_SERVER_N:-}" ]; then echo "$_BASE_SERVER_N"; return 0; fi     # _base_start_comfy counts once
+  n="$(_base_gpu_ids | grep -c . || true)"
+  case "$n" in ''|*[!0-9]*|0) n=1 ;; esac
+  cap="$(_base_servers_cap)"
+  case "$cap" in ''|*[!0-9]*|0) ;; *) if [ "$n" -gt "$cap" ]; then n="$cap"; fi ;; esac
+  echo "$n"
+}
+_base_server_port(){ if [ "${1:-0}" = 0 ]; then echo "$PORT"; else echo $(( BASE_EXTRA_PORT_BASE + $1 )); fi; }
+_base_server_gpu(){ _base_gpu_ids | sed -n "$(( ${1:-0} + 1 ))p"; }     # <i> → its device id; nothing without a GPU
+_base_servers_csv(){ # → COMFY_BASE_SERVERS: every server's loopback host:port, server 0 first
+  local i=1 n out
+  n="$(_base_server_count)"; out="127.0.0.1:$(_base_server_port 0)"
+  while [ "$i" -lt "$n" ]; do out="$out,127.0.0.1:$(_base_server_port "$i")"; i=$((i + 1)); done
+  echo "$out"
+}
+_base_server_state(){ local s="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; echo "${s:-$(dirname "$COMFY_LOG")}"; }
+_base_server_log(){ if [ "${1:-0}" = 0 ]; then echo "$COMFY_LOG"; else echo "${COMFY_LOG%.log}-gpu$1.log"; fi; }
+_base_server_dir(){ # <i> → server i's own folder (its temp and its database): beside server 0's temp folder, never inside it
+  local t
+  t="$(_base_launch_args 2>/dev/null | awk 'p{print; exit} $0=="--temp-directory"{p=1}')"
+  if [ -n "$t" ]; then echo "${t%/}/gpu$1"; else echo "$COMFY/temp-gpu$1"; fi     # ComfyUI's temp is <--temp-directory>/temp
+}
+_base_server_args(){ # <i> → the words server i>0 adds after the base's line (argparse takes the last): its own temp and database
+  local d; [ "${1:-0}" -gt 0 ] || return 0
+  d="$(_base_server_dir "$1")"
+  printf '%s\n' --temp-directory "$d"
+  # a ComfyUI without --database-url (before 0.3.4x) has no database to share, and would refuse the unknown flag
+  if grep -q -- '"--database-url"' "$COMFY/comfy/cli_args.py" 2>/dev/null; then printf '%s\n' --database-url "sqlite:///$d/comfyui.db"; fi
+}
+_base_servers_write(){ # state/servers.list: `index|port|gpu` per server, replaced whole at every start
+  local i=0 n f; n="$(_base_server_count)"; f="$(_base_server_state)/servers.list"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+  { while [ "$i" -lt "$n" ]; do echo "$i|$(_base_server_port "$i")|$(_base_server_gpu "$i")"; i=$((i + 1)); done; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+_base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints what would actually run (server 0's, 3.20.0)
+  local extra pv hf ff le cv=""
   extra="$(_base_launch_args 2>/dev/null | tr '\n' ' ')"; extra="${extra% }"
   pv="$(_base_preview_flags)"; hf="$(_base_hf_home)"; ff="$(_base_ffmpeg_path)"
   le="$(_base_launch_env 2>/dev/null | tr '\n' ' ')"; le="${le% }"     # 3.10.0: the launch environment, after the base's own two
+  if [ "$(_base_server_count)" -gt 1 ]; then cv="CUDA_VISIBLE_DEVICES=$(_base_server_gpu 0)"; le="$cv${le:+ $le}"; fi    # 3.20.0
   # `env HF_HOME=…`, not a bare assignment: the line is printed after `nohup`, and nohup would execute the assignment (2.0.11)
   printf '%s%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "${le:+env $le }" "$PY" "$(_base_comfy_listen)" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
 }
-_base_start_comfy(){
-  local extra=() w pv=()
+_base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), started together; 0 when server 0 answers
+  local extra=() w pv=() i rc
   _base_local_dirs
+  local _BASE_SERVER_N="" _BASE_WAIT_PID=""                         # read by the calls below (bash's dynamic scope)
+  _BASE_SERVER_N="$(_base_server_count)"                            # counted once: every call below reads it
   while IFS= read -r w; do extra+=("$w"); done < <(_base_launch_args)
   echo "  $(_base_start_cmd)"
   read -r -a pv <<< "$(_base_preview_flags)"
@@ -241,14 +315,14 @@ _base_start_comfy(){
   local le kv; le="$(_base_launch_env || true)"; [ -n "$le" ] && echo "  launch env: $(echo $le)" || true
   # 3.15.0: from the copy on the machine's own disk when there is a good one (lib/84-run-local.sh), else from the volume
   RUN_HERE_DIR="$COMFY"; RUN_HERE_PY="$PY"; if declare -F _base_run_here >/dev/null; then _base_run_here; fi
-  (cd "$RUN_HERE_DIR" && { if [ -n "$hf" ]; then export HF_HOME="$hf"; fi
-     if [ -n "$ff" ]; then export VHS_FORCE_FFMPEG_PATH="$ff"; fi
-     while IFS= read -r kv; do if [ -n "$kv" ]; then export "$kv"; fi; done <<< "$le"
-     # 3.1.0: where the base keeps its state, so a package's own route reads state/progress.json without guessing
-     # (boot.sh knows BASE_HOME from boot.env; an install knows BASE_STATE)
-     _cbs="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; if [ -n "$_cbs" ]; then export COMFY_BASE_STATE="$_cbs"; fi
-     unset BASE_LINK_TOKEN                        # 3.14.0: the key is the forwarder's alone; no pack in ComfyUI reads it
-     nohup "$RUN_HERE_PY" main.py --listen "$(_base_comfy_listen)" --port "$PORT" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} >> "$COMFY_LOG" 2>&1 & })
+  local servers st; servers="$(_base_servers_csv)"; st="$(_base_server_state)"
+  _base_servers_write
+  if [ "$_BASE_SERVER_N" -gt 1 ]; then echo "  $_BASE_SERVER_N servers, one per GPU: $servers (state/servers.list)"; fi
+  i=0
+  while [ "$i" -lt "$_BASE_SERVER_N" ]; do
+    _base_spawn_server "$i"
+    i=$((i + 1))
+  done
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
   # (ComfyUI-SeedVR2_VideoUpscaler 67 s, and thirty more packs behind it), so a flat 180 s window
   # declared `restart FAILED`, skipped smoke and combos, and failed the whole install — while the
@@ -257,17 +331,60 @@ _base_start_comfy(){
   # Waiting longer alone would be worse, not better: a server that DIED would then cost ten minutes
   # of silence. So the wait is patient while the process lives and gives up the moment it does not,
   # and it says which of the two happened.
-  _base_wait_comfy
+  # 3.20.0: server 0's answer is the result; with N servers its own pid says whether it lives (any main.py would)
+  if [ "$_BASE_SERVER_N" -gt 1 ]; then _BASE_WAIT_PID="$(cat "$st/comfyui.pid" 2>/dev/null || true)"; fi
+  _base_wait_comfy; rc=$?
+  i=1
+  while [ "$i" -lt "$_BASE_SERVER_N" ]; do      # started together, so by now these are up or nearly; one that fails is named
+    _base_wait_server "$i" || echo "  server $i (GPU $(_base_server_gpu "$i"), port $(_base_server_port "$i")) did not answer: $(_base_server_log "$i")"
+    i=$((i + 1))
+  done
+  return $rc
+}
+_base_spawn_server(){ # <i> → server i started in the background with the launch line's words, plus its own (3.20.0); its pid in state/
+  # Called by _base_start_comfy, whose locals (extra, pv, hf, ff, le, servers, st) it reads: bash's dynamic scope.
+  local i="$1" port listen log pidf gpu srv=() w
+  port="$(_base_server_port "$i")"; log="$(_base_server_log "$i")"; gpu="$(_base_server_gpu "$i")"
+  if [ "$i" = 0 ]; then listen="$(_base_comfy_listen)"; pidf="$st/comfyui.pid"
+  else listen=127.0.0.1; pidf="$st/comfyui-gpu$i.pid"; mkdir -p "$(_base_server_dir "$i")" 2>/dev/null || true
+    while IFS= read -r w; do srv+=("$w"); done < <(_base_server_args "$i")
+    echo "  server $i: GPU ${gpu:-?} on 127.0.0.1:$port ${srv[*]-}"
+  fi
+  (cd "$RUN_HERE_DIR" && { if [ -n "$hf" ]; then export HF_HOME="$hf"; fi
+     if [ -n "$ff" ]; then export VHS_FORCE_FFMPEG_PATH="$ff"; fi
+     while IFS= read -r kv; do if [ -n "$kv" ]; then export "$kv"; fi; done <<< "$le"
+     # 3.1.0: where the base keeps its state, so a package's own route reads state/progress.json without guessing
+     # (boot.sh knows BASE_HOME from boot.env; an install knows BASE_STATE)
+     _cbs="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; if [ -n "$_cbs" ]; then export COMFY_BASE_STATE="$_cbs"; fi
+     export COMFY_BASE_SERVERS="$servers" COMFY_BASE_SERVER_INDEX="$i"          # 3.20.0: every server, and which one this is
+     if [ "$_BASE_SERVER_N" -gt 1 ] && [ -n "$gpu" ]; then export CUDA_VISIBLE_DEVICES="$gpu"; fi
+     unset BASE_LINK_TOKEN                        # 3.14.0: the key is the forwarder's alone; no pack in ComfyUI reads it
+     nohup "$RUN_HERE_PY" main.py --listen "$listen" --port "$port" --enable-cors-header ${pv[@]+"${pv[@]}"} ${extra[@]+"${extra[@]}"} ${srv[@]+"${srv[@]}"} >> "$log" 2>&1 &
+     if [ "$_BASE_SERVER_N" -gt 1 ]; then echo $! > "$pidf" 2>/dev/null || true; fi; })      # one server needs no pid file
+}
+_base_wait_server(){ # <i> → 0 when server i>0 answers on its port; patient while its own process lives (3.20.0)
+  local i="$1" pid port waited=0 limit="${BASE_START_WAIT:-600}" tries="${BASE_START_TRIES:-}"
+  [ -n "$tries" ] && limit=$((tries * 2))
+  port="$(_base_server_port "$i")"; pid="$(cat "$(_base_server_state)/comfyui-gpu$i.pid" 2>/dev/null || true)"
+  while [ "$waited" -lt "$limit" ]; do
+    if curl -sf --max-time 5 "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then echo "  server $i up on 127.0.0.1:$port"; return 0; fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then echo "  server $i: its process is gone after $waited s"; return 1; fi
+    sleep 2; waited=$((waited + 2))
+  done
+  return 1
 }
 _base_wait_comfy(){ # [grace s] → 0 when HOSTPORT answers; patient while a ComfyUI process lives, done the moment none does
   # grace (3.0.3): how long no process at all still means "not started yet" rather than "died". A start through the boot
   # unit runs sshd, JupyterLab and the extensions first, so ComfyUI appears seconds after the unit does, not at once.
-  local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}"
+  # 3.20.0 _BASE_WAIT_PID: server 0's own pid, when N servers run; then only that process counts as alive
+  local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}" alive
   [ -n "$tries" ] && limit=$((tries * 2))            # older callers (and the suite) size it in 2 s tries
   while [ "$waited" -lt "$limit" ]; do
     sleep 2; waited=$((waited + 2))
     if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited s"; return 0; fi
-    if [ -n "$(_base_comfy_pids 2>/dev/null || true)" ]; then seen=1
+    if [ -n "${_BASE_WAIT_PID:-}" ]; then alive="$(kill -0 "$_BASE_WAIT_PID" 2>/dev/null && echo 1 || true)"
+    else alive="$(_base_comfy_pids 2>/dev/null || true)"; fi
+    if [ -n "$alive" ]; then seen=1
     elif [ "$seen" = 1 ] || [ "$waited" -ge "$grace" ]; then
       if [ "$seen" = 1 ] || [ "$grace" = 0 ]; then echo "  the ComfyUI process is gone after $waited s — it did not survive its own start"
       else echo "  no ComfyUI process after $waited s: the boot never started one (see state/logs/boot_*.log)"; fi

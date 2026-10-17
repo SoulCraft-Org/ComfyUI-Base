@@ -208,10 +208,11 @@ boot_comfy(){ # ComfyUI from the base's venv with the base's launch line, only w
   # detached start, outside the unit. Left running, it keeps the port and its VRAM and this boot's server is the second
   # GPU process beside it (MEASURED on a Verda machine: two main.py after `systemctl restart comfy-base-boot`).
   if [ -n "$(_base_comfy_pids 2>/dev/null || true)" ]; then
-    echo "boot: a ComfyUI this boot did not start is running: stopping it first (one GPU process per machine)"
+    echo "boot: a ComfyUI this boot did not start is running: stopping it first (one ComfyUI per GPU, all started by the boot)"
     if ! _base_stop_comfy; then echo "boot: it would not stop, so no second ComfyUI is started beside it"; return 0; fi
   fi
   echo "boot: starting ComfyUI: $(_base_start_cmd)"
+  # 3.20.0: one server per GPU (85-launch.sh), each named on its own line; server 0 on $HOSTPORT is the verdict here
   if _base_start_comfy; then echo "boot: ComfyUI answers on $HOSTPORT"; else echo "boot: ComfyUI did not answer within the wait — see $COMFY_LOG"; fi
   return 0
 }

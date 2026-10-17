@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.19.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.20.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -667,7 +667,8 @@ and a failed import check is a failure, never a rollback.
 | The host | `BASE_HOST`, `BASE_VOLUME`, `BASE_VOLUME_KIND`, `BASE_LISTEN` (§1); `state/host.env` when the driver wrote it |
 | The boot | `boot.sh`: PID 1 via podctl's start command on RunPod, the process of `comfy-base-boot.service` on a VM host: sshd (keys only) → JupyterLab (base tools venv, `JUPYTER_TOKEN`/`JUPYTER_PASSWORD`, else generated: never tokenless) → boot extensions (§9) → ComfyUI (base venv, base line, bound to `BASE_LISTEN`) → the app ports (3.9.0) → sleep forever |
 | App ports | `py/app_proxy.py` (standard library, any python3, never the GPU): one process for every row of `state/apps.d/*.list`, bound to `BASE_LISTEN`; on a public bind also ComfyUI's front (`--front 8188` on the machine's non-loopback addresses, ComfyUI on 127.0.0.1), and every link it serves needs the key (`BASE_LINK_TOKEN`: `?token=` once, then a host-only HttpOnly Secure SameSite=Lax cookie; else 401; loopback peers pass; constant-time; never logged; the cookie stripped before ComfyUI). `:<port>/<path>` → `127.0.0.1:8188/apps/<slug>/<path>`, except `ws upload view history queue interrupt`, which pass unchanged; one request per connection (`Connection: close` both ways), then bytes piped both ways, so bodies, streams and the websocket's 101 pass unparsed; `Host` and `Origin` untouched; a page that says ComfyUI is starting while it does not answer. `boot.sh --apps` restarts it (the install runs it) |
-| Restart | `_base_pids_from_table`: a python running `main.py` from the tree, or naming a `…/ComfyUI/main.py`; never PID 1 |
+| Servers | 3.20.0: one ComfyUI per GPU (`nvidia-smi --query-gpu=index`, or the machine's own `CUDA_VISIBLE_DEVICES`; `BASE_SERVERS` caps it, `1` is the single server of every earlier base; no GPU is one server). Server 0 is `$PORT` (8188) exactly as before (the front, the app ports and the links reach it alone); server i is `127.0.0.1:18188+i`, never a host port (8189 and up are app ports). All share the tree, venv, packs, models, launch env, args file and the input, output and user folders; each has `CUDA_VISIBLE_DEVICES` its own GPU, its own `--temp-directory <server 0's>/gpu<i>` (ComfyUI empties its temp at start) and `--database-url sqlite:///…/gpu<i>/comfyui.db` (when the ComfyUI has the flag), `logs/comfyui-gpu<i>.log`, `comfyui-gpu<i>.pid`. Every process gets `COMFY_BASE_SERVERS=127.0.0.1:8188,127.0.0.1:18189,…` (server 0 first) and `COMFY_BASE_SERVER_INDEX`: a package's runner sends parts to each by `POST /prompt` and `GET /history`. The default `OMP_NUM_THREADS` is the quota divided by N. Started together, at boot and at every restart; server 0's answer is the verdict, another that fails is named |
+| Restart | `_base_pids_from_table`: a python running `main.py` from the tree, or naming a `…/ComfyUI/main.py`; never PID 1. It stops every server; the start brings one up per GPU (3.20.0) |
 | Uploads | `<volume>/packages/` (`podctl upload`); each package extracted into its own folder there |
 | A baked image | a project's own (the base ships no generator): the base built at these very paths and parked on the container disk; a boot extension copies it onto an empty volume once and installs the project's packages, non-interactive, everything newest (§0.12) |
 | A buyer's machine | one OS disk and one NVMe data disk, created from nothing by `podctl create`; `runtime-apply` then `BASE_RUNTIME` + `BASE_STAGED=1` per package (`podctl buyer-install`); `pause` keeps the disks, `put-away` copies `output/` and `input/` to the Mac and deletes them (§0.3, §0.12) |
@@ -695,9 +696,9 @@ listens beyond loopback.
 every source), `boot.sh`, `comfy-base-boot.service` (the unit's text, always written; installed under
 `/etc/systemd/system` on a VM host), `ext/` when a project's image put extensions there (§9), `state/` (`boot.env`,
 `host.env` (`BASE_HOST`, `BASE_VOLUME`, written by the driver), `comfyui_args.txt`, `tokens.env` 0600, `apps.d/<package>.list`
-(3.9.0: the package's `APP_PORTS` rows), `launch.d/<id>.env` (3.10.0: each package's `LAUNCH_ENV`, §4),
+(3.9.0: the package's `APP_PORTS` rows), `launch.d/<id>.env` (3.10.0: each package's `LAUNCH_ENV`, §4), `servers.list` (3.20.0: `index|port|gpu` per ComfyUI server, replaced at every start) and, with more than one, `comfyui.pid` and `comfyui-gpu<i>.pid`,
 `constraints-torch.txt`, `boot-facts.txt`, `volume.env` on RunPod, `run.gen` (3.15.0: bumped when the code may have changed, read by the local copy's fingerprint), `gpu.lease`, `packages/<id>.manifest`, `logs/`: install
-logs, `boot_<ts>.log`, `comfyui.log`, `jupyter.log`, `app_proxy.log`, `fetch-later_<ts>.log`; 3.1.0: `last-run/<id>` (the last run's
+logs, `boot_<ts>.log`, `comfyui.log` (3.20.0: server 0's; `comfyui-gpu<i>.log` each other server's), `jupyter.log`, `app_proxy.log`, `fetch-later_<ts>.log`; 3.1.0: `last-run/<id>` (the last run's
 verdict), `runtime.json` and `runtime.stamp` (the applied runtime), and for a staged install `standins.list`,
 `later.queue`, `later.failed`, `fetch-later.pid` and `progress.json`:
 `{"format": 1, "updated", "stage": "first|later|done", "files": [{"file", "rel", "bytes", "state":
@@ -821,6 +822,24 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.20.0: one ComfyUI per GPU, so a multi-GPU pod renders several parts of one job at once (2026-10-17). The Video
+  Replacer renders about 1 s of B200 per output frame and a two-person swap is two passes, so a 45 s, 7-shot clip took
+  about 18 min of B200 per person on one GPU; split at its cuts, the shots are independent, and N GPUs finish it in the
+  time of its longest shot at the same cost per GPU-minute. The boot and the install's restart count the GPUs and start
+  one server on each (§6 Servers): server 0 unchanged on 8188 behind the front, server i on `127.0.0.1:18188+i` (not
+  8188+i: 8189 is the Video Replacer's app port), each with its own GPU, temp folder and database, all sharing the input,
+  output and user folders, and every one told the whole list in `COMFY_BASE_SERVERS`. Each server's packs load as on one
+  GPU, so a package's warm-up and readiness checks run on every GPU. The default `OMP_NUM_THREADS` is each server's share
+  of the CPU quota. `BASE_SERVERS=1` on the pod is the single server. `podctl create --gpus N` (1 to 8) puts N GPUs on the
+  pod: the stock check asks RunPod for N in each candidate data centre at once (`gpuTypes.lowestPrice` with the count and
+  `dataCenterId`, one aliased query; the old per-type view passes one free GPU for a 4-GPU pod), and before anything is
+  made every create prints RunPod's price for the pod and the RAM and vCPUs it comes with, then refuses when the
+  projected balance covers under one hour of today's spend plus this pod above the guard's floor. Read live on
+  2026-10-17: B200 x1 $7.99/h with 188 GB RAM and 24 vCPU; x2 $15.98/h, 502 GB, 48 vCPU (US-CA-2, US-NC-2); x4 and x8 none
+  free anywhere. `podctl status` names the servers. The GPU check (`py/gpu_facts.py`, podctl's `gpu_probe`) judges each
+  card by its own processes (by uuid): before, card 0's memory was set against every card's processes, which hid a
+  foreign tenant on any other card. Exercised on this Mac against fakes (a 4-GPU nvidia-smi stub, the
+  fake RunPod) by base CI; the GPU proof on a 2x B200 pod is the orchestrator's.
 - 3.19.1: one click on every Connect-tab link (Paul, 2026-10-17: "can you fix this so I can click the links?"). On a pod
   from 3.14.0 to 3.18.2, RunPod's own Connect links for ComfyUI, each app and the Jupyter Terminal landed on "This link
   needs its key" or Jupyter's token page; the only way in was the full link from the Logs tab or `podctl status`, once

@@ -1599,6 +1599,26 @@ def test_unit_gpu_facts_names_memory_held_outside_the_container(tmp_path):
     assert subprocess.run([sys.executable, str(BASE / "py" / "gpu_facts.py")], capture_output=True, text=True, env=env).stdout.strip() == "verdict=no-gpu"
 
 
+def test_unit_gpu_facts_judges_each_card_by_its_own_processes(tmp_path):
+    """3.20.0: one ComfyUI per GPU. Each card is judged by the processes on IT (nvidia-smi's uuid ties them): servers
+    holding their own cards are ours; a card whose memory nobody visible holds is NOT-OURS however clean the others are.
+    Before, card 0's memory was set against every card's processes, which hid a foreign tenant on any other card."""
+    import subprocess, sys
+    sys.path.insert(0, str(BASE / "py")); import gpu_facts
+    cards = [(183000, 90000, "GPU-a"), (183000, 91000, "GPU-b")]
+    apps = [(11, 89500, "GPU-a"), (12, 90500, "GPU-b")]
+    assert gpu_facts.verdict_many(cards, apps) == (366000, 181000, 180000, 1000, "ours")
+    assert gpu_facts.verdict_many(cards, apps[:1])[-1] == "NOT-OURS", "card b's 91 GB are nobody's we can see"
+    assert gpu_facts.verdict_many([(97887, 95258, "")], [(1903, 1698, "")]) == (97887, 95258) + gpu_facts.verdict(97887, 95258, [(1903, 1698)])
+    d = tmp_path / "smi"; d.mkdir()
+    (d / "nvidia-smi").write_text('#!/bin/bash\ncase "$*" in *query-gpu=memory*) printf "183000, 90000, GPU-a\\n183000, 91000, GPU-b\\n";; '
+                                  '*query-compute-apps*) printf "11, 89500, GPU-a\\n12, 90500, GPU-b\\n";; *) exit 1;; esac\n')
+    (d / "nvidia-smi").chmod(0o755)
+    env = {**os.environ, "PATH": "%s:%s" % (d, os.environ["PATH"])}
+    out = subprocess.run([sys.executable, str(BASE / "py" / "gpu_facts.py")], capture_output=True, text=True, env=env).stdout.strip()
+    assert out == "total=366000 used=181000 ours=180000 foreign=1000 procs=2 gpus=2 verdict=ours", out
+
+
 def test_unit_discovery_fails_the_run_when_the_gpu_is_not_ours():
     """The gate: a NOT-OURS line is a failed run with the remedy printed; an ours line is a fact; no answer is a note."""
     r = _bash('BASE_GPU_LINE="total=97887 used=95258 ours=1698 foreign=93560 procs=1 verdict=NOT-OURS"; _base_gpu_headroom; echo F=${#BASE_FAILED[@]}; printf "%s\\n" "${BASE_FAILED[@]}"')
@@ -2086,6 +2106,32 @@ def test_unit_boot_sh_starts_sshd_then_jupyter_then_comfyui_and_never_exits(tmp_
     # sleep infinity only when not BOOT_ONCE: the script's last statement
     src = (BASE / "lib" / "boot.sh").read_text()
     assert "sleep infinity" in src and "trap 'exit 0' TERM" in src
+
+
+def test_unit_boot_sh_starts_one_comfyui_per_gpu(tmp_path):
+    """3.20.0: a pod with four GPUs boots four servers at once: 8188 (the one the links and the app ports reach) and
+    18189-18191 on loopback, the boot log naming them, state/servers.list written; server 0's answer is the verdict."""
+    from basetest import fake_pod, run_script
+    STUB = _stub()
+    fake_pod(tmp_path, STUB, layout="official")
+    assert run_script(STUB / "stub-script.sh", fake_root=tmp_path).returncode == 0
+    bin_, log = _boot_stubs(tmp_path)
+    (bin_ / "nvidia-smi").write_text("#!/bin/bash\ncase \"$*\" in *--query-gpu=index*) printf '0\\n1\\n2\\n3\\n' ;; esac\nexit 0\n")
+    (bin_ / "nvidia-smi").chmod(0o755)
+    r, blog = _run_boot_sh(tmp_path, bin_, {"BASE_CGROUP_ROOT": str(tmp_path / "no-cgroup")})
+    assert r.returncode == 0, r.stderr + blog
+    assert "4 servers, one per GPU: 127.0.0.1:8188,127.0.0.1:18189,127.0.0.1:18190,127.0.0.1:18191" in blog, blog
+    assert "boot: starting ComfyUI: env CUDA_VISIBLE_DEVICES=0 " in blog and "boot: ComfyUI answers on 127.0.0.1:8188" in blog, blog
+    import time
+    for _ in range(50):
+        launches = [l for l in log.read_text().splitlines() if l.startswith("python main.py")]
+        if len(launches) >= 4:
+            break
+        time.sleep(0.1)
+    assert sorted(l.split("--port ")[1].split()[0] for l in launches) == ["18189", "18190", "18191", "8188"], launches
+    assert all(l.startswith("python main.py --listen 127.0.0.1 ") for l in launches), launches
+    rows = (tmp_path / "comfy-base" / "state" / "servers.list").read_text().splitlines()
+    assert rows == ["0|8188|0", "1|18189|1", "2|18190|2", "3|18191|3"], rows
 
 
 def test_unit_boot_sh_refuses_to_start_a_venv_that_cannot_import_torch_and_says_so(tmp_path):
@@ -2786,6 +2832,112 @@ def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path):
               % (state, bin_ / "python", comfy, tmp_path / "nohup.out"), env=env)
     assert "LINE=env CT2_VERBOSE=1 OMP_NUM_THREADS=2 %s main.py" % (bin_ / "python") in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
     assert "python env OMP=2 CT2=1" in log.read_text()
+
+
+# ---------------------------------------------------------------- 3.20.0: one ComfyUI per GPU
+
+def _gpus(tmp_path, n, **extra):
+    """A PATH with an nvidia-smi that lists n GPUs, and an environment without the machine's own GPU or server choices."""
+    bin_ = tmp_path / "bin"; bin_.mkdir(exist_ok=True)
+    rows = "".join("%d\\n" % i for i in range(n))
+    (bin_ / "nvidia-smi").write_text("#!/bin/bash\ncase \"$*\" in *--query-gpu=index*) printf '%s' ;; esac\nexit 0\n" % rows)
+    (bin_ / "nvidia-smi").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k not in ("CUDA_VISIBLE_DEVICES", "BASE_SERVERS", "OMP_NUM_THREADS", "BASE_NVIDIA_SMI")}
+    env.update({"PATH": "%s:/usr/bin:/bin" % bin_, "BASE_CGROUP_ROOT": str(tmp_path / "no-cgroup")})    # no quota unless a test sets one
+    env.update(extra)
+    return bin_, env
+
+
+def _sh(snippet, env):
+    return subprocess.run(["bash", "-c", 'source "%s/base.sh"; %s' % (BASE, snippet)], capture_output=True, text=True, env=env)
+
+
+def test_unit_servers_one_per_gpu_each_on_its_own_port_temp_and_database(tmp_path):
+    """3.20.0: N GPUs, N servers. Server 0 is 8188 as ever; server i listens on 18188+i (8189 and up are the packages' app
+    ports), with its own temp folder beside server 0's (ComfyUI empties its temp at start) and its own SQLite database
+    (when this ComfyUI has --database-url). The machine's own CUDA_VISIBLE_DEVICES is the GPU list when set; BASE_SERVERS
+    caps the count; no GPU at all is one server, as before."""
+    comfy = tmp_path / "ComfyUI"; (comfy / "comfy").mkdir(parents=True)
+    (comfy / "comfy" / "cli_args.py").write_text('parser.add_argument("--database-url", type=str, default=None)\n')
+    args = tmp_path / "comfyui_args.txt"; args.write_text("--temp-directory /x/local/temp\n--disable-api-nodes\n")
+    _, env = _gpus(tmp_path, 4)
+    pre = 'COMFY="%s"; PORT=8188; ARGS_FILE="%s"; PY=/v/bin/python; ' % (comfy, args)
+    r = _sh(pre + 'echo N=$(_base_server_count); echo CSV=$(_base_servers_csv); echo GPU3=$(_base_server_gpu 3); '
+                  'echo ARGS0=[$(_base_server_args 0)]; echo ARGS2=$(_base_server_args 2); echo LINE=$(_base_start_cmd)', env)
+    out = r.stdout
+    assert "N=4\n" in out and "CSV=127.0.0.1:8188,127.0.0.1:18189,127.0.0.1:18190,127.0.0.1:18191\n" in out and "GPU3=3\n" in out, out + r.stderr
+    assert "ARGS0=[]\n" in out, "server 0 adds nothing: it is the server every base before 3.20.0 ran"
+    assert "ARGS2=--temp-directory /x/local/temp/gpu2 --database-url sqlite:////x/local/temp/gpu2/comfyui.db\n" in out, out
+    assert "LINE=env CUDA_VISIBLE_DEVICES=0 /v/bin/python main.py" in out, out
+    # no --database-url in this ComfyUI: no flag it would refuse; no --temp-directory in the args file: a folder beside the tree
+    (comfy / "comfy" / "cli_args.py").write_text("# old\n"); args.write_text("--disable-api-nodes\n")
+    r = _sh(pre + 'echo ARGS1=$(_base_server_args 1)', env)
+    assert "ARGS1=--temp-directory %s/temp-gpu1\n" % comfy in r.stdout, r.stdout + r.stderr
+    # the cap, the machine's own GPU list, and no GPU at all
+    for extra, n, csv in (({"BASE_SERVERS": "2"}, 2, "127.0.0.1:8188,127.0.0.1:18189"), ({"BASE_SERVERS": "1"}, 1, "127.0.0.1:8188"),
+                          ({"CUDA_VISIBLE_DEVICES": "2,3"}, 2, "127.0.0.1:8188,127.0.0.1:18189"), ({"CUDA_VISIBLE_DEVICES": ""}, 1, "127.0.0.1:8188"),
+                          ({"CUDA_VISIBLE_DEVICES": "-1"}, 1, "127.0.0.1:8188"), ({"BASE_NVIDIA_SMI": str(tmp_path / "none")}, 1, "127.0.0.1:8188")):
+        r = _sh(pre + 'echo N=$(_base_server_count) CSV=$(_base_servers_csv) G0=$(_base_server_gpu 0) G1=$(_base_server_gpu 1)', dict(env, **extra))
+        assert ("N=%d CSV=%s " % (n, csv)) in r.stdout, (extra, r.stdout, r.stderr)
+        if extra.get("CUDA_VISIBLE_DEVICES") == "2,3":
+            assert "G0=2 G1=3" in r.stdout, "server i runs on the i-th GPU the machine lets it see"
+    r = _sh(pre + 'echo LINE=$(_base_start_cmd)', dict(env, BASE_SERVERS="1"))
+    assert "CUDA_VISIBLE_DEVICES" not in r.stdout, "one server: the launch line of every base before 3.20.0"
+
+
+def test_unit_servers_share_the_cpu_quota(tmp_path):
+    """The base's default OMP_NUM_THREADS is the container's CPU quota; N servers each get their share of it (at least
+    one), never the whole quota N times over. A package's or the machine's own value still wins, as before."""
+    cg = _cgroup(tmp_path, v2="1600000 100000")
+    _, env = _gpus(tmp_path, 4, BASE_CGROUP_ROOT=str(cg))
+    q = int(_sh("_base_cpu_quota", env).stdout.strip())                    # 16, or the CPUs this machine has when fewer
+    state = tmp_path / "state"; (state / "launch.d").mkdir(parents=True)
+    le = 'BASE_STATE="%s"; _base_launch_env' % state
+    assert _sh(le, env).stdout == "OMP_NUM_THREADS=%d\n" % max(1, q // 4)
+    assert _sh(le, dict(env, BASE_SERVERS="1")).stdout == "OMP_NUM_THREADS=%d\n" % q
+    (state / "launch.d" / "pkg.env").write_text("OMP_NUM_THREADS=8\n")
+    assert _sh(le, env).stdout == "OMP_NUM_THREADS=8\n", "a package's own value is never divided"
+
+
+def test_unit_servers_start_together_each_on_its_gpu_with_the_server_list(tmp_path):
+    """_base_start_comfy starts every server at once: server i gets CUDA_VISIBLE_DEVICES=i, COMFY_BASE_SERVERS (the same
+    list in every process, server 0 first) and COMFY_BASE_SERVER_INDEX=i, its port, loopback, its own log and pid file;
+    state/servers.list names them. Server 0's answer is the result."""
+    bin_, env = _gpus(tmp_path, 3)
+    log = tmp_path / "calls.log"
+    (bin_ / "python").write_text('#!/bin/bash\necho "CVD=${CUDA_VISIBLE_DEVICES-unset} SRV=${COMFY_BASE_SERVERS-unset} IDX=${COMFY_BASE_SERVER_INDEX-unset} argv=$*" >> "%s"\n' % log)
+    (bin_ / "curl").write_text("#!/bin/bash\nexit 0\n")
+    for p in (bin_ / "python", bin_ / "curl"): p.chmod(0o755)
+    comfy = tmp_path / "ComfyUI"; comfy.mkdir(); state = tmp_path / "state"; state.mkdir()
+    args = tmp_path / "args.txt"; args.write_text("--temp-directory %s/local/temp\n" % tmp_path)
+    r = _sh('BASE_STATE="%s"; PY="%s"; COMFY="%s"; PORT=8188; HOSTPORT=127.0.0.1:8188; ARGS_FILE="%s"; COMFY_LOG="%s/logs/comfyui.log"; '
+            'BASE_LISTEN=0.0.0.0; BASE_START_TRIES=3; _base_start_comfy; echo RC=$?' % (state, bin_ / "python", comfy, args, tmp_path), env)
+    assert "RC=0" in r.stdout and "3 servers, one per GPU: 127.0.0.1:8188,127.0.0.1:18189,127.0.0.1:18190" in r.stdout, r.stdout + r.stderr
+    import time
+    for _ in range(50):
+        if log.exists() and len(log.read_text().splitlines()) >= 3:
+            break
+        time.sleep(0.1)
+    lines = sorted(log.read_text().splitlines(), key=lambda l: l.split("IDX=")[1])
+    srv = "SRV=127.0.0.1:8188,127.0.0.1:18189,127.0.0.1:18190"
+    for i, line in enumerate(lines):
+        assert ("CVD=%d %s IDX=%d argv=main.py --listen 127.0.0.1 --port %d " % (i, srv, i, 8188 if i == 0 else 18188 + i)) in line, line
+        assert ("--temp-directory %s/local/temp/gpu%d" % (tmp_path, i) in line) == (i > 0), line
+    assert len(lines) == 3, lines
+    assert (state / "servers.list").read_text() == "0|8188|0\n1|18189|1\n2|18190|2\n"
+    assert all((state / ("comfyui%s.pid" % s)).read_text().strip().isdigit() for s in ("", "-gpu1", "-gpu2"))
+    assert (tmp_path / "logs" / "comfyui-gpu2.log").exists() and (tmp_path / "local" / "temp" / "gpu1").is_dir()
+    assert "server 1 up on 127.0.0.1:18189" in r.stdout and "server 2 up on 127.0.0.1:18190" in r.stdout, r.stdout
+    # one GPU: one server, no pid file, the list still written; no CUDA_VISIBLE_DEVICES of the base's own
+    log.unlink(); [p.unlink() for p in state.glob("*.pid")]
+    r = _sh('BASE_STATE="%s"; PY="%s"; COMFY="%s"; PORT=8188; HOSTPORT=127.0.0.1:8188; ARGS_FILE="%s"; COMFY_LOG="%s/logs/comfyui.log"; '
+            'BASE_START_TRIES=3; _base_start_comfy; echo RC=$?' % (state, bin_ / "python", comfy, args, tmp_path), dict(env, BASE_SERVERS="1"))
+    for _ in range(50):
+        if log.exists():
+            break
+        time.sleep(0.1)
+    assert "RC=0" in r.stdout and log.read_text().startswith("CVD=unset SRV=127.0.0.1:8188 IDX=0 argv=main.py"), log.read_text()
+    assert (state / "servers.list").read_text() == "0|8188|0\n" and not list(state.glob("*.pid"))
 
 
 def test_unit_launch_env_is_written_per_package_and_removed_when_dropped(tmp_path):

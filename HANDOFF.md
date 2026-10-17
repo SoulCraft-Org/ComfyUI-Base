@@ -129,6 +129,28 @@ the Video Replacer (the PR has the numbers).
   lets `testbed.sh` provision, and whether the proxy lets `gh pr comment` through.
 - A package's first `objinfo.py save` from the pod, so its prompts are checked against the pod's own lists.
 
+## 7. One ComfyUI per GPU, podctl create --gpus N (3.20.0)   (2026-10-17, no pod used)
+
+**Why.** A multi-GPU pod ran one ComfyUI on GPU 0 and left the rest idle. The Video Replacer (5.9.0) splits a clip at
+its cuts into independent shots; N servers render N shots at once, each exactly as one GPU would.
+
+**What changed.** `lib/85-launch.sh`: `_base_server_count` (GPUs, capped by `BASE_SERVERS`), `_base_spawn_server` (one per
+GPU: `CUDA_VISIBLE_DEVICES`, port 8188 or `127.0.0.1:18188+i`, its own temp folder and database, `COMFY_BASE_SERVERS` and
+`COMFY_BASE_SERVER_INDEX`), `state/servers.list`, the quota's `OMP_NUM_THREADS` split by N. `lib/boot.sh` and the install's
+restart start them all through `_base_start_comfy`. `hosts/runpod/provider.py`: `create_body(gpu_count=)`,
+`stock_count` / `count_rows` (lowestPrice with the count, one aliased query), `price()`. `podctl create --gpus N`, the
+money guard (`money_guard`: price, RAM and vCPUs, refused under one hour of balance), `podctl status` names the servers.
+`py/gpu_facts.py` and podctl's `gpu_probe`: each card judged by its own processes (`verdict_many`, by uuid).
+
+**Proven, and how.** The suite on this Mac against fakes: a 4-GPU `nvidia-smi` stub through the launch functions, the
+start and the fake pod's boot; the fake RunPod for `--gpus 2`, the count query, the price line and the STOP. CI on the PR.
+
+**Owed (the orchestrator's GPU proof, 2x B200: x4 and x8 had no Secure stock on 2026-10-17).**
+- The boot log's `2 servers, one per GPU`, both servers' `/system_stats` naming their own GPU, and each package's warm-up
+  on each.
+- One shot rendered on server 1 is byte-identical in content to the same shot on server 0 (same seed).
+- Host RAM with both servers loaded (the 4/8 rows of `lowestPrice` once they have stock).
+
 ## Requests
 
 ### 1. To the MiniMax H3 Video Replacer: declare the app's port

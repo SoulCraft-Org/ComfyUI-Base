@@ -190,7 +190,7 @@ _base_restart_proven(){ # _base_restart_comfy; when the import check rode along 
   return 0
 }
 
-_base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactly ONE up, wait for it; 0 when it answers
+_base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactly ONE up per GPU (3.20.0), wait; 0 when server 0 answers
   # MEASURED on a Verda machine: the install's restart started ComfyUI as a detached process (ppid 1) outside the boot
   # unit's cgroup, so a later `systemctl restart comfy-base-boot` started a SECOND one beside it: two main.py, the old
   # one holding :8188 and 34 GB of VRAM. Where the unit owns ComfyUI the restart goes through the unit, so the server
