@@ -1,7 +1,7 @@
 # Security
 
 **Reporting.** Please report a vulnerability privately, not in a public issue: **Report a vulnerability** on this
-repository's Security tab (GitHub private vulnerability reporting), or email support@soul-craft.com with the subject
+repository's Security tab (GitHub private vulnerability reporting), or email support@soulcraft.computer with the subject
 "security". Say what is affected (the version is the handbook's first line), how to reproduce it, and what an attacker
 gains. You get an answer within five working days; a fix ships as a new `base-vX.Y.Z` tag.
 
