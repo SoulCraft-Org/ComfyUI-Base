@@ -18,11 +18,21 @@ The rule. A GPU fits when its architecture (sm) is one a preferred class has, or
 oldest preferred class AND has at least 90 % of the smallest preferred class's memory (a newer chip with the memory,
 before this table names it). Everything else is below. A MIG slice is never its parent class: RunPod sells
 "NVIDIA B300 SXM6 AC MIG 1g.34gb", 34 GB of a B300.
+
+Which test lane (3.21.0). LANES lists the GPUs a smoke can run on, cheapest first (Kaggle, HF ZeroGPU, Modal's
+credits, then RunPod, which is paid), and pick_lane(peak_gib, minutes, needs) returns the first whose card holds the
+measured peak plus HEADROOM and whose own limit holds the run:
+
+    python3 gpu_fit.py --peak-gib 35.7 --minutes 10 --needs "bf16"   # lane=zerogpu-large ... paid=no
+    python3 gpu_fit.py --peak-gib 69 --minutes 60 --needs "B200"     # a GPU class is judged by fits(), as GPU_PREFER is
+
+Exit 0 with a lane, 1 with lane=none, 2 for an unknown need.
 """
 from __future__ import annotations
 
 import argparse
 import re
+from collections import namedtuple
 import subprocess
 import sys
 
@@ -90,6 +100,86 @@ def fits(prefer: list[str], cc: str | None, mib: int | None, name: str = "") -> 
     return "below"
 
 
+# 3.21.0: the test lanes, cheapest first. A smoke takes the first lane whose card holds its measured peak with HEADROOM
+# to spare and whose own limit holds the run (pick_lane). gb is the memory the vendor states; minutes is the longest
+# one run may take there, None for no limit of the lane's own; server says a ComfyUI server can stay up (ZeroGPU runs
+# per-call Gradio functions, so no). First-party: Modal's pricing page (per-second GPU prices, $30 a month of credits)
+# and timeouts guide (1 s to 24 h per call); HF's ZeroGPU docs (`large` is half an RTX PRO 6000, `xlarge` the whole card
+# at twice the quota rate). A paid lane (RunPod) comes last and still needs its owner's yes.
+HEADROOM = 0.10             # the Kaggle harness calls a peak past 95 % of the card "tight"; 10 % keeps clear of that
+KAGGLE_SESSION_MIN = 12 * 60
+ZEROGPU_CAP_MIN = 30        # our own cap on the PRO quota's 40 daily minutes; past the quota HF bills credits
+MODAL_CREDITS_USD = 30.0
+MODAL_MAX_MIN = 24 * 60
+DTYPES = ("fp16", "bf16", "fp8", "fp4")
+
+Lane = namedtuple("Lane", "name gpu cc gb minutes server paid")
+
+
+def _modal_min(usd_s: float) -> int:
+    """The minutes the month's credits buy at this GPU's list price, within Modal's 24 h per call."""
+    return min(MODAL_MAX_MIN, int(MODAL_CREDITS_USD / usd_s / 60))
+
+
+LANES = (
+    Lane("kaggle-t4", "NVIDIA T4", "7.5", 16, KAGGLE_SESSION_MIN, True, False),
+    Lane("kaggle-l4", "NVIDIA L4", "8.9", 24, KAGGLE_SESSION_MIN, True, False),
+    Lane("zerogpu-large", "half an NVIDIA RTX PRO 6000", "12.0", 48, ZEROGPU_CAP_MIN, False, False),
+    Lane("zerogpu-xlarge", "NVIDIA RTX PRO 6000", "12.0", 96, ZEROGPU_CAP_MIN // 2, False, False),
+    Lane("modal-t4", "NVIDIA T4", "7.5", 16, _modal_min(0.000164), True, False),
+    Lane("modal-l4", "NVIDIA L4", "8.9", 24, _modal_min(0.000222), True, False),
+    Lane("modal-a10", "NVIDIA A10", "8.6", 24, _modal_min(0.000306), True, False),
+    Lane("modal-l40s", "NVIDIA L40S", "8.9", 48, _modal_min(0.000542), True, False),
+    Lane("modal-a100-80gb", "NVIDIA A100 80GB", "8.0", 80, _modal_min(0.000694), True, False),
+    Lane("modal-rtx-pro-6000", "NVIDIA RTX PRO 6000", "12.0", 96, _modal_min(0.000842), True, False),
+    Lane("modal-b200", "NVIDIA B200", CLASSES["B200"][0], CLASSES["B200"][1], _modal_min(0.001736), True, False),
+    Lane("runpod-rtx-pro-6000", "NVIDIA RTX PRO 6000", "12.0", 96, None, True, True),
+    Lane("runpod-b200", "NVIDIA B200", CLASSES["B200"][0], CLASSES["B200"][1], None, True, True),
+    Lane("runpod-b300", "NVIDIA B300", CLASSES["B300"][0], CLASSES["B300"][1], None, True, True),
+)
+
+
+def fast_dtypes(cc: str) -> list[str]:
+    """The dtypes this architecture's tensor cores run natively: bf16 from Ampere (8.0), fp8 from Ada (8.9), fp4 from
+    Blackwell (10.0). A T4 (7.5) has fp16 alone."""
+    k = _cc_key(cc)
+    return [d for d, floor in zip(DTYPES, ((0, 0), (8, 0), (8, 9), (10, 0))) if k >= floor]
+
+
+def pick_lane(peak_gib: float, minutes: float, needs=(), lanes=LANES) -> Lane | None:
+    """The cheapest lane whose card holds `peak_gib` (measured, e.g. torch.cuda.max_memory_reserved) plus HEADROOM,
+    whose limit holds a run of `minutes`, and which has every need: a fast dtype (fp16 bf16 fp8 fp4), `server`, or GPU
+    classes from CLASSES, judged by fits() exactly as a package's GPU_PREFER is. None when no lane holds it.
+    `needs` is a list or a string in GPU_PREFER's form ("bf16 server"); an unknown need is a ValueError."""
+    needs = parse_prefer(needs) if isinstance(needs, str) else list(needs)
+    bad = [n for n in needs if n not in DTYPES and n != "server" and n not in CLASSES]
+    if bad:
+        raise ValueError("unknown need %s (known: %s, server, %s)" % (", ".join(bad), " ".join(DTYPES), " ".join(CLASSES)))
+    if peak_gib < 0 or minutes < 0:
+        raise ValueError("peak_gib and minutes are measured amounts, never negative")
+    classes = [n for n in needs if n in CLASSES]
+    for lane in lanes:
+        if peak_gib * (1 + HEADROOM) > lane.gb * 1e9 / 2 ** 30:
+            continue
+        if lane.minutes is not None and minutes > lane.minutes:
+            continue
+        if "server" in needs and not lane.server:
+            continue
+        if not {n for n in needs if n in DTYPES} <= set(fast_dtypes(lane.cc)):
+            continue
+        if classes and fits(classes, lane.cc, int(lane.gb * 1e9 / 2 ** 20), lane.gpu) != "ok":
+            continue
+        return lane
+    return None
+
+
+def lane_line(lane: Lane | None, peak_gib: float, minutes: float, needs: str) -> str:
+    if lane is None:
+        return "\t".join(("lane=none", "peak_gib=%g" % peak_gib, "minutes=%g" % minutes, "needs=%s" % needs))
+    return "\t".join(("lane=%s" % lane.name, "gpu=%s" % lane.gpu, "sm=%s" % sm_of(lane.cc), "gb=%d" % lane.gb,
+                      "minutes=%s" % ("none" if lane.minutes is None else lane.minutes), "paid=%s" % ("yes" if lane.paid else "no")))
+
+
 def _smi():
     """(name, cc, total MiB) of the first GPU, or None when nvidia-smi does not answer."""
     try:
@@ -117,7 +207,16 @@ def main(argv=None):
     ap.add_argument("--prefer", default="")
     ap.add_argument("--check", metavar="PREFER")
     ap.add_argument("--name"); ap.add_argument("--cc"); ap.add_argument("--mib", type=int)
+    ap.add_argument("--peak-gib", type=float); ap.add_argument("--minutes", type=float, default=0.0)
+    ap.add_argument("--needs", default="")
     a = ap.parse_args(argv)
+    if a.peak_gib is not None:
+        try:
+            lane = pick_lane(a.peak_gib, a.minutes, a.needs)
+        except ValueError as e:
+            print(e); return 2
+        print(lane_line(lane, a.peak_gib, a.minutes, a.needs))
+        return 0 if lane else 1
     if a.check is not None:
         bad = unknown_classes(parse_prefer(a.check))
         if bad:

@@ -257,6 +257,51 @@ def test_unit_gpu_fit_names_b200_and_b300_and_judges_every_other_gpu_below(tmp_p
     assert r.returncode == 1 and "H9000" in r.stdout
 
 
+def test_unit_pick_lane_takes_the_cheapest_lane_that_holds_the_peak_and_the_run(tmp_path):
+    """3.21.0: pick_lane(peak_gib, minutes, needs) walks LANES cheapest first (Kaggle, ZeroGPU, Modal's credits, then
+    paid RunPod) and returns the first whose card holds the measured peak plus 10 % and whose own limit holds the run.
+    The peaks are measured ones: Photo Auditor's 17.72 GB reserved on a Modal L4, Krea 2's 35.7 GB in bf16, Flux 2 Dev's
+    fp8 transformer and encoder together. A GPU class in `needs` is judged by fits(), the GPU_PREFER rule, never a copy."""
+    sys.path.insert(0, str(BASE / "py")); import gpu_fit
+
+    def pick(*a):
+        lane = gpu_fit.pick_lane(*a)
+        return lane.name if lane else None
+    assert pick(12, 20) == "kaggle-t4"
+    assert pick(14, 20) == "kaggle-l4"                              # 14 GiB plus 10 % is past a T4's 14.9 GiB
+    assert pick(12, 20, "bf16") == "kaggle-l4"                      # a T4 (sm_75) has fp16 alone
+    assert pick(12, 20, ["bf16", "server"]) == "kaggle-l4"
+    assert pick(17.72, 10) == "kaggle-l4"
+    assert pick(35.7, 10) == "zerogpu-large"
+    assert pick(35.7, 10, "server") == "modal-l40s"                 # ZeroGPU runs per-call functions, no server
+    assert pick(35.7, 45) == "modal-l40s"                           # past the 30-minute ZeroGPU cap
+    assert pick(71.1, 10, "fp8") == "zerogpu-xlarge"
+    assert pick(71.1, 20, "fp8") == "modal-rtx-pro-6000"            # xlarge costs the quota twice: 15 minutes
+    assert pick(60, 60) == "modal-a100-80gb" and pick(60, 60, "fp8") == "modal-rtx-pro-6000"   # an A100 has no fp8
+    assert pick(69, 60, "B200") == "modal-b200"                     # an RTX PRO 6000 holds it but is below B200
+    assert pick(69, 600, "B200") == "runpod-b200" and gpu_fit.pick_lane(69, 600, "B200").paid   # past the $30
+    assert pick(150, 60) == "modal-b200" and pick(240, 60) == "runpod-b300"
+    assert pick(300, 1) is None
+    lanes = {lane.name: lane for lane in gpu_fit.LANES}
+    assert lanes["modal-b200"].minutes == 288 and lanes["modal-rtx-pro-6000"].minutes == 593   # $30 at list price
+    assert lanes["modal-l4"].minutes == 24 * 60                     # Modal's own 24 h per call
+    assert [lane.paid for lane in gpu_fit.LANES] == sorted(lane.paid for lane in gpu_fit.LANES)   # paid lanes last
+    assert gpu_fit.fast_dtypes("7.5") == ["fp16"] and gpu_fit.fast_dtypes("8.0") == ["fp16", "bf16"]
+    assert gpu_fit.fast_dtypes("8.9") == ["fp16", "bf16", "fp8"] and gpu_fit.fast_dtypes("12.0") == list(gpu_fit.DTYPES)
+    with pytest.raises(ValueError):
+        gpu_fit.pick_lane(12, 20, "bf17")
+    with pytest.raises(ValueError):
+        gpu_fit.pick_lane(-1, 20)
+    cli = [sys.executable, str(BASE / "py" / "gpu_fit.py")]
+    r = subprocess.run(cli + ["--peak-gib", "35.7", "--minutes", "10", "--needs", "bf16"], capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.rstrip("\n").split("\t") == [
+        "lane=zerogpu-large", "gpu=half an NVIDIA RTX PRO 6000", "sm=sm_120", "gb=48", "minutes=30", "paid=no"], r.stdout
+    r = subprocess.run(cli + ["--peak-gib", "300", "--minutes", "1"], capture_output=True, text=True)
+    assert r.returncode == 1 and r.stdout.startswith("lane=none\t"), r.stdout
+    r = subprocess.run(cli + ["--peak-gib", "12", "--needs", "bf17"], capture_output=True, text=True)
+    assert r.returncode == 2 and "bf17" in r.stdout
+
+
 def test_unit_a_gpu_below_gpu_prefer_is_a_warning_in_the_banner_and_a_typo_is_refused(tmp_path):
     """The pod's own run (preflight and the real run share base_init → base_banner) says, once, whether this GPU is the one
     the package is tuned for: a warning that lands in the SUMMARY (podctl prints it), never a failure. An unknown class
