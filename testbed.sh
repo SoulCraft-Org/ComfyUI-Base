@@ -88,15 +88,30 @@ own_pids() {
   done
 }
 
-# Who listens on a port (pids), or "?" when something accepts a connection there and lsof is not on this host to say who.
-# NB: lsof exits 1 when nothing matches, and `set -o pipefail` propagates that, so every lookup needs `|| true`.
+# Who listens on a port (pids), or "?" when something accepts a connection there and nothing on this host can say who.
+# lsof first; then, on Linux, /proc (3.20.1: a container such as the soulcraft-hf runner has no lsof, and every holder
+# read "?"). NB: lsof exits 1 when nothing matches, and `set -o pipefail` propagates that, so every lookup needs `|| true`.
 port_holders() { # [port] (default $PORT)
-  local port="${1:-$PORT}"
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u || true
-  elif (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-    echo "?"
+  local port="${1:-$PORT}" pids=""
+  command -v lsof >/dev/null 2>&1 && pids="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | sort -u || true)"
+  [ -n "$pids" ] || pids="$(proc_port_holders "$port")"
+  if [ -n "$pids" ]; then echo "$pids"
+  elif (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then echo "?"
   fi
+}
+
+# Linux without lsof: the LISTEN rows (st 0A) of /proc/net/tcp and tcp6 for the port give socket inodes, and the
+# /proc/<pid>/fd links that name those inodes give the pids. Sees every process of this user; prints nothing elsewhere.
+proc_port_holders() { # port
+  local hex inodes
+  [ -r /proc/net/tcp ] || return 0
+  hex="$(printf '%04X' "$1")"
+  inodes="$(awk -v h="$hex" 'FNR>1 && $4=="0A" && $10!="0" {n=split($2, a, ":"); if (a[n]==h) printf " %s", $10}' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)"
+  [ -n "$inodes" ] || return 0
+  ls -l /proc/[0-9]*/fd 2>/dev/null | awk -v want="$inodes " '
+    /^\/proc\/[0-9]+\/fd:$/ {split($0, a, "/"); pid = a[3]; next}
+    / -> socket:\[[0-9]+\]$/ {i = $NF; gsub(/[^0-9]/, "", i); if (index(want, " " i " ")) print pid}' | sort -u || true
 }
 
 # 3.16.0: the one answer to "is there a server this testbed started, and where is it". Ours only when the recorded pid (or
