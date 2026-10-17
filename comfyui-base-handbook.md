@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.21.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.22.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
