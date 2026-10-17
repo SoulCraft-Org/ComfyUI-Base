@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.20.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.21.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -303,6 +303,15 @@ create reads it live):
 - No NVENC. NVIDIA's encode/decode matrix gives the HGX B200 and B300 0 NVENC engines (7 NVDEC), like the H100, so an
   `h264_nvenc` save fails there; encode on the CPU (`libx264`). "RTX" features (RTX Video Super Resolution) name an
   RTX GPU, which these are not.
+
+**Which test lane (3.21.0).** A smoke is not a pod run: it goes to the cheapest GPU that holds it. `py/gpu_fit.py`'s
+`LANES` lists them cheapest first (Kaggle T4 and L4, HF ZeroGPU `large` and `xlarge`, Modal's monthly credits from a T4
+to a B200, then RunPod, which is paid), and `pick_lane(peak_gib, minutes, needs)` returns the first whose card holds the
+measured peak plus 10 % and whose own limit holds the run: Kaggle's 12 h session, ZeroGPU's 30-minute cap (15 on
+`xlarge`, which costs the quota twice), the minutes $30 buys at Modal's list price within its 24 h per call. `needs`
+names fast dtypes (`fp16 bf16 fp8 fp4`, from the compute capability), `server` (ZeroGPU runs per-call functions, so
+never), or GPU classes, judged by `fits()` as `GPU_PREFER` is. `python3 py/gpu_fit.py --peak-gib 35.7 --minutes 10
+--needs bf16` prints `lane=zerogpu-large` and its card; `lane=none` exits 1.
 
 **Past B200 and B300, and no volume needed (3.18.0, Paul, 2026-10-16: rendering speed first).** `podctl create` with no
 `--gpu` asks for `NVIDIA B200`, `NVIDIA B300 SXM6 AC`, then `NVIDIA H200`, `NVIDIA H100 80GB HBM3` and `NVIDIA RTX PRO 6000
@@ -822,6 +831,10 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.21.0: which test lane a smoke takes (2026-10-17). `py/gpu_fit.py` gains `LANES`, `fast_dtypes()` and
+  `pick_lane(peak_gib, minutes, needs)`, which builds on `fits()` for GPU classes instead of a second rule, and a
+  `--peak-gib/--minutes/--needs` mode on the command line (§1, "Which test lane"). The unit tier covers the order, the
+  headroom, the limits, the dtypes and the CLI. Nothing else changed; no pod used.
 - 3.20.3: the CPU-quota and launch-environment tests hold on any machine (2026-10-17). On the free `soulcraft-hf` runner
   (a 2-CPU Hugging Face CPU Space that exports `OMP_NUM_THREADS=2`, workspace integration run 39049424709) three unit
   tests failed while the code was right. The cap to the CPUs online turned the fake 250000/100000 quota into 2, and the
