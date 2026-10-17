@@ -337,3 +337,45 @@ def test_unit_basetest_records_what_a_run_skipped_and_runs_only_that(tmp_path):
     (s / "test_a.py").write_text("def test_unit_runs(): pass\ndef test_unit_needs_build(): pass\n")
     r = py(BASE_ONLY_IDS=str(out))
     assert r.returncode == 0 and "2 passed, 1 deselected" in r.stdout, r.stdout + r.stderr
+
+
+def _vendoring(root, name, version, body="# the pack\n"):
+    """A package <name> vendoring Pack-X at <version> (no version: a pack without a pyproject.toml)."""
+    d = root / name; d.mkdir(parents=True)
+    (d / ("%s-script.sh" % name)).write_text('WF_NAME=""\nPKG_ID="%s"\n' % name)
+    pk = d / "Pack-X"; pk.mkdir(); (pk / "__init__.py").write_text(body)
+    if version:
+        (pk / "pyproject.toml").write_text('[project]\nname = "pack-x"\nversion = "%s"\n' % version)
+    return pk
+
+
+def test_unit_own_packs_newest_keeps_one_copy_per_pack_the_newest(tmp_path):
+    """3.20.2: one folder per pack name, the newest version (numeric, so 1.10.0 beats 1.9.0), a copy with no version
+    loses to one with a version, the same version keeps the first, and two contents under one version are named."""
+    import own_packs
+    old = _vendoring(tmp_path, "a", "1.9.0"); new = _vendoring(tmp_path, "b", "1.10.0"); bare = _vendoring(tmp_path, "c", None)
+    notes = []
+    assert own_packs.newest([str(old), str(bare), str(new)], note=notes.append) == [str(new)]
+    assert own_packs.newest([str(bare), str(old)]) == [str(old)] and own_packs.newest([str(old), str(bare)]) == [str(old)]
+    assert any("1.10.0 %s kept over 1.9.0 %s" % (new, old) in n for n in notes), notes
+    same = _vendoring(tmp_path, "d", "1.9.0"); twin = _vendoring(tmp_path, "e", "1.9.0", body="# other bytes\n")
+    notes = []
+    assert own_packs.newest([str(old), str(same), str(twin)], note=notes.append) == [str(old)]
+    assert notes == ["Pack-X: %s and %s both say version 1.9.0 with different content; one of them missed a version bump"
+                     % (old, twin)], notes
+    other = tmp_path / "f" / "Pack-Y"; other.mkdir(parents=True)
+    assert own_packs.newest([str(old), str(other), str(new)]) == [str(new), str(other)], "first-seen order, per name"
+
+
+def test_unit_testbed_links_the_newest_copy_when_two_packages_vendor_one_pack(tmp_path):
+    """The workspace's integration run linked the Video Replacer's Content Gate 1.5.0 over FLUX 3 Klein's newer copy,
+    because the testbed linked each package's pack by folder name and the last package walked won. It links the
+    newest version now (what a pod keeps), and --status says which copy and from where."""
+    _repo_only("the repo's testbed.sh")
+    root = (tmp_path / "ws").resolve()
+    _vendoring(root, "a-newer", "1.10.0"); _vendoring(root, "z-older", "1.9.0")    # name order alone picks z-older
+    s = subprocess.run(["bash", str(BASE / "testbed.sh"), "--status"], capture_output=True, text=True, env=_env(BASE_WORKSPACE=str(root)))
+    assert s.returncode == 0, s.stdout + s.stderr
+    assert "packages under %s (2) · 1 vendored" % root in s.stdout, s.stdout + s.stderr
+    assert "vendored Pack-X 1.10.0 from a-newer" in s.stdout and "from z-older" not in s.stdout, s.stdout + s.stderr
+    assert "1.10.0 %s kept over 1.9.0 %s" % (root / "a-newer" / "Pack-X", root / "z-older" / "Pack-X") in s.stderr, s.stderr

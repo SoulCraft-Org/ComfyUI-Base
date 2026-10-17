@@ -4,6 +4,7 @@
     own_packs.py digest <dir>                          sha256 of the pack's content (paths and bytes)
     own_packs.py version <dir>                         the pyproject.toml [project] version, or "-"
     own_packs.py newer <a> <b>                         exit 0 when version a is newer than b
+    own_packs.py newest <dir>...                       one folder per pack name, the newest version of each (3.20.2)
     own_packs.py mirror <src> <dst> <stage> <prev>     make <dst> exactly <src>: copy into <stage>, move the live
                                                        folder to <prev>, move the copy into place
 
@@ -62,6 +63,34 @@ def newer(a, b):
         return a > b
 
 
+def newest(dirs, note=None):
+    """One folder per pack name (its basename), the newest version of each, in the order the names first appear: the
+    testbed links the copy a pod would keep (lib/62-own-packs.sh: newest wins, never moved backwards), never just the
+    last package walked. A copy with no version loses to any copy that has one; on the same version the first given
+    stays, and two copies of one version with different content are named, since one of them missed a bump."""
+    pick, order = {}, []
+    for d in dirs:
+        name = os.path.basename(d.rstrip("/"))
+        if name not in pick:
+            pick[name] = d
+            order.append(name)
+            continue
+        have, cand = version(pick[name]), version(d)
+        if cand != "-" and (have == "-" or newer(cand, have)):
+            kept, dropped = d, pick[name]
+            pick[name] = d
+        else:
+            kept, dropped = pick[name], d
+            if cand == have:                  # the same version: the first stays; silent when the copies are identical
+                if note and digest(d) != digest(pick[name]):
+                    note("%s: %s and %s both say version %s with different content; one of them missed a version bump"
+                         % (name, pick[name], d, cand))
+                continue
+        if note:
+            note("%s: %s %s kept over %s %s" % (name, version(kept), kept, version(dropped), dropped))
+    return [pick[n] for n in order]
+
+
 def mirror(src, dst, stage, prev):
     name = os.path.basename(dst.rstrip("/"))
     new = os.path.join(stage, name)
@@ -85,6 +114,9 @@ def main(argv):
         print(version(argv[2]))
     elif cmd == "newer" and len(argv) == 4:
         return 0 if newer(argv[2], argv[3]) else 1
+    elif cmd == "newest":
+        for d in newest(argv[2:], note=lambda m: print("  ·· " + m, file=sys.stderr)):
+            print(d)
     elif cmd == "mirror" and len(argv) == 6:
         mirror(*argv[2:6])
     else:
