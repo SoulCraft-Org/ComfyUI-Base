@@ -1715,10 +1715,11 @@ def test_unit_embeddings_are_a_flat_freeform_category():
     # the packs that os.listdir their folder (SAM3 SmartInpainter, DepthAnythingV2, SeedVR2, ComfyUI-RMBG's models/RMBG/<name>/,
     # LayerStyle's models/grounding-dino/) get flat categories too (RMBG, grounding-dino: 2.0.17)
     # ultralytics/bbox and /segm (3.20.0): the face-detector packs join models/ultralytics/bbox/<name> themselves
-    for cat in ("sams", "depthanything", "SEEDVR2", "RMBG", "grounding-dino", "ultralytics/bbox", "ultralytics/segm"):
+    for cat in ("sams", "depthanything", "SEEDVR2", "RMBG", "grounding-dino", "ultralytics/bbox", "ultralytics/segm", "Wan", "DreamID-V"):
         assert "rc=0" in _bash(f'MODELS=("{cat}|||m.pt|https://huggingface.co/x/y/resolve/main/m.pt|9|flat|"); _base_model_rows >/dev/null; echo rc=$?').stdout, cat
         assert _bash(f'_base_dest_rel "{cat}|||m.pt|https://huggingface.co/x/y/resolve/main/m.pt|9|flat|"').stdout.strip() == f"{cat}/m.pt"
     assert _bash('_base_dest_rel "RMBG|||RMBG-2.0/|hf://1038lab/RMBG-2.0|884972398|snapshot|"').stdout.strip() == "RMBG/RMBG-2.0/"
+    assert _bash('_base_dest_rel "Wan|||Wan2.1-T2V-1.3B/|hf://Wan-AI/Wan2.1-T2V-1.3B|17573837064|snapshot|"').stdout.strip() == "Wan/Wan2.1-T2V-1.3B/"
     r = _bash('MODELS=("RMBG|RMBG||RMBG-2.0/|hf://1038lab/RMBG-2.0|884972398|snapshot|"); _base_model_rows >/dev/null; echo rc=$?')
     assert "rc=1" in r.stdout and "freeform" in r.stderr, "RMBG with a Family must be refused: the pack reads models/RMBG/<name>/"
     r = _bash('MODELS=("ultralytics/bbox|Face||face_yolov8m.pt|https://huggingface.co/x/y/resolve/main/f.pt|9|no|"); _base_model_rows >/dev/null; echo rc=$?')
@@ -1739,10 +1740,11 @@ def test_unit_latent_upscale_models_is_a_flat_freeform_category():
     # the packs that os.listdir their folder (SAM3 SmartInpainter, DepthAnythingV2, SeedVR2, ComfyUI-RMBG's models/RMBG/<name>/,
     # LayerStyle's models/grounding-dino/) get flat categories too (RMBG, grounding-dino: 2.0.17)
     # ultralytics/bbox and /segm (3.20.0): the face-detector packs join models/ultralytics/bbox/<name> themselves
-    for cat in ("sams", "depthanything", "SEEDVR2", "RMBG", "grounding-dino", "ultralytics/bbox", "ultralytics/segm"):
+    for cat in ("sams", "depthanything", "SEEDVR2", "RMBG", "grounding-dino", "ultralytics/bbox", "ultralytics/segm", "Wan", "DreamID-V"):
         assert "rc=0" in _bash(f'MODELS=("{cat}|||m.pt|https://huggingface.co/x/y/resolve/main/m.pt|9|flat|"); _base_model_rows >/dev/null; echo rc=$?').stdout, cat
         assert _bash(f'_base_dest_rel "{cat}|||m.pt|https://huggingface.co/x/y/resolve/main/m.pt|9|flat|"').stdout.strip() == f"{cat}/m.pt"
     assert _bash('_base_dest_rel "RMBG|||RMBG-2.0/|hf://1038lab/RMBG-2.0|884972398|snapshot|"').stdout.strip() == "RMBG/RMBG-2.0/"
+    assert _bash('_base_dest_rel "Wan|||Wan2.1-T2V-1.3B/|hf://Wan-AI/Wan2.1-T2V-1.3B|17573837064|snapshot|"').stdout.strip() == "Wan/Wan2.1-T2V-1.3B/"
     r = _bash('MODELS=("RMBG|RMBG||RMBG-2.0/|hf://1038lab/RMBG-2.0|884972398|snapshot|"); _base_model_rows >/dev/null; echo rc=$?')
     assert "rc=1" in r.stdout and "freeform" in r.stderr, "RMBG with a Family must be refused: the pack reads models/RMBG/<name>/"
     r = _bash('MODELS=("ultralytics/bbox|Face||face_yolov8m.pt|https://huggingface.co/x/y/resolve/main/f.pt|9|no|"); _base_model_rows >/dev/null; echo rc=$?')
