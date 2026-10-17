@@ -76,7 +76,7 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "link_token", "named_volumes", "DEFAULT_VOLUME_NAME",                                               # 3.14.0
            "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB",                                            # 3.18.0
            "REF_VARS", "env_ref", "env_refs", "refs_line", "DEFAULT_API_V2_URL",                   # 3.19.0
-           "stock_count", "count_rows", "COUNT_FIELDS"):                                            # 3.20.0
+           "stock_count", "count_rows", "COUNT_FIELDS", "pod_rate", "pods_spend", "unit_price"):   # 3.20.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -2034,7 +2034,8 @@ def balance_line(b, lag_min, floor=None):
     if spend is None:
         return line + " (this host states no spend rate, so nothing is projected)"
     p = projected_balance(b, lag_min)
-    line += " · spending %.2f/h · projected %.2f (%g min of spend not booked yet taken off)" % (spend, p, float(lag_min))
+    line += " · spending %.2f/h%s · projected %.2f (%g min of spend not booked yet taken off)" % (
+        spend, " (the running pods at N x their GPU's price: above RunPod's own figure)" if b.get("pods_spend_per_hr") else "", p, float(lag_min))
     if floor is not None and spend > 0 and p > floor:
         line += " · %.1f h to the %.2f floor" % ((p - floor) / spend, floor)
     return line

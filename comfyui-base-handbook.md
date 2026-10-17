@@ -834,7 +834,11 @@ for any invocation that somehow arrives without the environment. The suite asser
   pod: the stock check asks RunPod for N in each candidate data centre at once (`gpuTypes.lowestPrice` with the count and
   `dataCenterId`, one aliased query; the old per-type view passes one free GPU for a 4-GPU pod), and before anything is
   made every create prints RunPod's price for the pod and the RAM and vCPUs it comes with, then refuses when the
-  projected balance covers under one hour of today's spend plus this pod above the guard's floor. Read live on
+  projected balance covers under one hour of today's spend plus this pod above the guard's floor. Every projection
+  (`podctl balance`, `guard`, create's guard) reads a spend never below the running pods' own: each pod at the larger of
+  its `costPerHr` and its gpuCount x its GPU's list price (`gpuTypes.securePrice`), whichever way RunPod's record counts
+  the GPUs. The models folder takes `ultralytics/bbox`, `ultralytics/segm`, `Wan`, `DreamID-V` and `MiniMax-Remover` as
+  flat categories (no Family: their packs join those paths themselves). Read live on
   2026-10-17: B200 x1 $7.99/h with 188 GB RAM and 24 vCPU; x2 $15.98/h, 502 GB, 48 vCPU (US-CA-2, US-NC-2); x4 and x8 none
   free anywhere. `podctl status` names the servers. The GPU check (`py/gpu_facts.py`, podctl's `gpu_probe`) judges each
   card by its own processes (by uuid): before, card 0's memory was set against every card's processes, which hid a

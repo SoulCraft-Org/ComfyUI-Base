@@ -141,6 +141,9 @@ restart start them all through `_base_start_comfy`. `hosts/runpod/provider.py`: 
 `stock_count` / `count_rows` (lowestPrice with the count, one aliased query), `price()`. `podctl create --gpus N`, the
 money guard (`money_guard`: price, RAM and vCPUs, refused under one hour of balance), `podctl status` names the servers.
 `py/gpu_facts.py` and podctl's `gpu_probe`: each card judged by its own processes (`verdict_many`, by uuid).
+`balance()`'s spend is never below the running pods' `pod_rate` (the larger of `costPerHr` and gpuCount x
+`securePrice`), so `podctl balance`, `guard` and create's guard project N GPUs at N x the price. engine-akatz's three
+commits: `ultralytics/bbox`, `ultralytics/segm`, `Wan`, `DreamID-V`, `MiniMax-Remover` are flat model categories.
 
 **Proven, and how.** The suite on this Mac against fakes: a 4-GPU `nvidia-smi` stub through the launch functions, the
 start and the fake pod's boot; the fake RunPod for `--gpus 2`, the count query, the price line and the STOP. CI on the PR.

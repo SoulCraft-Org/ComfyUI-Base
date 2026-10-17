@@ -2027,6 +2027,34 @@ def test_unit_balance_is_projected_past_the_lag_and_guard_stops_running_pods_at_
         srv.close()
 
 
+def test_unit_balance_spend_is_never_below_the_running_pods_at_n_times_the_price(tmp_path, capsys):
+    """3.20.0: every projection (podctl balance, guard, create's money guard) reads balance()'s spend, and that spend is
+    never below what the running pods cost at gpuCount x their GPU's list price (gpuTypes.securePrice). A 2-GPU pod whose
+    record counts one GPU's price, or that RunPod's figure has not caught up with yet, is projected at 2 x the price."""
+    podctl = _load()
+    me = {"clientBalance": 30.0, "currentSpendPerHr": 7.99, "spendLimit": 80}
+    def gql(body):
+        q = body.get("query") or ""
+        return {"myself": dict(me)} if "myself" in q else ({"gpuTypes": [{"securePrice": 7.99}]} if "securePrice" in q else {})
+    srv = FakeRunPod(_pod(name="Two", gpu={"id": "NVIDIA B200", "count": 2}, gpuCount=2, costPerHr=7.99), gql=gql)
+    prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    try:
+        b = prov.balance()
+        assert b["spend_per_hr"] == 15.98 and b["pods_spend_per_hr"] == 15.98, b          # 2 x 7.99, not RunPod's 7.99
+        assert podctl.projected_balance(b, 30) == 30.0 - 15.98 / 2
+        podctl.cmd_balance(prov, podctl.build_parser().parse_args(["balance"]))
+        assert "spending 15.98/h (the running pods at N x their GPU's price" in capsys.readouterr().out
+        srv.pod["costPerHr"] = 15.98                                                      # a record that counts both: no double count
+        assert prov.balance()["spend_per_hr"] == 15.98
+        me["currentSpendPerHr"] = 20.0                                                    # RunPod's figure above the pods' (a volume too): it stands
+        assert prov.balance() == {"amount": 30.0, "currency": "USD", "spend_per_hr": 20.0, "spend_limit": 80}
+        srv.pod["desiredStatus"] = "EXITED"; me["currentSpendPerHr"] = 0.1                # a stopped pod costs nothing here
+        assert prov.balance()["spend_per_hr"] == 0.1
+    finally:
+        srv.close()
+    assert podctl.pod_rate(None, {"costPerHr": 3.0}) == 3.0, "no GPU named: the record's own rate"
+
+
 def test_unit_create_flags_a_host_does_not_take_are_refused_by_name(tmp_path):
     """Verda's create_machine takes no --volume or --min-cuda: a clear refusal, never a TypeError traceback."""
     podctl = _load()

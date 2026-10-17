@@ -867,9 +867,53 @@ def balance(api):
     if not isinstance(me.get("clientBalance"), (int, float)):
         raise PodctlError("GraphQL myself answered no clientBalance: %r" % (sorted(me),))
     spend = me.get("currentSpendPerHr")
-    return {"amount": float(me["clientBalance"]), "currency": "USD",
-            "spend_per_hr": float(spend) if isinstance(spend, (int, float)) else None,
-            "spend_limit": me.get("spendLimit")}
+    out = {"amount": float(me["clientBalance"]), "currency": "USD",
+           "spend_per_hr": float(spend) if isinstance(spend, (int, float)) else None,
+           "spend_limit": me.get("spendLimit")}
+    # 3.20.0: never below what the running pods themselves cost at N x the price of their GPU (pods_spend): a pod of
+    # several GPUs that RunPod's figure has not caught up with, or counts at one GPU's price, is projected at its own.
+    pods = pods_spend(api)
+    if pods and (out["spend_per_hr"] is None or pods > out["spend_per_hr"] + 1e-9):
+        out["spend_per_hr"] = out["pods_spend_per_hr"] = round(pods, 4)
+    return out
+
+
+def unit_price(api, gpu, prices=None):
+    """3.20.0: one GPU's Secure Cloud list price an hour (GraphQL gpuTypes.securePrice: stock-independent, unlike
+    lowestPrice), cached in `prices`; 0.0 when RunPod names none."""
+    prices = {} if prices is None else prices
+    if gpu not in prices:
+        try:
+            types = api.graphql("query { gpuTypes(input:{id:%s}) { securePrice } }" % json.dumps(gpu)).get("gpuTypes") or []
+            v = (types[0] or {}).get("securePrice") if isinstance(types, list) and types and isinstance(types[0], dict) else None
+        except Exception:                                    # a projection never fails for want of a price
+            v = None
+        prices[gpu] = float(v) if isinstance(v, (int, float)) and v > 0 else 0.0
+    return prices[gpu]
+
+
+def pod_rate(api, pod, prices=None):
+    """3.20.0: what one pod spends an hour: the larger of its own costPerHr (or adjustedCostPerHr) and its gpuCount x its
+    GPU's list price, so N GPUs are projected at N x the price whichever way the record counts them."""
+    own = pod.get("costPerHr") or pod.get("adjustedCostPerHr") or 0
+    own = float(own) if isinstance(own, (int, float)) else 0.0
+    g = pod.get("gpu") if isinstance(pod.get("gpu"), dict) else {}
+    gpu = g.get("id") or (pod.get("machine") or {}).get("gpuTypeId") or (pod.get("gpuTypeIds") or [None])[0]
+    try:
+        n = int(pod.get("gpuCount") or g.get("count") or 1)
+    except (TypeError, ValueError):
+        n = 1
+    return max(own, n * unit_price(api, gpu, prices) if gpu else 0.0)
+
+
+def pods_spend(api):
+    """3.20.0: the account's RUNNING pods' pod_rate, summed (REST v1 GET /pods); None when the listing fails."""
+    try:
+        pods = api.get("/pods" + POD_READ) or []
+    except Exception:
+        return None
+    prices = {}
+    return sum(pod_rate(api, p, prices) for p in pods if isinstance(p, dict) and p.get("desiredStatus") == "RUNNING")
 
 
 def stock(api, gpu, volume=False, skipped=None):
