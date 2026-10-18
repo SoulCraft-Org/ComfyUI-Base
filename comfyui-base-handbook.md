@@ -844,9 +844,12 @@ for any invocation that somehow arrives without the environment. The suite asser
   and ComfyUI-Easy-Sam3 stops on `No module named 'triton'`. Every package that uses RMBG saw a missing node on CI.
   `testbed.sh --server` on Linux now installs the newest triton right after torch, against a constraints file of the
   torch family as installed (`testbed/.testbed-torch.txt`), so it never moves torch; importing it needs no GPU. A miss is
-  a warning and the build goes on. `--status` names the venv's triton on Linux. macOS (no triton wheels) and the pod's
-  install are unchanged. A unit test holds the order, the constraints, the warning and the macOS path. Exercised on the
-  CI runner only.
+  a warning and the build goes on. `--status` names the venv's triton on Linux, and, for every package, the packs its own
+  server could not import: each pack ComfyUI's "Import times for custom nodes" marks `(IMPORT FAILED)` in that server's
+  log, or "none". Krea 2's CI (run 39078526395) had passed its suite while RMBG never registered, with nothing in the
+  log to say so. macOS (no triton wheels) and the pod's install are unchanged. Unit tests hold the order, the
+  constraints, the warning, the macOS path, and the import report (a failed pack named, a clean one not, "none", a
+  foreign server never read). Exercised on the CI runner only.
 - 3.22.0: install speed on the critical path, and a clock that shows it (Paul's priority 3, 2026-10-17). Read from the
   last Video Replacer pod (1x B200, EU-RO-1, base 3.20.0, every row: 42 files, 295.5 GB): about 5:17 from create to the
   App for a fresh install, with the 66.3 GB B300-only file the long pole (147 s with its sha256) and VENV 116 s beside

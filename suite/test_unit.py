@@ -1421,6 +1421,31 @@ def test_unit_testbed_puts_triton_beside_cpu_torch_on_linux(tmp_path):
     assert not [c for c in log.read_text().splitlines() if "triton" in c or c.startswith("pip freeze")], log.read_text()
 
 
+def test_unit_testbed_status_names_the_packs_its_server_could_not_import(tmp_path):
+    """3.22.1: image-creator-krea-2's CI (run 39078526395) passed its suite while ComfyUI-RMBG never registered on the
+    testbed, and nothing in the log said so. --status reads ComfyUI's own import times from this server's log and names
+    every pack marked (IMPORT FAILED), or "none"; a server this testbed did not start is never read."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "3.14")
+    slog, cn = tb / "server.log", "/x/testbed/custom_nodes"
+    ours = 'LOG="%s"; owned_server(){ echo 127.0.0.1:8199; }; own_pids(){ echo 4242; }; status' % slog
+    # one pack failed, one imported: only the failed one is named
+    slog.write_text("Import times for custom nodes:\n"
+                    "   0.4 seconds (IMPORT FAILED): %s/ComfyUI-RMBG\n"
+                    "   1.2 seconds: %s/ComfyUI-KJNodes\n" % (cn, cn))
+    r = run(ours)
+    assert r.returncode == 0 and "could not import: ComfyUI-RMBG (" in r.stdout and "KJNodes" not in r.stdout, r.stdout + r.stderr
+    # every pack imported: "none"
+    slog.write_text("Import times for custom nodes:\n"
+                    "   0.4 seconds: %s/ComfyUI-RMBG\n"
+                    "   1.2 seconds: %s/ComfyUI-KJNodes\n" % (cn, cn))
+    r = run(ours)
+    assert r.returncode == 0 and "could not import: none" in r.stdout, r.stdout + r.stderr
+    # a server that is not this testbed's: its log says nothing about the one answering
+    r = run('LOG="%s"; owned_server(){ return 1; }; status' % slog)
+    assert r.returncode == 0 and "could not import" not in r.stdout, r.stdout + r.stderr
+
+
 def test_unit_testbed_sourced_runs_nothing(tmp_path):
     """The suite sources testbed.sh for its functions: sourcing defines and returns, it never provisions or prints usage."""
     _repo_only("the repo's testbed.sh")

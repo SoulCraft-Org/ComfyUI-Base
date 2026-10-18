@@ -450,6 +450,14 @@ status() {
   if mine="$(owned_server 2>/dev/null)"; then ok "server answering at $mine (this testbed's, pid $(own_pids | head -1))"
   elif curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then note "a server answers on $PORT, but not this testbed's (TESTBED_PORT picks another)"
   else note "server not running"; fi
+  # 3.22.1: the packs this server could not import, from ComfyUI's own "Import times for custom nodes" in its log. A suite
+  # passes around a pack that never registered (ComfyUI-RMBG without triton did, image-creator-krea-2 CI run 39078526395),
+  # so the CI log names them instead
+  if [ -n "${mine:-}" ] && [ -f "$LOG" ] && grep -q "Import times for custom nodes" "$LOG"; then
+    local failed; failed="$(sed -n 's|.* seconds (IMPORT FAILED): .*/||p' "$LOG" | sort -u | tr '\n' ' ')"
+    if [ -n "$failed" ]; then warn "packs this server could not import: ${failed% } (their nodes are missing; see $LOG)"
+    else ok "packs this server could not import: none (ComfyUI's import times in $LOG)"; fi
+  fi
   [ -f "$PORTF" ] && note "port file: $PORTF ($(tr -d '[:space:]' < "$PORTF"))"
   # what a provision WOULD install, and where the packages were found. Silent derivation is how 2.6.0 shipped
   # a testbed that quietly provisioned the base's packs and none of a consumer repository's.
