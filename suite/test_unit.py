@@ -1295,8 +1295,10 @@ def test_unit_the_testbed_finds_packages_without_naming_one():
 
 _FAKE_UV = r"""#!/bin/bash
 # a uv stand-in: `python list` prints a canned listing, `pip compile` resolves only on $TORCH_OK's minors,
-# `venv` behaves like uv 0.13 (refuses an existing directory) and makes a python that reports the minor it was given
+# `venv` behaves like uv 0.13 (refuses an existing directory) and makes a python that reports the minor it was given,
+# `pip freeze` lists a CPU torch family, and an install of triton fails while $UV_NO_TRITON is set
 echo "$*" >> "$UV_LOG"
+case "$*" in *" triton") [ -z "${UV_NO_TRITON:-}" ] || { echo "No solution found when resolving dependencies: triton" >&2; exit 1; };; esac
 case "$1 $2" in
   "python list") cat <<'EOF'
 cpython-3.16.0a1-macos-aarch64-none                 <download available>
@@ -1315,6 +1317,7 @@ EOF
   "venv --python") d="$4"
     [ -e "$d" ] && { echo "error: A virtual environment already exists at $d" >&2; exit 2; }
     mkdir -p "$d/bin"; printf '#!/bin/bash\necho %s\n' "$3" > "$d/bin/python"; chmod +x "$d/bin/python"; exit 0;;
+  "pip freeze") printf 'numpy==2.3.4\ntorch==2.14.1+cpu\ntorchaudio==2.14.1+cpu\ntorchvision==0.29.1+cpu\n'; exit 0;;
 esac
 exit 0
 """
@@ -1381,6 +1384,66 @@ def test_unit_testbed_replaces_a_half_made_venv(tmp_path):
     # an older minor is rebuilt onto the picked one
     r = run("_testbed_venv 3.15 && _venv_minor")
     assert r.returncode == 0 and "rebuilding it" in r.stdout and r.stdout.strip().endswith("3.15"), r.stdout + r.stderr
+
+
+def test_unit_testbed_puts_triton_beside_cpu_torch_on_linux(tmp_path):
+    """3.22.1 (image-creator-krea-2#10): CPU torch has no triton, and packs import it at module level (ComfyUI-RMBG's HEAD
+    through its bundled sam3, ComfyUI-Easy-Sam3), so neither registered on the Linux testbed while a pod's CUDA torch
+    carries it. On Linux --server installs the newest triton right after torch, against a constraints file of the torch
+    family as installed so it never moves torch; a triton that will not install is a warning and the build goes on;
+    macOS (no triton wheels) asks for none."""
+    _repo_only("the repo's testbed.sh")
+    go = 'uname(){ echo %s; }; start_server(){ echo "server started"; }; provision_server'
+    tb, log, run = _testbed_sandbox(tmp_path / "linux", "3.14")
+    r = run(go % "Linux")
+    assert r.returncode == 0 and "server started" in r.stdout, r.stdout + r.stderr
+    calls = log.read_text().splitlines()
+    def at(pred):
+        return next((i for i, c in enumerate(calls) if pred(c.split())), None)
+    torch = at(lambda a: a[:2] == ["pip", "install"] and a[-3:] == ["torch", "torchvision", "torchaudio"])
+    freeze = at(lambda a: a[:2] == ["pip", "freeze"])
+    triton = at(lambda a: a[:2] == ["pip", "install"] and a[-1] == "triton")
+    reqs = at(lambda a: a[:2] == ["pip", "install"] and "-r" in a)
+    assert None not in (torch, freeze, triton, reqs) and torch < freeze < triton < reqs, calls
+    args = calls[triton].split()
+    assert "--upgrade" in args, args                                          # the newest, on a reused venv too
+    cons = pathlib.Path(args[args.index("-c") + 1])
+    assert sorted(cons.read_text().split()) == ["torch==2.14.1+cpu", "torchaudio==2.14.1+cpu", "torchvision==0.29.1+cpu"], cons.read_text()
+    assert "beside torch 2.14.1+cpu" in r.stdout, r.stdout
+    # no triton build resolves: a warning, and the requirements and the server still follow
+    tb, log, run = _testbed_sandbox(tmp_path / "miss", "3.14")
+    r = run("export UV_NO_TRITON=1; " + go % "Linux")
+    assert r.returncode == 0 and "triton did not install" in r.stdout and "server started" in r.stdout, r.stdout + r.stderr
+    # macOS: nothing asked for
+    tb, log, run = _testbed_sandbox(tmp_path / "mac", "3.14")
+    r = run(go % "Darwin")
+    assert r.returncode == 0 and "server started" in r.stdout, r.stdout + r.stderr
+    assert not [c for c in log.read_text().splitlines() if "triton" in c or c.startswith("pip freeze")], log.read_text()
+
+
+def test_unit_testbed_status_names_the_packs_its_server_could_not_import(tmp_path):
+    """3.22.1: image-creator-krea-2's CI (run 39078526395) passed its suite while ComfyUI-RMBG never registered on the
+    testbed, and nothing in the log said so. --status reads ComfyUI's own import times from this server's log and names
+    every pack marked (IMPORT FAILED), or "none"; a server this testbed did not start is never read."""
+    _repo_only("the repo's testbed.sh")
+    tb, log, run = _testbed_sandbox(tmp_path, "3.14")
+    slog, cn = tb / "server.log", "/x/testbed/custom_nodes"
+    ours = 'LOG="%s"; owned_server(){ echo 127.0.0.1:8199; }; own_pids(){ echo 4242; }; status' % slog
+    # one pack failed, one imported: only the failed one is named
+    slog.write_text("Import times for custom nodes:\n"
+                    "   0.4 seconds (IMPORT FAILED): %s/ComfyUI-RMBG\n"
+                    "   1.2 seconds: %s/ComfyUI-KJNodes\n" % (cn, cn))
+    r = run(ours)
+    assert r.returncode == 0 and "could not import: ComfyUI-RMBG (" in r.stdout and "KJNodes" not in r.stdout, r.stdout + r.stderr
+    # every pack imported: "none"
+    slog.write_text("Import times for custom nodes:\n"
+                    "   0.4 seconds: %s/ComfyUI-RMBG\n"
+                    "   1.2 seconds: %s/ComfyUI-KJNodes\n" % (cn, cn))
+    r = run(ours)
+    assert r.returncode == 0 and "could not import: none" in r.stdout, r.stdout + r.stderr
+    # a server that is not this testbed's: its log says nothing about the one answering
+    r = run('LOG="%s"; owned_server(){ return 1; }; status' % slog)
+    assert r.returncode == 0 and "could not import" not in r.stdout, r.stdout + r.stderr
 
 
 def test_unit_testbed_sourced_runs_nothing(tmp_path):

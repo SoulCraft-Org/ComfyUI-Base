@@ -41,7 +41,8 @@
 #    read from each pack's real source — the checks that catch a pod install
 #    failing to load the graph.
 #  ✔ server (--server): the pure-Python packs import and register under a
-#    current Python, and /object_info answers.
+#    current Python, and /object_info answers. On Linux triton sits beside the
+#    CPU torch (3.22.1), so packs that import it at module level register too.
 #  ✘ CUDA: this host has no NVIDIA GPU. SolAttn (Triton), the Nvidia RTX nodes
 #    and the int8-ConvRot loader (comfy-kitchen) cannot import here.
 #  ✘ rendering: needs the weights and an sm_120 GPU. That is the pod.
@@ -315,6 +316,25 @@ _testbed_venv(){ # <x.y>
   fi
 }
 
+# 3.22.1: triton beside the CPU torch, on Linux. A pod's CUDA torch carries it (lib/30-venv.sh keeps it in the torch
+# family) and the CPU build does not, while packs import it at module level: ComfyUI-RMBG's HEAD (229529e, 2026-10-17)
+# bundles a sam3 whose edt.py does `import triton`, the pack's loader then raises a NameError in its own except branch
+# and none of its nodes register, and ComfyUI-Easy-Sam3 stops on "No module named 'triton'". Importing it needs no GPU
+# (on the soulcraft-hf runner triton 3.8.0 imported and RMBG registered its 45 nodes). The newest triton, resolved
+# against a constraints file of the torch family as installed, so adding it never moves torch. A miss is a warning: the
+# packs that need it then fail to register on their own, and every other check still runs. macOS has no triton wheels.
+_testbed_triton(){
+  local cons="$COMFY/.testbed-torch.txt" v="" tv   # inside the ignored testbed tree
+  uv pip freeze --python "$VENV/bin/python" 2>/dev/null | grep -E '^(torch|torchvision|torchaudio)==' >"$cons" || true
+  tv="$(sed -n 's/^torch==//p' "$cons")"
+  if uv pip install -q --upgrade --python "$VENV/bin/python" -c "$cons" triton >/dev/null 2>&1 \
+     && v="$("$VENV/bin/python" -c 'import triton; print(triton.__version__)' 2>/dev/null)" && [ -n "$v" ]; then
+    ok "triton $v beside torch ${tv:-?} (packs that import it at module level register)"
+  else
+    warn "triton did not install or import beside the CPU torch: packs that import it at module level (ComfyUI-RMBG, ComfyUI-Easy-Sam3) will not register"
+  fi
+}
+
 provision_server() {
   hdr "VENV + SERVER (CPU)"
   command -v uv >/dev/null || { warn "uv is not installed — needed to build the venv"; return 1; }
@@ -329,9 +349,10 @@ provision_server() {
   if [ "$(uname -s)" = Linux ]; then export UV_TORCH_BACKEND=cpu; fi
   note "installing torch (CPU${UV_TORCH_BACKEND:+, uv --torch-backend $UV_TORCH_BACKEND}) + every requirement at its newest: this is the slow part …"
   uv pip install -q --upgrade --python "$VENV/bin/python" torch torchvision torchaudio >/dev/null
+  if [ "$(uname -s)" = Linux ]; then _testbed_triton; fi
   # one pin-free set: ComfyUI's own == pins (its frontend packages) and every pack's are lifted by the base's reqlift
   local row dir files=("ComfyUI=$COMFY/requirements.txt") derived="$COMFY/.testbed-derived.txt"   # inside the ignored testbed tree
-  for row in "${PACKS[@]}"; do
+  for row in ${PACKS[@]+"${PACKS[@]}"}; do          # PACKS may be empty (bash 3.2 + set -u)
     dir="${row%%|*}"
     [ -f "$CN/$dir/requirements.txt" ] && files+=("$dir=$CN/$dir/requirements.txt")
   done
@@ -421,10 +442,22 @@ status() {
   hdr "STATUS"
   [ -d "$COMFY/.git" ] && ok "ComfyUI $(git -C "$COMFY" describe --tags 2>/dev/null || echo '?') · $(ls -1 "$CN" 2>/dev/null | wc -l | tr -d ' ') packs" || note "no source tree yet"
   [ -x "$VENV/bin/python" ] && ok "venv $($VENV/bin/python -V 2>&1)" || note "no venv"
+  if [ -x "$VENV/bin/python" ] && [ "$(uname -s)" = Linux ]; then   # 3.22.1: _testbed_triton; macOS has none to show
+    local tri; tri="$("$VENV/bin/python" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || true)"
+    if [ -n "$tri" ]; then ok "triton $tri"; else warn "no triton in the venv: packs that import it at module level do not register (--server installs it)"; fi
+  fi
   local mine
   if mine="$(owned_server 2>/dev/null)"; then ok "server answering at $mine (this testbed's, pid $(own_pids | head -1))"
   elif curl -fsS "http://127.0.0.1:$PORT/system_stats" >/dev/null 2>&1; then note "a server answers on $PORT, but not this testbed's (TESTBED_PORT picks another)"
   else note "server not running"; fi
+  # 3.22.1: the packs this server could not import, from ComfyUI's own "Import times for custom nodes" in its log. A suite
+  # passes around a pack that never registered (ComfyUI-RMBG without triton did, image-creator-krea-2 CI run 39078526395),
+  # so the CI log names them instead
+  if [ -n "${mine:-}" ] && [ -f "$LOG" ] && grep -q "Import times for custom nodes" "$LOG"; then
+    local failed; failed="$(sed -n 's|.* seconds (IMPORT FAILED): .*/||p' "$LOG" | sort -u | tr '\n' ' ')"
+    if [ -n "$failed" ]; then warn "packs this server could not import: ${failed% } (their nodes are missing; see $LOG)"
+    else ok "packs this server could not import: none (ComfyUI's import times in $LOG)"; fi
+  fi
   [ -f "$PORTF" ] && note "port file: $PORTF ($(tr -d '[:space:]' < "$PORTF"))"
   # what a provision WOULD install, and where the packages were found. Silent derivation is how 2.6.0 shipped
   # a testbed that quietly provisioned the base's packs and none of a consumer repository's.
