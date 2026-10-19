@@ -226,6 +226,33 @@ def test_unit_verify_prints_a_failing_tests_whole_error_block(tmp_path):
     assert "head -16" not in src and "head -24" not in src, "the old 16/24-line caps are back"
 
 
+def test_unit_verify_names_every_failing_test_before_the_capped_sections(tmp_path):
+    """3.22.1: a package's CI log named 4 of 7 failures (2026-10-17). The runner's -rs left only skips in the short summary,
+    and `| head -200` cut the sections off and broke awk's pipe. Every FAILED and ERROR line now comes first, then the
+    sections, capped inside awk, with nothing on stderr."""
+    _repo_only("_build/verify.sh")
+    src = (BASE / "_build" / "verify.sh").read_text(encoding="utf-8")
+    fn = src[src.index("_verify_failures(){"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    assert "| head" not in fn, fn
+    names = ["suite/x.py::test_%d" % i for i in range(7)]
+    blocks = "".join("____ %s ____\n>       assert f()\n%s\n" % (n.split("::")[1], "\n".join("E       line %d" % j for j in range(60)))
+                     for n in names)
+    summary = "".join("%s %s - assert\n" % ("ERROR" if i == 6 else "FAILED", n) for i, n in enumerate(names))
+    log = ("x\n==================== FAILURES ====================\n" + blocks
+           + "========== short test summary info ==========\nSKIPPED [1] suite/y.py:3: no GPU\n" + summary
+           + "6 failed, 3 passed, 1 skipped, 1 error in 1.00s\n")
+    f = tmp_path / "suite.log"; f.write_text(log)
+    r = subprocess.run(["bash", "-c", fn + '\n_verify_failures "$1"', "_", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    out = r.stdout
+    for i, n in enumerate(names):
+        line = "%s %s - assert" % ("ERROR" if i == 6 else "FAILED", n)
+        assert line in out and out.index(line) < out.index("= FAILURES ="), (line, out[:800])
+    assert "SKIPPED" not in out and "E       line 0" in out, out[:800]
+    assert len(out.splitlines()) == 7 + 200, len(out.splitlines())                     # the 7 names, then 200 section lines
+
+
 def _verify_beside(tmp_path, start="exit 0", owned='echo "127.0.0.1:$(cat "$TESTBED_STATE/p")"'):
     """verify.sh in a stand-in base: no consumer root, a packager whose --check is green, a base.sh whose `test` records the
     BASE_SERVER it was handed (from the repo and from the zip), and a testbed.sh that records every call with its

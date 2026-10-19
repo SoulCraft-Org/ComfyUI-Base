@@ -1618,6 +1618,57 @@ def test_unit_sage_wheels_are_built_and_named_the_way_a_pod_keys_them(tmp_path):
     assert "-std=c++20" in r.stdout and "c++17" not in r.stdout and 'startswith("10.3")' in r.stdout and 'num = "103a"' in r.stdout, r.stdout + r.stderr
 
 
+def test_unit_sage_publish_skips_a_wheel_published_with_its_sum_and_a_dry_run_only_warns(tmp_path):
+    """3.22.1: a pull request rebuilds every arch and the release usually holds them all, so its dry publish failed on the
+    first one (run 39073460610). An arch whose published sum is this build's is skipped; any other clash (a different
+    build, or a wheel whose sum never landed) warns in a dry run and still fails a real one, before anything uploads.
+    The workflow's own publish step, run against a fake gh holding sm_100 and lacking sm_120."""
+    _repo_only(".github/workflows/sage-wheels.yml")
+    wf = (BASE / ".github" / "workflows" / "sage-wheels.yml").read_text()
+    step = wf[wf.index("name: publish what was built"):]
+    lines = []
+    for l in step[step.index("run: |\n") + 7:].splitlines():                         # the block scalar: its 10-space indent, or blank
+        if l.strip() and not l.startswith(" " * 10): break
+        lines.append(l[10:])
+    step = "\n".join(lines)
+    fake = tmp_path / "bin"; fake.mkdir()
+    (fake / "gh").write_text('#!/bin/bash\ncase "$1 $2" in\n'
+                             '  "release view") [[ " $* " == *" --json "* ]] && ls "$FAKE_REL"; exit 0;;\n'
+                             '  "release download") while [ $# -gt 0 ]; do [ "$1" = --pattern ] && p="$2"; shift; done; cat "$FAKE_REL/$p" 2>/dev/null || exit 1;;\n'
+                             '  "release upload") echo "REAL UPLOAD ${@: -1}";;\nesac\n')
+    (fake / "curl").write_text('#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && echo "Apache License" > "$2"; shift; done\n')
+    for f in ("gh", "curl"): (fake / f).chmod(0o755)
+    whl = "sageattention-2.2.0-cp314-cp314-linux_x86_64.whl"
+
+    def publish(case, dry, held):
+        w = tmp_path / case; (w / "rel").mkdir(parents=True); (w / "tmp").mkdir()
+        for arch in ("10.0", "12.0"):
+            sm = "sm_" + arch.replace(".", ""); d = w / "dist" / ("sage-" + arch); d.mkdir(parents=True)
+            (d / "key.txt").write_text("sageattention-abc-cp314-torch2.14.1-cu130-%s\n" % sm); (d / whl).write_text("wheel %s\n" % sm)
+        (w / "rel" / ("sm_100." + whl)).write_text("wheel sm_100\n")
+        if held != "no sum":
+            s = subprocess.run(["sha256sum", "sm_100." + whl], cwd=w / "rel", capture_output=True, text=True, check=True).stdout
+            (w / "rel" / "sm_100.sha256").write_text(s if held == "same" else "0" * 64 + s[64:])
+        env = {**os.environ, "PATH": "%s:%s" % (fake, os.environ["PATH"]), "FAKE_REL": str(w / "rel"), "RUNNER_TEMP": str(w / "tmp"),
+               "GITHUB_STEP_SUMMARY": str(w / "summary"), "GITHUB_REPOSITORY": "o/r", "GITHUB_SHA": "x", "TAG": "sage-abc", "SHA": "abc",
+               "SHA12": "abc", "PYTAG": "cp314", "TORCH": "2.14.1", "BACKEND": "cu130", "IMAGE": "img", "RUN_URL": "u", "DRY": dry}
+        r = subprocess.run(["bash", "-c", step], cwd=w, capture_output=True, text=True, env=env)
+        return r.returncode, r.stdout + r.stderr
+
+    rc, out = publish("dry-same", "1", "same")
+    assert rc == 0 and "sm_100 is published, nothing to upload" in out and "DRY (pull request): gh release upload" in out, out
+    assert "/sm_120.sha256" in out and "/sm_100." not in out.split("nothing to upload", 1)[1], out
+    rc, out = publish("real-same", "", "same")
+    assert rc == 0 and "REAL UPLOAD" in out and "/sm_120.sha256" in out, out
+    assert not any(l.startswith("REAL UPLOAD") and "/sm_100." in l for l in out.splitlines()), out
+    for held in ("different", "no sum"):
+        rc, out = publish("dry-" + held, "1", held)
+        assert rc == 0 and "::warning::sage-abc already holds" in out and "::error::" not in out, (held, out)
+        rc, out = publish("real-" + held, "", held)
+        assert rc == 1 and "::error::sage-abc already holds" in out and "published assets are never replaced" in out, (held, out)
+        assert "REAL UPLOAD" not in out, (held, out)                                    # refused before anything uploads
+
+
 def _fake_nvidia_smi(tmp_path, total, used, apps):
     """A nvidia-smi answering the two queries gpu_facts.py makes, with the given card and visible-process numbers."""
     d = tmp_path / "smibin"; d.mkdir(parents=True, exist_ok=True)
@@ -2612,6 +2663,21 @@ def test_unit_the_test_command_runs_the_suite_with_the_base_s_own_uv_when_none_i
     r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; base_test unit; echo "RESULT=$BASE_TEST_RESULT RC=$BASE_TEST_RC"',
               env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
     assert "RESULT=1 failed, 3 passed RC=1" in r.stdout and "✖ suite" in r.stdout and "✔ suite" not in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_a_red_suite_under_errtrace_is_reported_not_trapped(tmp_path):
+    """3.22.1: a package script runs `set -Eeuo pipefail` with the base's traps, and errtrace carries the ERR trap into
+    base_test. A red suite failed the pipeline into tee, the trap blamed tee and ended the run (exit 4) before the summary.
+    Under those options the runner still reports pytest's own status, and it asks pytest to name every failed and errored
+    test (-rfEs; -rs named only the skips)."""
+    _pod(tmp_path)
+    tools = tmp_path / "comfy-base" / "bin"; tools.mkdir(parents=True)
+    uv = tools / "uv"; uv.write_text('#!/bin/bash\necho "uv $*" >> "$(dirname "$0")/calls.log"\necho "7 failed, 3 passed"\nexit 1\n'); uv.chmod(0o755)
+    r = _bash('BASE_INNER=""; base_env_setup; base_discover quiet; PY=/nonexistent/python; BASE_NODE_SRC=""; '
+              'set -E -o pipefail; _base_install_traps; trap - EXIT; base_test unit; trap - ERR; echo "RESULT=$BASE_TEST_RESULT RC=$BASE_TEST_RC"',
+              env={"BASE_FAKE_ROOT": str(tmp_path), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")})
+    assert "unexpected failure" not in r.stdout + r.stderr and "RESULT=7 failed, 3 passed RC=1" in r.stdout, r.stdout + r.stderr
+    assert "✖ suite" in r.stdout and " -rfEs " in (tools / "calls.log").read_text(), r.stdout
 
 
 

@@ -11,8 +11,9 @@
 #            LICENSE-SageAttention.txt (Apache-2.0, from the same commit)
 #
 # Write-once: no asset is ever replaced. An arch whose sum is published is never built again for that release, and
-# the publish step refuses (fails) rather than overwrite anything already there. The sage-* tags are protected
-# against moves and deletes by the organisation's tag ruleset.
+# the publish step refuses (fails) rather than overwrite anything already there; a wheel whose published sum is this
+# build's own is simply skipped, and a dry run only warns (3.22.1). The sage-* tags are protected against moves and
+# deletes by the organisation's tag ruleset.
 #
 # Daily, it asks what a pod would pick today (_build/sage/resolve.py: SageAttention main, the newest Python the torch
 # family has wheels for, torch_pick.py's torch and CUDA build) and builds only the archs that release lacks, so a new
@@ -200,17 +201,29 @@ jobs:
               --title "SageAttention $SHA12 · torch $TORCH $BACKEND · $PYTAG" --notes-file "$RUNNER_TEMP/notes.md"
           fi
 
-          # write-once: refuse anything already published (or half-published), then each wheel, then its sum
+          # write-once: every clash is settled before anything uploads, then each wheel, then its sum. An arch whose
+          # published sum is this build's sum is already there and leaves the upload list; any other clash (a different
+          # build, or a wheel whose sum never landed) fails a real publish and only warns in a dry run, because a pull
+          # request rebuilds every arch and the release usually holds them all (3.22.1)
           have="$(command gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null || true)"
-          for w in "${new[@]}"; do
-            a="$(basename "$w")"; sm="${a%%.*}"
-            if grep -qxF "$a" <<< "$have" || grep -qxF "$sm.sha256" <<< "$have"; then
-              echo "::error::$TAG already holds $a or $sm.sha256: published assets are never replaced"; exit 1
-            fi
-          done
+          keep=()
           for w in "${new[@]}"; do
             a="$(basename "$w")"; sm="${a%%.*}"
             (cd "$up" && sha256sum "$a") > "$up/$sm.sha256"
+            if ! grep -qxF "$a" <<< "$have" && ! grep -qxF "$sm.sha256" <<< "$have"; then keep+=("$w"); continue; fi
+            pub="$(command gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$sm.sha256" --output - 2>/dev/null || true)"
+            if [ -n "$pub" ] && [ "$pub" = "$(cat "$up/$sm.sha256")" ]; then
+              echo "$TAG already holds $a with this build's sum: $sm is published, nothing to upload"
+            elif [ -n "$DRY" ]; then
+              ps="${pub%% *}"; mine="$(cut -d' ' -f1 "$up/$sm.sha256")"
+              echo "::warning::$TAG already holds $a or $sm.sha256 with sum ${ps:-none}, not this build's $mine: a real publish would refuse it (published assets are never replaced)"
+            else
+              echo "::error::$TAG already holds $a or $sm.sha256: published assets are never replaced"; exit 1
+            fi
+          done
+          new=(${keep[@]+"${keep[@]}"})
+          for w in ${new[@]+"${new[@]}"}; do
+            a="$(basename "$w")"; sm="${a%%.*}"
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$w"
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$up/$sm.sha256"
           done

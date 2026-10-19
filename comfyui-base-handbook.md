@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.22.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.22.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -837,6 +837,17 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.22.1: two CI fixes (2026-10-18). (1) A package's CI log named 4 of the 7 tests that failed (2026-10-17): the
+  runner's `-rs` put only skips in pytest's short summary, and `_build/verify.sh` cut the FAILURES section with
+  `| head -200`, which also broke awk's pipe. The runner now passes `-rfEs`, and `_verify_failures` prints every FAILED
+  and ERROR line of the short summary first, then the sections, capped inside awk. Under a package script's
+  `set -Eeuo pipefail` a red suite also tripped the base's ERR trap at the pipeline into tee (exit 4, blaming tee) before
+  the summary; the runner now reads pytest's own status with `&& rc=... || rc=...`, which neither trips the trap nor needs
+  pipefail. (2) `sage-wheels.yml`: a pull request rebuilds every arch and runs the publish step dry, but the write-once
+  check exited 1 on the first arch the release already held (run 39073460610). An arch whose published
+  `sm_<arch>.sha256` is this build's sum is now skipped; any other clash (a different build, or a wheel whose sum never
+  landed) warns in a dry run and still fails a real publish, before anything uploads. The unit tier covers the failure
+  report, the runner under errtrace with the base's traps, and the publish step against a fake gh. No pod used.
 - 3.22.0: install speed on the critical path, and a clock that shows it (Paul's priority 3, 2026-10-17). Read from the
   last Video Replacer pod (1x B200, EU-RO-1, base 3.20.0, every row: 42 files, 295.5 GB): about 5:17 from create to the
   App for a fresh install, with the 66.3 GB B300-only file the long pole (147 s with its sha256) and VENV 116 s beside

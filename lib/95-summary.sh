@@ -233,10 +233,14 @@ base_test(){ # [tier] — the package's suite.py beside the script (the base's o
     case "$_v" in BASE_WF|BASE_SCRIPT|BASE_PKG_DIR|BASE_LIB|BASE_COMFY|BASE_VENV|BASE_STATE|BASE_MODELS_DIR|BASE_NODE_SRC|BASE_SERVER|BASE_ON_POD|BASE_WORKSPACE|BASE_SKIPPED_OUT|BASE_ONLY_IDS) ;; *) _scrub+=(-u "$_v");; esac
   done
   local _errexit=0; case $- in *e*) _errexit=1;; esac; set +e      # pytest's OWN status, whatever the shell's options (2.0.14: tee's 0 once read as green)
+  # 3.22.1: -rfEs names every failed and errored test in the short summary (-rs named only the skips). The `&& … || …`
+  # keeps a red suite under pipefail from tripping the ERR trap that `set -E` carries in here (it blamed tee and ended the
+  # run, exit 4), and reads pytest's status with or without pipefail: `|| rc=` alone would read tee's 0 without it
+  rc=0
   PYTHONPATH="$BASE_DIR/py${PYTHONPATH:+:$PYTHONPATH}" BASE_WF="${PKG_DIR:-}/${WF_NAME:-}" BASE_SCRIPT="${PKG_SCRIPT:-}" BASE_PKG_DIR="${PKG_DIR:-}" BASE_LIB="$BASE_DIR" \
      BASE_COMFY="${COMFY:-}" BASE_VENV="${VENV:-}" BASE_STATE="${BASE_STATE:-}" BASE_MODELS_DIR="${M:-}" BASE_NODE_SRC="${BASE_NODE_SRC:-}" BASE_SERVER="${BASE_SERVER:-}" BASE_ON_POD="$on_pod" \
      env ${_scrub[@]+"${_scrub[@]}"} -u HF_TOKEN -u HF_HUB_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HUGGINGFACE_API_KEY -u CIVITAI_TOKEN -u CIVITAI_API_KEY -u CIVITAI_API_TOKEN \
-     "${runner[@]}" -q -rs -p no:cacheprovider -p basetest ${cargs[@]+"${cargs[@]}"} "$suite" ${mexpr:+-m "$mexpr"} 2>&1 | tee "$out"; rc="${PIPESTATUS[0]}"
+     "${runner[@]}" -q -rfEs -p no:cacheprovider -p basetest ${cargs[@]+"${cargs[@]}"} "$suite" ${mexpr:+-m "$mexpr"} 2>&1 | tee "$out" && rc="${PIPESTATUS[0]}" || rc="${PIPESTATUS[0]}"
   [ "$_errexit" = 1 ] && set -e; true
   BASE_TEST_TABLE="$(awk '/= test tiers =/{f=1;next} f&&/^=+/{exit} f' "$out" || true)"
   BASE_TEST_RESULT="$(grep -E '^[0-9]+ (passed|failed)|no tests ran|error' "$out" | tail -1 || true)"; BASE_TEST_RESULT="${BASE_TEST_RESULT:-exit $rc}"

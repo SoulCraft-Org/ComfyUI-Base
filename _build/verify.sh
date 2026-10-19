@@ -111,9 +111,12 @@ export BASE_SERVER
 # 3.15.3: a failing suite's report, whole enough to diagnose from CI: pytest's ERRORS and FAILURES sections (each test's
 # header, its > lines and its whole E block) capped at 200 lines, then the short summary naming every failing test.
 # It used to keep 12-24 lines, and a long assertion lost its cause (2026-10-16, a Video Replacer failure).
+# 3.22.1: every FAILED and ERROR line of the short summary comes first (the runner's -rfEs puts them all there), then
+# the sections, capped inside awk. A package's CI log named 4 of 7 failures (2026-10-17): -rs listed only skips, and
+# `| head -200` cut the sections off and broke awk's pipe.
 _verify_failures(){ # <log>
-  awk '/= (ERRORS|FAILURES) =/{p=1} /= short test summary info =/{p=0} p' "$1" | head -200 | sed 's/^/    /'
-  awk '/= short test summary info =/{p=1} p' "$1" | head -40 | sed 's/^/    /'
+  awk '/= short test summary info =/{p=1} p && /^(FAILED|ERROR) /' "$1" | sed 's/^/    /'
+  awk '/= (ERRORS|FAILURES) =/{p=1} /= short test summary info =/{p=0} p && n++ < 200' "$1" | sed 's/^/    /'
 }
 # Step 2: the suite from the repository. BASE_ONLY_IDS (exported by the caller, or not) narrows it to those tests.
 _verify_repo_pass(){ # <dir> <name> [label]
