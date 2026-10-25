@@ -1,11 +1,22 @@
-# Always the newest (ComfyUI Base 3.0.0): the CI's actions move to their newest release through a pull request,
-# which is merged once its own verify run is green.
+# Always the newest (ComfyUI Base 3.0.0; owner, 2026-10-25): every ecosystem is checked each weekday, all bumps arrive
+# in one pull request per ecosystem, and each merges once its own verify run is green (dependabot-automerge.yml).
+# Security updates are separate (repository settings) and come as soon as an alert opens.
 version: 2
 updates:
+  # Actions are pinned to full commit SHAs (the version is the comment beside each); all bumps in one pull request.
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: daily
     groups:
       actions:
+        patterns: ["*"]
+
+  # The gitleaks hook's frozen rev in .pre-commit-config.yaml.
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      pre-commit:
         patterns: ["*"]
