@@ -139,14 +139,17 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     base_summary
   fi
   _base_hook pkg_pre_models
+  _base_launch_early || true           # 3.26.0: a first install starts ComfyUI here, beside the downloads (lib/80-server.sh)
   _base_models_early_join || true      # 3.11.0: the early downloads, waited for and folded in; the model stage still judges every row
   base_models || true
   base_prune || true
   base_sync || true
   _base_hook pkg_post_models
-  base_import_check || true
-  _base_own_packs_judge "${BASE_TMPD:-/nonexistent}/import_check.log" || true   # 3.2.0: an own pack that does not import is put back
-  base_hygiene || true
+  if [ "${BASE_EARLY_DONE:-0}" != "1" ]; then   # 3.26.0: an early start ran these just before it
+    base_import_check || true
+    _base_own_packs_judge "${BASE_TMPD:-/nonexistent}/import_check.log" || true   # 3.2.0: an own pack that does not import is put back
+    base_hygiene || true
+  fi
   base_boot_install || true
   base_ledger_write || true
   base_restart || true
@@ -290,6 +293,7 @@ HLP
 
 _base_list(){ local x; for x in "$@"; do echo "      • $x"; done; }
 base_summary(){ # one screen; exits 0, or 1 when anything is in BASE_FAILED. Always the last step.
+  if declare -F _base_early_abandon >/dev/null; then _base_early_abandon; fi   # 3.26.0: a run stopped before its restart
   local tag=""; [ "$BASE_DRY" = "1" ] && tag=" (dry run — nothing was changed)"
   hdr "SUMMARY · ${PKG_NAME:-ComfyUI Base} V${PKG_VERSION:-$BASE_VERSION} · base $BASE_VERSION$tag"
   echo "  venv       ${VENV:-?} → $BASE_VENV_RESULT"

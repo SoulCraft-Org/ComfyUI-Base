@@ -246,7 +246,9 @@ def test_unit_comfyui_is_told_where_the_base_keeps_its_state():
     alike) exports it, from BASE_STATE in an install and from BASE_HOME in the boot."""
     body = (BASE / "lib" / "85-launch.sh").read_text()
     whole = body[body.index("_base_start_comfy(){"):]
-    assert "_base_spawn_server" in whole[:whole.index("\n}\n")], "3.20.0: _base_start_comfy starts each server through _base_spawn_server"
+    assert "_base_spawn_comfy" in whole[:whole.index("\n}\n")], "3.26.0: _base_start_comfy is the spawn, then the wait"
+    whole = body[body.index("_base_spawn_comfy(){"):]
+    assert "_base_spawn_server" in whole[:whole.index("\n}\n")], "3.20.0: the start runs each server through _base_spawn_server"
     start = body[body.index("_base_spawn_server(){"):]
     start = start[:start.index("\n}\n")]
     assert 'export COMFY_BASE_STATE="$_cbs"' in start and '${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}' in start
