@@ -20,7 +20,7 @@ number is what it is."""
 import hashlib, json, os, re, shutil, subprocess, sys, types, urllib.request, zipfile
 import pytest
 from pathlib import Path
-from canvas import (wvals, _sg_defs, _all_nodes, byid, TITLE_H, GRID, PREVIEW_RESERVE, NOTE_TYPES, FRONTEND_ONLY_TYPES,
+from canvas import (text_host, wvals, _sg_defs, _all_nodes, byid, TITLE_H, GRID, PREVIEW_RESERVE, NOTE_TYPES, FRONTEND_ONLY_TYPES,
                     nbound, gb, ov, contains, center_in, _extent, _canvas_links, _area, structure_sha, package_files)
 
 __all__ = ["canvas", "geometry", "snap", "server_answering",          # `wf` is deliberately not exported: a suite with its own keeps it; one without imports it by name
@@ -495,6 +495,13 @@ def test_snapshot_sizes_cache_is_current(canvas, snap):
     made_on = kept.get("platform", "darwin")
     if made_on != sys.platform:
         pytest.skip(f"sizes.json was photographed on {made_on}; this is {sys.platform}, whose fonts measure text differently")
+    # 3.27.2: the machine and the fonts too (text_host). A cache without them was made where the photograph always ran:
+    # the HF runner (x86_64) on Linux, the Mac (arm64) on macOS, so the CI router's ARM overflow skips it.
+    here = text_host()
+    made_machine = kept.get("machine") or {"linux": "x86_64", "darwin": "arm64"}.get(made_on, "")
+    if made_machine != here["machine"] or ("fonts" in kept and kept["fonts"] != here["fonts"]):
+        pytest.skip(f"sizes.json was photographed on {made_on}/{made_machine} (fonts {kept.get('fonts', '?')}); this is "
+                    f"{sys.platform}/{here['machine']} (fonts {here['fonts'] or 'none'}), whose text measures differently")
     assert kept["workflow_structure_sha"] == snap["view"]["workflow_structure_sha"], "sizes.json was made from a different graph: rerun the photograph tool"
     off = [k for k, r in fresh.items() if k not in kept["nodes"] or any(abs(a - b) > 0.5 for a, b in zip(r["computed"], kept["nodes"][k]["computed"]))]
     assert off == [], f"{len(off)} nodes compute a different size than sizes.json holds (frontend {snap['view']['frontend']} vs {kept.get('frontend')}): {off[:8]}"

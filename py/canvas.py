@@ -19,6 +19,21 @@ Contents
 import ast, dataclasses, glob, hashlib, json, math, os, re
 from pathlib import Path
 
+
+def text_host():
+    """3.27.2: what the frontend's text measurement depends on besides the frontend itself: the OS, the machine and the
+    fonts it finds (Chromium asks fontconfig on Linux). The same frontend computed 17 of a package's nodes at other sizes
+    on a Blacksmith ARM runner than on the HF runner that photographed them (2026-10-25). The fonts are a fingerprint of
+    the sorted family names `fc-list` reports ("" where there is no fc-list)."""
+    import platform, subprocess, sys
+    try:
+        out = subprocess.run(["fc-list", "--format", "%{family}\n"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    fams = sorted({f.strip() for line in out.splitlines() for f in line.split(",") if f.strip()})
+    return {"platform": sys.platform, "machine": platform.machine(),
+            "fonts": hashlib.sha256("\n".join(fams).encode()).hexdigest()[:16] if fams else ""}
+
 # ---------------------------------------------------------------- graph helpers
 def wvals(n):
     wv = n.get("widgets_values")

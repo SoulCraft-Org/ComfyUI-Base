@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.27.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.27.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -869,6 +869,12 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.27.2: the size cache is compared only on the text host that photographed it (2026-10-25). The same frontend
+  measured 17 of the Video Creator's nodes at other sizes on a Blacksmith ARM runner (the CI router's overflow) than
+  on the HF runner that made `sizes.json`, and `test_snapshot_sizes_cache_is_current` failed on a cache that was
+  right. `snapshot.py` now records the machine and a fingerprint of the fonts (`py/canvas.py` `text_host`) beside
+  the OS (3.8.2), and the test skips, saying why, on any other host; a cache without them counts as made on x86_64
+  (Linux, the HF runner) or arm64 (macOS).
 - 3.27.1: the canvas tools default to their own testbed port (2026-10-25). `snapshot.py`, `probe.py` and `panels.py` took
   `--server` from `BASE_SERVER`, else `127.0.0.1:8199`. A runner Space now runs two runners, each with its own
   `TESTBED_PORT` (8199 and 8299, workspace `ci/hf-runner/`), and a bare 8199 is the other runner's testbed mid-gate (a
