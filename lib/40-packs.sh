@@ -824,7 +824,7 @@ base_consolidate(){ # what is already installed elsewhere on this pod: strays of
   hdr "CONSOLIDATE · what is already installed on this pod"
   local VOLROOT="${BASE_PERSIST_ROOT:-$BASE_VOLUME}"; [ -n "$BASE_FAKE_ROOT" ] && VOLROOT="$BASE_FAKE_ROOT"
   local d name url sha cnr why branch other rows
-  # ---- other ComfyUI trees: reported, never touched. 3.25.0: the template image's seed is not one (a head start, read by
+  # ---- other ComfyUI trees: reported, never touched. 3.26.0: the template image's seed is not one (a head start, read by
   # the venv build, lib/30-venv.sh): neither its tree nor its venv is reported, so neither costs a du on a fresh volume.
   # A pack of ours inside it is still a stray below, and moved in: the image's clone is fetched, not cloned again.
   local others=()

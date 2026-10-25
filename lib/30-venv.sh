@@ -130,7 +130,7 @@ _base_python_pick(){ # → newest CPython minor whose uv pip compile resolves th
 }
 _base_uv_platform(){ case "$(uname -m)" in aarch64|arm64) echo aarch64-unknown-linux-gnu;; *) echo x86_64-unknown-linux-gnu;; esac; }
 _base_torch_pick(){ # <x.y> [venv backend] → "<torch version> <backend>" (uv --torch-backend=auto), its reason on stderr
-  # 3.25.0: answered once per run for each pair. A fresh venv asked twice for the same minor (the backend pick, then the
+  # 3.26.0: answered once per run for each pair. A fresh venv asked twice for the same minor (the backend pick, then the
   # torch pick after the Python pick), four or five uv compiles each time. The answer is kept in the run's temp dir, which
   # the caller has made (_base_tmp), so a command substitution finds it too; a failed pick is not kept, so it is asked again.
   local k="" rc=0
@@ -198,9 +198,9 @@ _base_venv_boot_line(){ # [venv] → the banner's "boots from" line, judged by t
   else echo -e "  boots from   ${bh:-?} · ${RED}$bv; this run rebuilds the venv${NC}"; fi
 }
 
-# ---------------------------------------------------------------- 3.25.0: the template image's head start
+# ---------------------------------------------------------------- 3.26.0: the template image's head start
 # The template image (runpod-template's ghcr comfyui-base) carries a seed built at the volume's own paths, under
-# BASE_IMAGE_SEED (/opt/comfy-seed): ComfyUI, a venv, the managed CPython it boots from, and since 3.25.0 uv's cache with
+# BASE_IMAGE_SEED (/opt/comfy-seed): ComfyUI, a venv, the managed CPython it boots from, and since 3.26.0 uv's cache with
 # every wheel of that venv unpacked (one copy in the layer: the cache's files are hardlinks of the venv's). A venv built
 # here needs no download for anything the image holds: uv reads the image's cache and links the files (copies them,
 # across filesystems), and fetches only what moved since the image was built. A head start, never a pin: every pick
@@ -330,7 +330,7 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   local pymm="$1" tv="$2" ts rv step_fail=0 had=0 backend="${BASE_TORCH_BACKEND:?the torch backend is picked first}"
   ts="$(_base_ts)"
   [ -d "$VENV" ] && had=1 || true
-  _base_venv_image_cache                     # 3.25.0: the image's wheels, when the image carries them
+  _base_venv_image_cache                     # 3.26.0: the image's wheels, when the image carries them
   CONSTRAINTS="$BASE_STATE/constraints-torch.txt"
   _base_reqlift >/dev/null 2>&1 || true
   # (0) prove the whole set resolves BEFORE the old venv is touched — a throwaway venv in a temp dir
@@ -472,7 +472,7 @@ base_venv(){ # the stage: reuse when the probe passes, otherwise rebuild with ro
   # the newest patch of the chosen minor: uv keeps the old patch (a venv elsewhere may still use it) and moves venvs
   # created through its minor-version directory to the new one without a rebuild
   if [ "$BASE_DRY" != "1" ]; then
-    _base_image_python "$pymm"               # 3.25.0: the image's copy first, so a newer patch is the only download
+    _base_image_python "$pymm"               # 3.26.0: the image's copy first, so a newer patch is the only download
     uv python upgrade "$pymm" >/dev/null 2>&1 || uv python install "$pymm" >/dev/null 2>&1 || true
   fi
   owner="$(_base_venv_owner)"

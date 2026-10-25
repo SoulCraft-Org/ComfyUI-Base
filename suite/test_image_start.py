@@ -1,8 +1,8 @@
-"""unit tier, 3.25.0: the template image's head start.
+"""unit tier, 3.26.0: the template image's head start.
 
 The template image (runpod-template's ghcr comfyui-base) carries a seed built at the volume's own paths under
 /opt/comfy-seed: ComfyUI, a venv, the managed CPython it boots from, and uv's cache with every wheel of that venv
-unpacked. A podctl pod never copies the seed, so before 3.25.0 its venv downloaded and unpacked all 4.1 GB again on the
+unpacked. A podctl pod never copies the seed, so before 3.26.0 its venv downloaded and unpacked all 4.1 GB again on the
 image that already held them. A venv built on such a machine now reads those wheels, and the picks, the newest pass and
 everything else about the install are as before. Every test runs the real library against a throwaway tree."""
 import functools, http.server, os, pathlib, shutil, subprocess, sys, threading, zipfile, pytest
@@ -44,7 +44,7 @@ def test_unit_across_filesystems_the_images_wheels_are_copied_without_a_hardlink
 
 
 def test_unit_no_image_cache_leaves_the_volumes_own_cache_alone(tmp_path):
-    vol, seed, pre = _seeded(tmp_path, cache=False)                       # an image without the cache (built before 3.25.0)
+    vol, seed, pre = _seeded(tmp_path, cache=False)                       # an image without the cache (built before 3.26.0)
     r = _bash(pre + '_base_venv_image_cache; echo "UV=$UV_CACHE_DIR LINK=${UV_LINK_MODE:-default}"')
     assert "UV=%s LINK=default" % (vol / ".cache" / "uv") in r.stdout and "the image's" not in r.stdout, r.stdout + r.stderr
     # a cache that is not on the volume has no twin in the seed: it is never swapped

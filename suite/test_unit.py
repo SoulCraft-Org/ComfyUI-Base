@@ -141,7 +141,7 @@ def test_unit_no_and_list_ends_a_loop_body():
 
 
 def test_unit_outbound_hosts_are_allowlisted():
-    allow = {"huggingface.co", "github.com", "pypi.org", "pypi.nvidia.com", "download.pytorch.org",
+    allow = {"huggingface.co", "github.com", "civitai.com", "pypi.org", "pypi.nvidia.com", "download.pytorch.org",
              "developer.download.nvidia.com", "127.0.0.1", "localhost", "0.0.0.0"}   # 3.0.0: NVIDIA's CUDA repository (the driver)
     src = "\n".join(_src(p) for p in [*LIB, *sorted((BASE / "py").glob("*.py"))])
     hosts = set(re.findall(r"https?://([A-Za-z0-9.-]+)", src))
@@ -3303,7 +3303,7 @@ def test_unit_start_waits_while_the_process_lives_and_gives_up_when_it_dies(tmp_
 
 
 def test_unit_the_restart_is_seen_within_a_second_of_answering(tmp_path):
-    # 3.25.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing
+    # 3.26.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing
     bin_ = tmp_path / "bin"; bin_.mkdir()
     (bin_ / "curl").write_text("#!/bin/bash\nexit 0\n"); (bin_ / "curl").chmod(0o755)
     r = _bash('HOSTPORT=127.0.0.1:8188; _base_comfy_pids(){ echo 424242; }; _base_wait_comfy; echo RC=$?', env={"PATH": "%s:/usr/bin:/bin" % bin_})

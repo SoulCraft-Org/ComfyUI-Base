@@ -183,7 +183,7 @@ _base_python_moved(){ # BASE_PY_MOVED: how many Python packages differ from the 
 }
 
 _base_outdated(){ # → "name installed latest" for every package still behind, torch's closure excluded
-  # 3.25.0: the closure is left out of the query too (--exclude), not only out of the answer: its two dozen packages were
+  # 3.26.0: the closure is left out of the query too (--exclude), not only out of the answer: its two dozen packages were
   # looked up on PyPI and NVIDIA's index on every scan, and the newest pass scans twice
   local idx=() closure ex=() n
   while IFS= read -r a; do idx+=("$a"); done < <(_base_uv_index_args | grep -v -- '--find-links\|wheels$' || true)

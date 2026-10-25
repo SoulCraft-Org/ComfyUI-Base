@@ -212,7 +212,7 @@ against the fake RunPod, balance and guard; `test_ports.py`: reuse, now fresh by
 - `podctl balance` against the live account while a pod runs: how far `clientBalance` actually trails, to set
   `--lag-min` from a measurement instead of 30.
 
-## 9. The Python side of a fresh install: the image's wheels, one torch pick (3.25.0)   (2026-10-25, no pod used)
+## 9. The Python side of a fresh install: the image's wheels, one torch pick (3.26.0)   (2026-10-25, no pod used)
 
 **Why.** Paul's priority 3, install speed (target 8 minutes from pod create to App ready). The 5.9.0 install's VENV took
 116 s on `runpod/comfyui:1.4.7-cuda13.0`. The picks are a few seconds of it (about 14 uv compiles, measured on the Mac at

@@ -213,7 +213,7 @@ def test_unit_a_minor_without_torch_family_wheels_costs_one_small_compile_and_no
 
 
 def test_unit_a_fresh_venv_asks_for_its_torch_pick_once(tmp_path):
-    """3.25.0: with no venv to read a backend from, the backend pick and then the torch pick both asked torch_pick.py about
+    """3.26.0: with no venv to read a backend from, the backend pick and then the torch pick both asked torch_pick.py about
     the same minor, four or five uv compiles each, the second set for an answer the run already had. It is kept now,
     its reason included (the target line still says why)."""
     env = _uv_new_python(tmp_path); log = tmp_path / "uv.log"; env["UV_LOG"] = str(log)
@@ -238,7 +238,7 @@ def test_unit_a_failed_torch_pick_is_asked_again_and_a_good_one_is_not(tmp_path)
 
 
 def test_unit_the_outdated_scan_does_not_ask_the_index_about_torchs_closure(tmp_path):
-    # 3.25.0: the closure is filtered out of the answer as before, and now out of the query too
+    # 3.26.0: the closure is filtered out of the answer as before, and now out of the query too
     d = tmp_path / "bin"; d.mkdir(); log = tmp_path / "uv.log"
     _stub(d, "uv", f"""\
         echo "$*" >> "{log}"
@@ -773,7 +773,7 @@ def test_unit_sudo_carries_the_non_interactive_settings(tmp_path):
 
 
 def test_unit_dpkg_skips_its_fsync_on_a_runpod_container_and_nowhere_else(tmp_path):
-    # 3.25.0: a RunPod container's disk is the image's again at every start, so a crash mid-unpack leaves nothing behind;
+    # 3.26.0: a RunPod container's disk is the image's again at every start, so a crash mid-unpack leaves nothing behind;
     # a VM keeps its disk, and every fsync with it
     d = tmp_path / "bin"; d.mkdir()
     _stub(d, "sudo", 'echo "SUDO $*"\n'); _stub(d, "id", 'echo 1000\n')
