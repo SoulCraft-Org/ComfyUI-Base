@@ -10,6 +10,8 @@
 # BASE_FAKE_FREE_GB=<n>  overrides the measured free space for the disk gate (fake trees are sparse)
 # BASE_FAKE_DL=fail      with BASE_NO_NET: every fake download fails (the suite asserts the non-zero exit)
 # BASE_FAKE_DL=real      with BASE_NO_NET: run the REAL download branches (hf / curl stubbed on PATH by the suite)
+# BASE_FAKE_ORIGIN=<url>  3.25.0: with BASE_FAKE_ROOT, the ranged downloader (py/fetch_ranges.py) fetches from this origin
+#                        instead of the row's (civitai.com, github.com): the suite's local server, never a real host
 # BASE_TOKEN_CHECK_URL_HF   where a token is validated (the suite points it at a fake service)
 # BASE_INNER=1           set by fake-pod tests: do not run a suite inside a suite run
 # BASE_YES=1             unattended: yes to the deletion prompt (failure-path rollback questions default to yes anyway)
@@ -67,8 +69,10 @@
 # BASE_STAGED=1          3.1.0: act on the package's MODELS_LATER: those rows get 0-byte stand-ins, the server starts
 #                        on the first flow's files, and a detached `base.sh fetch-later` brings the rest
 #                        (state/later.queue, state/standins.list, state/progress.json). Every other run ignores it.
-# BASE_FETCH_JOBS=<n>    3.1.0: how many model files download at once. 3.11.0: default 6 (3 under 32 GiB of memory),
-#                        largest first; 1 is the one-at-a-time behaviour of 3.0 to 3.10.
+# BASE_FETCH_JOBS=<n>    3.1.0: how many model files download at once. 3.11.0: default 6, largest first; 1 is the
+#                        one-at-a-time behaviour of 3.0 to 3.10. 3.25.0: 6 on every machine (it was 3 under 32 GiB).
+# BASE_RANGE_CONNS=<n>   3.25.0: connections per file on the ranged leg (Civitai, a big GitHub file): default 16
+# BASE_RANGE_MIN_MB=<n>  3.25.0: a GitHub file this size or more takes the ranged leg, a smaller one curl (default 256)
 # BASE_MODELS_FOREGROUND=1  3.11.0: the model downloads wait for the venv build, as before (lib/52-models-early.sh)
 # BASE_TOOLS_FOREGROUND=1   3.11.0: JupyterLab's tools venv builds in the BOOT stage, as before (lib/75-boot.sh)
 # BASE_CUDA_FOREGROUND=1    3.22.0: the cuBLAS probe (and its apt install) runs after the venv, as before (lib/40-packs.sh)

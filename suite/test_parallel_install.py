@@ -75,10 +75,8 @@ def test_unit_the_probe_keeps_a_b300_venv_built_for_sm_100(tmp_path):
 
 # ---------------------------------------------------------------- downloads: six at once, the biggest first
 
-def test_unit_six_downloads_at_once_by_default_three_on_a_small_machine():
-    assert _bash('_base_fetch_jobs').stdout.strip() in ("3", "6")
-    src = _code("lib/50-models.sh", "_base_fetch_jobs(){", "\n}\n")
-    assert 'n=3; else n=6' in src and "33554432" in src                      # 32 GiB in kB, from /proc/meminfo
+def test_unit_six_downloads_at_once_by_default():
+    assert _bash('_base_fetch_jobs').stdout.strip() == "6"                    # 3.25.0: on every machine (test_fetch_ranges.py)
     assert _bash('BASE_FETCH_JOBS=2 _base_fetch_jobs').stdout.strip() == "2"
 
 
