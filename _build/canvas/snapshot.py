@@ -18,7 +18,7 @@ from pathlib import Path
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "py"))
-from canvas import structure_sha, CHROME_LEFT, CHROME_TOP, FRONTEND_ONLY_TYPES, load_spec, package_files              # noqa: E402
+from canvas import structure_sha, CHROME_LEFT, CHROME_TOP, FRONTEND_ONLY_TYPES, load_spec, package_files, text_host             # noqa: E402
 from comfy_settings import SEED                                                                                      # noqa: E402
 
 
@@ -347,6 +347,8 @@ def main():
         Path(a.sizes_out).write_text(json.dumps(
                   {"frontend": view["frontend"], "comfyui": view["comfyui"], "generated": view["generated"],
                    "platform": sys.platform,       # 3.8.2: the text metrics differ by OS; the cache is compared only where it was made
+                   # 3.27.2: and by machine and fonts (py/canvas.py text_host): a Blacksmith ARM runner measured 17 nodes otherwise
+                   "machine": text_host()["machine"], "fonts": text_host()["fonts"],
                    "workflow_structure_sha": view["workflow_structure_sha"],
                    "constants": {"NODE_TITLE_HEIGHT": 30, "NODE_SLOT_HEIGHT": 20, "NODE_WIDGET_HEIGHT": 20},
                    "nodes": sizes}, indent=1, ensure_ascii=False))
