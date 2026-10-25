@@ -163,7 +163,7 @@ _base_restart_proven(){ # _base_restart_comfy; when the import check rode along 
   local off rc=0
   if [ "${BASE_IMPORT_DEFERRED:-0}" != "1" ]; then _base_restart_comfy; return $?; fi
   off="$(_base_log_size "$COMFY_LOG")"
-  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then off="${BASE_EARLY_OFF:-$off}"; fi   # 3.26.0: that start's own slice
+  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then off="${BASE_EARLY_OFF:-$off}"; fi   # 3.27.0: that start's own slice
   _base_restart_comfy || rc=$?
   BASE_IMPORT_DEFERRED=0
   _base_tmp; local log="$BASE_TMPD/import_check.log"
@@ -197,7 +197,7 @@ _base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactl
   # one holding :8188 and 34 GB of VRAM. Where the unit owns ComfyUI the restart goes through the unit, so the server
   # is always the unit's and a unit restart replaces it. BASE_RESTART_VIA says which way it went (unit | direct).
   BASE_RESTART_VIA=direct
-  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then         # 3.26.0: started beside the downloads, and nothing it reads at start moved
+  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then         # 3.27.0: started beside the downloads, and nothing it reads at start moved
     BASE_EARLY_STATE=used; BASE_RESTART_VIA=early
     echo "  the start made beside the model downloads (nothing it reads at start has changed since)"
     _base_wait_spawned; return
@@ -216,7 +216,7 @@ _base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactl
   _base_stop_comfy || return 1
   _base_start_comfy
 }
-# ---------------------------------------------------------------- 3.26.0: the first start beside the model downloads
+# ---------------------------------------------------------------- 3.27.0: the first start beside the model downloads
 # A first install (no ComfyUI answering, BASE_RESTART=1) used to start ComfyUI only after everything else: the models join,
 # prune, sync, the post-models hook, hygiene. The start is a cold one (16 s on a B200 on 2026-10-17: Python, torch, CUDA,
 # ComfyUI's own nodes; the custom nodes under 1 s), and nothing in the model stages needs it, nor it them: ComfyUI's file
@@ -327,7 +327,7 @@ base_restart(){ # reports what needs a restart and prints the exact launch line;
   _base_early_decide
   local live=0
   curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1 && live=1
-  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then live=0; fi   # 3.26.0: the server answering is this run's own early start
+  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then live=0; fi   # 3.27.0: the server answering is this run's own early start
   if [ "$live" = 0 ]; then
     if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then miss "do NOT start ComfyUI — the import check failed; fix that first"; BASE_RESTART_RESULT="do not start (import check failed)"; BASE_RESTART_NEEDED=1; return 0; fi
     if [ "$BASE_RESTART" = "1" ]; then       # opting in means a running server at the end, whether or not one was running before (2.0.11)

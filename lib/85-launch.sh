@@ -301,7 +301,7 @@ _base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), sta
   _base_spawn_comfy || return 1
   _base_wait_spawned
 }
-_base_spawn_comfy(){ # 3.26.0: the start without the wait, so an install can start ComfyUI beside its model downloads and wait
+_base_spawn_comfy(){ # 3.27.0: the start without the wait, so an install can start ComfyUI beside its model downloads and wait
   # after them (lib/80-server.sh _base_launch_early). What the wait needs is left in BASE_SPAWN_N and BASE_SPAWN_PID.
   local extra=() w pv=() i
   _base_local_dirs
@@ -332,7 +332,7 @@ _base_spawn_comfy(){ # 3.26.0: the start without the wait, so an install can sta
   if [ "$_BASE_SERVER_N" -gt 1 ]; then BASE_SPAWN_PID="$(cat "$st/comfyui.pid" 2>/dev/null || true)"; fi
   return 0
 }
-_base_wait_spawned(){ # 3.26.0: wait for what _base_spawn_comfy started; 0 when server 0 answers
+_base_wait_spawned(){ # 3.27.0: wait for what _base_spawn_comfy started; 0 when server 0 answers
   local rc i
   local _BASE_SERVER_N="${BASE_SPAWN_N:-1}" _BASE_WAIT_PID="${BASE_SPAWN_PID:-}"   # the spawn's view, for the calls below
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
@@ -390,11 +390,11 @@ _base_wait_comfy(){ # [grace s] → 0 when HOSTPORT answers; patient while a Com
   # 3.20.0 _BASE_WAIT_PID: server 0's own pid, when N servers run; then only that process counts as alive
   local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}" alive half=0
   [ -n "$tries" ] && limit=$((tries * 2))            # older callers (and the suite) size it in 2 s tries
-  # 3.26.0: asked every half second (it was every 2 s, so the answer was seen a second late on average); the process
+  # 3.27.0: asked every half second (every second since 3.26.0, every 2 s before); the process
   # check and the progress lines keep their 2 s rhythm, and `waited` stays whole seconds
   while [ "$waited" -lt "$limit" ]; do
     sleep 0.5; half=$((half + 1)); waited=$((half / 2))
-    if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited s"; return 0; fi
+    if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited$([ $((half % 2)) = 1 ] && echo .5) s"; return 0; fi
     [ $((half % 4)) -eq 0 ] || continue
     if [ -n "${_BASE_WAIT_PID:-}" ]; then alive="$(kill -0 "$_BASE_WAIT_PID" 2>/dev/null && echo 1 || true)"
     else alive="$(_base_comfy_pids 2>/dev/null || true)"; fi

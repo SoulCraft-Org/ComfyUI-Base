@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.26.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.27.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -500,7 +500,7 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   quota's count. Inter-op threads, the GPU and CUDA kernels are unaffected. On a machine with no quota torch keeps its
   own default (the physical cores it sees), the right number there.
 - Hooks, called if defined, dry-run aware via `$BASE_DRY`: `pkg_pre_venv pkg_post_venv pkg_pre_models
-  pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`. 3.26.0: register model folders
+  pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`. 3.27.0: register model folders
   (`_base_yaml_register`) from `pkg_hygiene`, not `pkg_post_models`: hygiene runs before a first install's early start, and
   ComfyUI reads `extra_model_paths.yaml` only at start, so a folder registered later costs a second start. And `pkg_cmd_<name>` per
   `PKG_COMMANDS` row `name|function|help`. A failing hook fails the run. A package whose `pkg_post_venv` compiles
@@ -605,7 +605,7 @@ background (3.11.0, below)] → the venv snapshot → `pkg_pre_venv` → venv �
 `pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
 MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
-either version moves) → `pkg_pre_models` → [3.26.0, a first install (`BASE_RESTART=1`, no server answering): the import
+either version moves) → `pkg_pre_models` → [3.27.0, a first install (`BASE_RESTART=1`, no server answering): the import
 check, hygiene, then ComfyUI started NOW, beside the downloads; base_restart waits for it below] → [join the model downloads] →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub;
 3.25.0: Civitai, and a GitHub file of `BASE_RANGE_MIN_MB` (256) or more, over `BASE_RANGE_CONNS` (16) connections, hashed as
@@ -678,6 +678,20 @@ runs on a machine once per base version (`state/base-suite.ok`). A retry of the 
 Mac gate. podctl polls every 5 s, and since 3.24.0 the wait is on the machine (STEP RC is looked for once a second there),
 so the end of a step is seen within a second. Every ssh, scp and log fetch of one run shares ONE connection (3.24.0,
 ControlMaster; `PODCTL_SSH_MUX=0` turns it off).
+
+**The image's head start** (3.26.0). On the template image (`runpod-template`, `ghcr.io/soulcraft-org/comfyui-base`),
+`BASE_IMAGE_SEED` (`/opt/comfy-seed`) holds a seed built at the volume's own paths, and from runpod-template#21 on, uv's
+cache with every wheel of the seed's venv (one copy in the layer: the cache's files are hardlinks of the venv's). A podctl
+pod never copies the seed (its boot guard runs only a `boot.sh` already on the volume), so its venv used to fetch the
+4.1 GB the image already held. A venv the run must build now reads the seed's cache, the twin of the volume's
+`.cache/uv`, for the rest of the run: the wheels it holds are linked into the venv (copied across filesystems,
+`UV_LINK_MODE=copy`) instead of downloaded and unpacked, and only what moved since the image was built is fetched.
+Every pick and the newest pass run as before, and the versions are a cold cache's: the cache's index listings from the
+build day are deleted before uv reads it, so only immutable per-file entries (metadata, unpacked wheels) are reused. A
+reused venv keeps the volume's own cache. The image's CPython is copied
+onto a volume that has none of that minor before `uv python upgrade`, which still moves it to a newer patch. The seed is
+not a second install: CONSOLIDATE neither reports nor sizes its tree and venv, and moves a pack of ours out of it into
+`custom_nodes`, where the pack pass fetches it instead of cloning it.
 
 **A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
 moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
@@ -855,7 +869,7 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
-- 3.26.0: a first install starts ComfyUI beside its model downloads, not after them (2026-10-25). On 2026-10-17 the App's
+- 3.27.0: a first install starts ComfyUI beside its model downloads, not after them (2026-10-25). On 2026-10-17 the App's
   cold start (16 s on a B200: Python, torch, CUDA and ComfyUI's own nodes; the custom nodes under 1 s) came after the
   models join (30 s), prune, sync, the post-models hook, the import check and hygiene, though nothing in those needs a
   server and the server needs none of them: ComfyUI's file lists re-check their folders, so a model that lands after the
@@ -869,10 +883,34 @@ for any invocation that somehow arrives without the environment. The suite asser
   start; a run that stops before its restart stops the server it started; a boot-unit host starts through the unit at the
   end, as before. The early server listens on 127.0.0.1 (ComfyUI always does since 3.14.0), and the app ports that front
   it start at boot install, after base_models and base_prune, so no prompt can reach it while a snapshot
-  folder fills or prune moves a file. The server is asked whether it is up every 0.5 s (was 2 s). `BASE_EARLY_LAUNCH=0` keeps the old order.
-  A package that registers model folders from `pkg_post_models` (video-replacer-minimax-h3 5.9.x does) gets the second
+  folder fills or prune moves a file. The server is asked whether it is up every 0.5 s (every second since 3.26.0). `BASE_EARLY_LAUNCH=0` keeps the old order.
+  A package that registers model folders from `pkg_post_models` (video-replacer-minimax-h3 5.9.0 did; 5.9.1 moved them) gets the second
   start until it moves those lines to `pkg_hygiene`. Expected: up to 16 s less pod to App ready, capped by the join's
   length. Exercised by the unit tier's stand-ins only (no pod).
+- 3.26.0: the Python side of a fresh install (Paul's priority 3, install speed, 2026-10-25). Read from the last Video
+  Replacer pod (yswh3tkypxhxev, `runpod/comfyui:1.4.7-cuda13.0`, base 3.20.0) and the code: VENV's 116 s held the uv
+  picks (about 14 uv compiles, measured at about 1 s each cold and near 0 warm, so a few seconds in all), 4.1 GB of
+  wheels in 165 packages downloaded and unpacked (the torch closure, 3.0 GB in 23 of them, from download-r2.pytorch.org
+  and pypi.nvidia.com; 1.1 GB from PyPI), the verify (`import torch` 3.5 s), and the `cuda-libraries-dev-13-0` apt
+  that 3.22.0 moved beside it. (1) The template image's head start (§5): a venv the run must build reads uv's cache from
+  the image's seed (`$BASE_IMAGE_SEED/.cache/uv`) for the rest of the run, so the wheels the image holds are linked or
+  copied instead of fetched, and the same versions as a cold cache: its index listings (`simple-v*`, `flat-index-v*`,
+  from the build day) are dropped first, since an index sending a long max-age would have uv trust them and resolve
+  older (the unit tier shows exactly that against a local index, then the empty freeze diff with the guard); the
+  image's CPython is copied onto a volume that has none of that minor; CONSOLIDATE no
+  longer reports or sizes the seed's tree and venv. The image carries the cache from runpod-template's own change of
+  the same day. (2) The torch pick is answered once per run for each minor and venv backend (`_base_torch_pick`): a fresh
+  venv asked twice, four or five compiles each time; a failed pick is asked again. (3) The newest pass's outdated scan
+  leaves the torch closure out of the query (`--exclude`), not only out of its answer. (4) On RunPod, dpkg runs with
+  `--force-unsafe-io`: the container disk is the image's again at every start, so a crash mid-unpack leaves nothing
+  behind (a VM keeps every fsync). (5) The restart's readiness poll asks every second, not every two. Expected, not
+  measured: on the image, VENV from 116 s to about 25-35 s (nothing of the 4.1 GB fetched or unpacked unless it moved,
+  cuBLAS already in the CUDA devel base, the second pick gone); on `runpod/comfyui`, 2-5 s (the pick, half a second of
+  the poll on average) and SYSTEM, off the critical path, shorter by dpkg's fsyncs. Not done here: the run's one
+  directory scan, at CONSOLIDATE, still walks the image's cache (its prune list, `_base_cache_prune` in lib/50-models.sh,
+  names the run's own caches, and the swap comes later, at the venv). The
+  unit tier covers each (`suite/test_image_start.py`; the pick, the scan, dpkg and the poll beside their neighbours).
+  No pod used.
 - 3.25.0: the customer's own downloads, as fast as each source allows (Paul, 2026-10-25: every model, LoRA and file
   comes from the buyer's own Hugging Face and Civitai accounts). Read first, from the sources' own documentation. The
   Hub is fully Xet-backed and `hf_transfer` is deprecated (`HF_HUB_ENABLE_HF_TRANSFER` no longer does anything);

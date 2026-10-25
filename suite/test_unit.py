@@ -2849,7 +2849,7 @@ def test_unit_restart_opt_in_starts_a_server_when_none_runs(tmp_path):
     assert "R=started" not in r.stdout and not log.exists() and "import check failed" in r.stdout, r.stdout + r.stderr
 
 
-# 3.26.0: a first install starts ComfyUI beside its model downloads; base_restart waits for that start at its old place
+# 3.27.0: a first install starts ComfyUI beside its model downloads; base_restart waits for that start at its old place
 _EARLY = ('PKG_DIR=/nonexistent; WF_NAME=w.json; base_env_setup; base_discover quiet; BASE_NO_NET=0; BASE_DRY=0; PY="%s"; COMFY_LOG="%s"; '
           'BASE_START_TRIES=3; BASE_RESTART=1; BASE_VENV_RESULT=built; '
           'base_import_check(){ BASE_IMPORT_DEFERRED=1; echo IMPORTCHECK; }; base_hygiene(){ echo HYGIENE; }; _base_own_packs_judge(){ :; }; '
@@ -3378,6 +3378,19 @@ def test_unit_start_waits_while_the_process_lives_and_gives_up_when_it_dies(tmp_
     # the old tries-based knob still sizes the window, so existing callers keep working
     r = _bash(base + '_base_comfy_pids(){ echo 424242; }; BASE_START_TRIES=2; _base_start_comfy; echo RC=$?')
     assert "RC=1" in r.stdout and "after 4 s" in r.stdout, r.stdout
+
+
+def test_unit_the_restart_is_seen_within_a_second_of_answering(tmp_path):
+    # 3.26.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing.
+    # 3.27.0: every half second (the early start's wait), reported to the half second
+    bin_ = tmp_path / "bin"; bin_.mkdir()
+    (bin_ / "curl").write_text("#!/bin/bash\nexit 0\n"); (bin_ / "curl").chmod(0o755)
+    r = _bash('HOSTPORT=127.0.0.1:8188; _base_comfy_pids(){ echo 424242; }; _base_wait_comfy; echo RC=$?', env={"PATH": "%s:/usr/bin:/bin" % bin_})
+    assert "up after 0.5 s" in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
+    src = (BASE / "lib" / "85-launch.sh").read_text(encoding="utf-8")
+    for fn, nxt in (("_base_wait_server(){", "_base_wait_comfy(){"), ("_base_wait_comfy(){", "\n}\n")):
+        body = src[src.index(fn):]; body = body[:body.index(nxt, len(fn))]
+        assert "sleep 0.5; half=$((half + 1))" in body and "sleep 2" not in body and "sleep 1;" not in body, fn
 
 
 # ---------------------------------------------------------------- T21: the two modes of 2.1.0 (a baked template image)

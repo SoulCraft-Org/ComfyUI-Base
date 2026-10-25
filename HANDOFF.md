@@ -211,3 +211,28 @@ against the fake RunPod, balance and guard; `test_ports.py`: reuse, now fresh by
   time with no volume (six at a time, pinned).
 - `podctl balance` against the live account while a pod runs: how far `clientBalance` actually trails, to set
   `--lag-min` from a measurement instead of 30.
+
+## 9. The Python side of a fresh install: the image's wheels, one torch pick (3.26.0)   (2026-10-25, no pod used)
+
+**Why.** Paul's priority 3, install speed (target 8 minutes from pod create to App ready). The 5.9.0 install's VENV took
+116 s on `runpod/comfyui:1.4.7-cuda13.0`. The picks are a few seconds of it (about 14 uv compiles, measured on the Mac at
+about 1 s cold and near 0 warm); the rest is 4.1 GB of wheels fetched and unpacked (3.0 GB of them torch's closure), the
+verify, and the cuBLAS apt 3.22.0 moved beside it. The template image could carry all of that, but a podctl pod never
+copied its seed, and its build deleted uv's cache.
+
+**What changed.** `lib/30-venv.sh`: `_base_venv_image_cache` (a venv being built reads `$BASE_IMAGE_SEED/.cache/uv`,
+`UV_LINK_MODE=copy` across filesystems), `_base_image_python`, `_base_image_twin`, `_base_in_image_seed`, and
+`_base_torch_pick` answering once per run. `lib/40-packs.sh`: CONSOLIDATE skips the seed's tree and venv.
+`lib/47-latest.sh`: `_base_outdated --exclude` the torch closure. `lib/15-system.sh`: `--force-unsafe-io` on RunPod.
+`lib/85-launch.sh`: the readiness polls every second. The image's half is runpod-template's PR of the same day (the seed
+keeps uv's cache, hardlinked with its venv; ffmpeg and the OS upgrade baked in; the seed copy keeps hardlinks).
+
+**Proven, and how.** The unit tier in CI (`suite/test_image_start.py`, and tests beside the pick, the scan, apt and the
+poll). Render parity (Paul: an install change must never change the render): the image's index listings are dropped
+before uv reads its cache. `test_unit_the_image_cache_resolves_the_same_versions_as_a_cold_cache_never_older` shows a
+stale listing installing an older version without the guard, and an empty freeze diff against a cold cache with it. On this Mac only `bash -n`, the packager and the new functions run once against a scratch tree.
+
+**Owed (the next pod, on the image).** The image has never been built: base-image.yml is skipped until `IMAGE_RUNNER`
+names a machine with Docker. Then, on one fresh pod made with `--image ghcr.io/soulcraft-org/comfyui-base:<tag>`: the
+pull (create to RUNNING, uncached and cached), VENV and its `uv cache: the image's` line, and the timeline's critical
+path against the 5.9.0 pod's.
