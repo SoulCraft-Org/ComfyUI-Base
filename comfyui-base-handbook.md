@@ -244,7 +244,10 @@ links (`ComfyUI http://localhost:8188`, `Jupyter Terminal http://localhost:8888/
 how a `--private` pod's ports are named. Those are the local numbers with nothing set. `PODCTL_TUNNEL_OFFSET=N` adds N
 to each, and `PODCTL_TUNNEL_BASE=<port>` (3.23.0) moves every local side into a block of the workstation's own:
 machine N takes `base+10N` to `base+10N+9`, ComfyUI, JupyterLab and 9199 at the first three, the app ports after them
-by port. The remote ports never move (`hosts/README.md` has the details). 11434 is no longer forwarded (3.23.0);
+by port. Pick a base that leaves room for every machine: each machine takes 10 ports (base+10N … base+10N+9), so the
+whole fleet must fit inside your account's block, e.g. base 3150 for up to 5 machines in 3100–3199. A base like 3180
+with a third machine would run into the next account's block. The remote ports never move (`hosts/README.md` has the
+details). 11434 is no longer forwarded (3.23.0);
 `--port 11434` forwards it for a package that runs an inference server on the machine. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
 (`<Display Name>/` with a `<Display Name> Script.sh`, and `ComfyUI Base/`) and their workflow copies in ComfyUI's
 browser; `--yes` removes exactly those, after the re-install has put the `<name>/` folders beside them. `--pkg` takes

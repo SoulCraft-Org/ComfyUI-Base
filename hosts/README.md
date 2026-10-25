@@ -57,7 +57,10 @@ run inside your block and every local side moves there; the remote ports stay wh
 | `base+10N+2` | 9199 | a package's metrics exporter, if it runs one |
 | `base+10N+3` … `+9` | every other port, lowest first | the machine's apps, or the ports `--port` names |
 
-`export PODCTL_TUNNEL_BASE=3180` puts the first machine at 3180-3189 and the second at 3190-3199. The ssh-config
+Pick a base that leaves room for every machine: each machine takes 10 ports (base+10N … base+10N+9), so the whole
+fleet must fit inside your account's block, e.g. base 3150 for up to 5 machines in 3100–3199. A base like 3180 with a
+third machine would run into the next account's block. `export PODCTL_TUNNEL_BASE=3150` puts the first machine at
+3150-3159 and the second at 3160-3169. The ssh-config
 block, `podctl tunnel`, `jupyter`, `mcp --over tunnel` and `create`'s hint all print the same numbers. A value that
 is not a whole number, or that would put a machine's ten ports outside 1024-65535, is refused rather than ignored,
 and so is an eleventh port. `--port LOCAL:REMOTE` still picks a local side by hand. 11434 (Ollama's) has not been
