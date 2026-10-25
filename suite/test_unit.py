@@ -141,7 +141,7 @@ def test_unit_no_and_list_ends_a_loop_body():
 
 
 def test_unit_outbound_hosts_are_allowlisted():
-    allow = {"huggingface.co", "github.com", "pypi.org", "pypi.nvidia.com", "download.pytorch.org",
+    allow = {"huggingface.co", "github.com", "civitai.com", "pypi.org", "pypi.nvidia.com", "download.pytorch.org",
              "developer.download.nvidia.com", "127.0.0.1", "localhost", "0.0.0.0"}   # 3.0.0: NVIDIA's CUDA repository (the driver)
     src = "\n".join(_src(p) for p in [*LIB, *sorted((BASE / "py").glob("*.py"))])
     hosts = set(re.findall(r"https?://([A-Za-z0-9.-]+)", src))

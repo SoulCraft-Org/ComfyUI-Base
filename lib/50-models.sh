@@ -340,9 +340,9 @@ _base_source(){ # <url> → hf | civitai | github | local: where a row's bytes c
   esac
 }
 _base_civitai_url_ok(){ # <url> → 0 for a download URL of one model version, its query only Civitai's own file selectors
-  local u="$1" q re_url='^https://civitai[.]com/api/download/models/[0-9]+([?][A-Za-z0-9=&._-]*)?$' \
-        re_q='^(&(fileId|type|format|size|fp)=[A-Za-z0-9._-]+)+$'
-  [[ "$u" =~ $re_url ]] || return 1
+  local u="$1" q re_id='^[0-9]+([?][A-Za-z0-9=&._-]*)?$' re_q='^(&(fileId|type|format|size|fp)=[A-Za-z0-9._-]+)+$'
+  case "$u" in https://civitai.com/api/download/models/*) ;; *) return 1;; esac
+  [[ "${u#https://civitai.com/api/download/models/}" =~ $re_id ]] || return 1
   q="${u#*\?}"; [ "$q" != "$u" ] || return 0
   [[ "&$q" =~ $re_q ]]                             # only the selectors: a token=, or anything else, is refused
 }

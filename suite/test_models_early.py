@@ -116,7 +116,8 @@ def test_unit_a_failed_early_download_fails_the_run_by_name_once_without_a_secon
     assert "FJOIN=0 DL=0" in out and "the model stage fails the run by their names" in out, out + r.stderr   # the join is not the verdict
     for f in ("a", "b"):
         assert out.count("F model: vae/Example/Real/%s.safetensors not obtained" % f) == 1, out          # the model stage's is, by name
-    assert len(log.read_text().splitlines()) == 6                                                          # three attempts each, not six
+    # three attempts each, not six (3.25.0: beside them, the one `hf cache verify --help` the queue asks before it forks)
+    assert len([l for l in log.read_text().splitlines() if l.startswith("hf download")]) == 6
 
 
 def test_unit_the_disk_gate_stops_the_early_pass_before_anything_downloads(tmp_path):

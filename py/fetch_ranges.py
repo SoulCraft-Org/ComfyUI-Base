@@ -7,7 +7,7 @@
 Standard library only: the system Python runs it, so it works before any venv exists and on any image.
 
   redirects   followed here, not by a library: the auth header (a 0600 file holding "Authorization: Bearer …", never
-              argv) goes to the first host only. Civitai answers its download URL with a 307 to a presigned storage URL
+              argv) goes on the first request only, never on a redirect. Civitai answers its download URL with a 307 to a presigned storage URL
               (24 h); the token never reaches that storage, its logs, or this output, which names hosts and never a query.
   ranges      the first request asks for byte 0 only. A 206 gives the total size (Content-Range) and proves ranges: the
               file is then fetched as fixed blocks over up to --conns kept-alive connections, each block written where
@@ -80,12 +80,12 @@ def _status_fail(status, host):
 
 
 def open_url(url, auth=None, headers=None, max_hops=10):
-    """GET url, following redirects by hand; auth only to the first host. → (final url, connection, response)."""
+    """GET url, following redirects by hand; auth on the first request only. → (final url, connection, response)."""
     origin = _host(url)
-    for _ in range(max_hops):
+    for hop in range(max_hops):
         conn = _conn(url)
         h = {"User-Agent": UA, **(headers or {})}
-        if auth and _host(url) == origin:
+        if auth and hop == 0:                          # never on a redirect, whatever host it names
             h[auth[0]] = auth[1]
         try:
             conn.request("GET", _target(url), headers=h)

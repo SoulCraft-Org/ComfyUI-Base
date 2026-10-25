@@ -253,7 +253,7 @@ def test_unit_gen_models_and_gen_hashes_read_civitai(server, tmp_path):
 def test_unit_six_downloads_at_once_on_every_machine():
     assert _bash('_base_fetch_jobs').stdout.strip() == "6"
     assert _bash('BASE_FETCH_JOBS=2 _base_fetch_jobs').stdout.strip() == "2"
-    assert "meminfo" not in (BASE / "lib/50-models.sh").read_text().split("_base_fetch_jobs(){", 1)[1].split("\n}\n", 1)[0]
+    assert "MemTotal" not in (BASE / "lib/50-models.sh").read_text().split("_base_fetch_jobs(){", 1)[1].split("\n}\n", 1)[0]
 
 
 def test_unit_the_hub_s_verify_probe_is_asked_once_for_the_whole_queue(tmp_path):
