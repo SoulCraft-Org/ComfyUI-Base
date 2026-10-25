@@ -1,4 +1,4 @@
-"""unit tier, 3.24.0: the customer's own downloads, as fast as the source allows.
+"""unit tier, 3.25.0: the customer's own downloads, as fast as the source allows.
 
 The promises: a Civitai file (and a big GitHub file) comes over many connections, its sha256 taken from the blocks as they
 land, never from a second read; the token goes to civitai.com only, from a 0600 file, never to the storage it redirects to

@@ -76,7 +76,7 @@ def test_unit_the_probe_keeps_a_b300_venv_built_for_sm_100(tmp_path):
 # ---------------------------------------------------------------- downloads: six at once, the biggest first
 
 def test_unit_six_downloads_at_once_by_default():
-    assert _bash('_base_fetch_jobs').stdout.strip() == "6"                    # 3.24.0: on every machine (test_fetch_ranges.py)
+    assert _bash('_base_fetch_jobs').stdout.strip() == "6"                    # 3.25.0: on every machine (test_fetch_ranges.py)
     assert _bash('BASE_FETCH_JOBS=2 _base_fetch_jobs').stdout.strip() == "2"
 
 

@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.23.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.25.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -92,7 +92,7 @@ run once per machine as **step one**; then each workflow package is **step two**
    ComfyUI it did not start before starting its own (3.0.3).
 8. **One deletion prompt, default No.** Duplicates, superseded files (only inside the package's own family
    folders) and partials, never a file another installed package claims (the ledger). `BASE_YES=1` approves.
-9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, civitai.com (3.24.0; with the storage its
+9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, civitai.com (3.25.0; with the storage its
    download URLs redirect to, which never receives the token), pypi.org, pypi.nvidia.com,
    download.pytorch.org, the distribution's apt mirrors and developer.download.nvidia.com (NVIDIA's CUDA repository); a `MODELS` row may name no other host. Nothing is uploaded. `--disable-api-nodes` is
    launch-arg hygiene. Tokens come from the shell env, else the machine's own environment (PID 1's: `HF_TOKEN` or its
@@ -231,8 +231,9 @@ holds the interface and a recipe.
 ### 1.1 RunPod (proven)
 
 **The one command (2.0.14).** Once a pod is reachable (`podctl ensure`), the whole documented sequence is
-`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. For each item in order,
-the local zip is checked current, the volume size is recorded for the disk gate, the zip is uploaded and extracted,
+`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. Every local zip is checked
+current first, the volume size is recorded for the disk gate, and every zip goes up in one upload (3.24.0: a zip already
+on the machine with the same size and sha256 is not sent again). Then for each item in order the zip is extracted,
 `--check` runs on the pod (non-zero stops everything), the real run goes detached (`BASE_RESTART=1` for a package;
 `--comfy-ref <ref>` for a newer ComfyUI, that install only) and is polled until `STEP RC=`, the pod's `state/logs` are
 copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block is printed, and a green run writes the pack records
@@ -514,7 +515,7 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   Leave it off unless the remote's HEAD is genuinely stale.
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
   fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), a Civitai download
-  URL (3.24.0: `https://civitai.com/api/download/models/<versionId>`, its query only Civitai's file selectors `fileId`,
+  URL (3.25.0: `https://civitai.com/api/download/models/<versionId>`, its query only Civitai's file selectors `fileId`,
   `type`, `format`, `size`, `fp`, never a token), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
   basenames the index may adopt. Pin a row to a commit (3.12.0): `resolve/<40-hex commit>/<path>` for a file,
@@ -604,7 +605,7 @@ MCP → newest (every package still behind forced to its newest; 3.3.0: each for
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
 either version moves) → `pkg_pre_models` → [join the model downloads] →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub;
-3.24.0: Civitai, and a GitHub file of `BASE_RANGE_MIN_MB` (256) or more, over `BASE_RANGE_CONNS` (16) connections, hashed as
+3.25.0: Civitai, and a GitHub file of `BASE_RANGE_MIN_MB` (256) or more, over `BASE_RANGE_CONNS` (16) connections, hashed as
 they land (`py/fetch_ranges.py`); curl for a smaller GitHub file; disk gate first; one line per file in
 `state/logs/<run>.downloads.tsv`) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check (3.15.0: from the local copy; with `BASE_RESTART=1` and no server answering, deferred to the restart, whose
@@ -671,7 +672,9 @@ nothing changed, and it stops only on what would stop the real run before that r
 suite, which would only test the server the real run is about to replace. `podctl install --base --pkg <dir>` installs
 the base and runs ONE pipeline, the package's (it already covers every stage the base's own run would); the base's suite
 runs on a machine once per base version (`state/base-suite.ok`). A retry of the same zip against the same base skips the
-Mac gate, and podctl polls every 5 s.
+Mac gate. podctl polls every 5 s, and since 3.24.0 the wait is on the machine (STEP RC is looked for once a second there),
+so the end of a step is seen within a second. Every ssh, scp and log fetch of one run shares ONE connection (3.24.0,
+ControlMaster; `PODCTL_SSH_MUX=0` turns it off).
 
 **A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
 moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
@@ -849,7 +852,7 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
-- 3.24.0: the customer's own downloads, as fast as each source allows (Paul, 2026-10-25: every model, LoRA and file
+- 3.25.0: the customer's own downloads, as fast as each source allows (Paul, 2026-10-25: every model, LoRA and file
   comes from the buyer's own Hugging Face and Civitai accounts). Read first, from the sources' own documentation. The
   Hub is fully Xet-backed and `hf_transfer` is deprecated (`HF_HUB_ENABLE_HF_TRANSFER` no longer does anything);
   `HF_XET_HIGH_PERFORMANCE=1`, already set, is the fast path, so the Hub leg keeps hf. Civitai answers its download
@@ -881,6 +884,22 @@ for any invocation that somehow arrives without the environment. The suite asser
   tier covers the helper against a local Civitai stand-in (redirect, token on the first hop only, ranges, resume, the
   stated hash, a source without ranges), the row rules, the leg choice, the record, the held move and the probe asked
   once. No pod used; the Hub leg is unchanged except for the probe.
+- 3.24.0: `podctl install` spends seconds, not most of a minute, around the package run (2026-10-25). The 2026-10-17
+  release run's "16:10 install, 395 s package run" was read as 9.5 minutes of driver overhead. It was not: the first
+  attempt died in the run script before podctl ran, the pod was stopped, fixed and resumed 11:39 later, and the install
+  clock was never re-stamped; the real `podctl install` took 277 s, and the "395 s" is the stage table's sum, which
+  counts the background stages beside the foreground (the package run's wall clock was 221 s). podctl's own share was
+  about 54 s: 46 s before the run, 8 s after. Most of it was connections: about 21 ssh handshakes, each about 11 round
+  trips (1.8 s to EU-RO-1 from the maintainer's Mac at 164 ms), because no command shared a connection. Now one
+  ControlMaster per machine carries every ssh, scp and log fetch of a run (2 round trips a command, measured 0.13 s
+  against 0.77 s); its master carries ClearAllForwardings like every command session, so it never binds the Host
+  block's forwards, and a dead master is retried once only when the session request failed before the command
+  started (a second launch would be a second install). Every zip is checked first and all of them go up in one upload
+  (probe, one scp, one check), and a zip already there with the same size and sha256 is not sent again. The poll waits
+  on the machine, so a finished step is seen within a second instead of 2.5 s later on average plus a handshake. The
+  lease is read once, and released in one round trip; the volume size is recorded once per run. A stale package zip now
+  stops before the base changes anything. Expected: about 35 s less per install to EU-RO-1, about 10 s to US-CA.
+  Exercised against the suite's stand-ins only (no pod).
 - 3.23.0: `podctl` binds no vendor port on the workstation when told not to (2026-10-24). The tunnel's local sides were
   the remote ports plus `PODCTL_TUNNEL_OFFSET` (0-1000), so every session bound 8188, 8888, 9199 and 11434 or a few
   ports above them. A workstation whose rule is that local listeners sit in each account's own block (3100-3199 for the

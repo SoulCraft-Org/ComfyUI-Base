@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One file over many connections, hashed as it lands (3.24.0). The Civitai leg, and GitHub's for a big file.
+"""One file over many connections, hashed as it lands (3.25.0). The Civitai leg, and GitHub's for a big file.
 
     fetch_ranges.py get  <url> <out> --bytes N [--sha256 HEX] [--auth-file F] [--conns 16] [--block-mib 8]
     fetch_ranges.py info <url> [--auth-file F] [--bytes N]        → {"bytes": N, "sha256": "<hex>"|null}

@@ -6,7 +6,7 @@
 #               embeddings, sams, depthanything, SEEDVR2, RMBG and grounding-dino, which write category/[Purpose/]file;
 #               vae_approx is flat: ComfyUI's preview loader wants the file right there)
 #   url       = https://huggingface.co/<repo>/resolve/<revision>/<path>  |  https://github.com/...
-#             | https://civitai.com/api/download/models/<versionId>[?fileId=…&type=…&format=…]   (3.24.0: the buyer's own
+#             | https://civitai.com/api/download/models/<versionId>[?fileId=…&type=…&format=…]   (3.25.0: the buyer's own
 #             |          Civitai account, CIVITAI_TOKEN in a header file; never a token= in the URL)
 #             | LOCAL   (must already exist somewhere on the pod; relocated into place, else the run FAILS — a file, or
 #             |          with a trailing / on file, a snapshot FOLDER of that name holding a config.json)
@@ -71,7 +71,7 @@ _base_model_rows(){ # prints validated MODELS rows; exit 1 on any violation (mes
                 if ! [[ "$url" =~ ^hf://[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*(@[0-9a-f]{40})?$ ]]; then
                   echo "  !! an hf:// url is hf://owner/repo, pinned as hf://owner/repo@<40-hex commit> ($url)" >&2; bad=1; continue; fi;;
       https://huggingface.co/*|https://github.com/*) ;;
-      https://civitai.com/*) if ! _base_civitai_url_ok "$url"; then   # 3.24.0
+      https://civitai.com/*) if ! _base_civitai_url_ok "$url"; then   # 3.25.0
                                echo "  !! a Civitai url is https://civitai.com/api/download/models/<versionId>[?fileId=…&type=…&format=…&size=…&fp=…], with no token in it ($file)" >&2; bad=1; continue; fi;;
       *) echo "  !! url host not on the privacy list (huggingface.co, github.com, civitai.com) or not LOCAL/hf://: $url" >&2; bad=1; continue;;
     esac
@@ -227,7 +227,7 @@ _base_hf_verify(){ # <hf> <repo> <revision> <dir> [--fail-on-missing-files] → 
   # sha256 (LFS) or git hash the Hub states for that revision. `hf cache verify` is the Hub's own check; an hf too old to
   # have it verifies nothing and says so (the size check still stands).
   local hfbin="$1" repo="$2" rev="${3:-main}" dir="$4" out; shift 4
-  # 3.24.0: whether this hf has it is asked once per hf (_base_hf_can_verify, before the queue forks), not once per file:
+  # 3.25.0: whether this hf has it is asked once per hf (_base_hf_can_verify, before the queue forks), not once per file:
   # each ask was a Python start inside the file's download slot
   if ! _base_hf_can_verify "$hfbin"; then note "sha256 not checked: this hf has no 'cache verify' (the size was)"; return 0; fi
   if out="$("$hfbin" cache verify "$repo" --revision "$rev" --local-dir "$dir" "$@" 2>&1)"; then return 0; fi
@@ -280,7 +280,7 @@ _base_pin_moved(){ # <dest> <url> → 0 when the row pins a commit other than th
 # ---------------------------------------------------------------- sizes
 _base_expected(){ # <url> → exact:<bytes> from the Hub (x-linked-size beats content-length; a non-2xx final hop counts for nothing) | approx:0
   local url="$1" out xl cl st
-  if [ "$(_base_source "$url")" = civitai ]; then   # 3.24.0: its storage refuses a HEAD; one byte asked for names the total
+  if [ "$(_base_source "$url")" = civitai ]; then   # 3.25.0: its storage refuses a HEAD; one byte asked for names the total
     out="$(_base_fetch_ranges info "$url" 2>/dev/null | sed -n 's/^RESULT .*"bytes": \([0-9]*\).*/\1/p' | tail -1)"
     if [[ "$out" =~ ^[0-9]+$ ]] && [ "$out" -gt 0 ]; then echo "exact:$out"; else echo "approx:0"; fi
     return 0
@@ -327,7 +327,7 @@ _base_curl_dl(){ # <staged file> <url> [curl args] — the GitHub leg: curl, res
   tail -3 "$out"; rm -f "$out"; return 1
 }
 
-# ---------------------------------------------------------------- 3.24.0: the ranged leg (py/fetch_ranges.py)
+# ---------------------------------------------------------------- 3.25.0: the ranged leg (py/fetch_ranges.py)
 # Civitai, and a GitHub file of BASE_RANGE_MIN_MB or more, come over BASE_RANGE_CONNS connections at once, each block
 # hashed from memory as it lands: size and sha256 are judged with no second read of the file. The token rides a 0600
 # header file to civitai.com only, never to the storage it redirects to, never argv, never a URL.
@@ -397,7 +397,7 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
   local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS rfile="" tv held=0
   base="$(basename "$dest")"; stage="$STAGING/$base.d"; mkdir -p "$stage"
   BASE_VERIFY_SECS=0                                # 3.22.0: how long the sha256 re-read took (the timeline's "sha256" span)
-  BASE_DL_VIA="hf-xet"                              # 3.24.0: the transport, for the per-file record
+  BASE_DL_VIA="hf-xet"                              # 3.25.0: the transport, for the per-file record
   if [ "$BASE_NO_NET" = "1" ] && [ "${BASE_FAKE_DL:-}" != "real" ]; then   # BASE_FAKE_DL=real: the real branches with stubbed tools on PATH
     BASE_DL_VIA="fake"
     if [ "${BASE_FAKE_DL:-}" = "fail" ]; then err "fake download failed (BASE_FAKE_DL=fail)"; rm -rf "$stage"; return 1; fi
@@ -430,7 +430,7 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
       BASE_VERIFY_SECS=$(( SECONDS - tv ))
     fi
   elif _base_ranged "$url" "$bytes"; then
-    staged="$stage/$base"      # 3.24.0: Civitai, or a big GitHub file: many connections, hashed as it lands, resumable
+    staged="$stage/$base"      # 3.25.0: Civitai, or a big GitHub file: many connections, hashed as it lands, resumable
     # its file has the full size from the first block on (each block is written where it belongs), so the size below
     # proves nothing here: only the helper's own verdict lets it move; a failed one stays staged, to resume
     if ! _base_ranged_dl "$staged" "$url" "$bytes"; then
@@ -598,7 +598,7 @@ _base_progress(){ # [stage] → state/progress.json from the queue, the stand-in
 # ---------------------------------------------------------------- fetching: one at a time, or BASE_FETCH_JOBS at once
 _base_fetch_jobs(){ # 3.11.0: six at once by default (one Xet file does not fill a pod's link; about three to six do, measured
   # 2026-10-16: six files 1.7 GB/s together, one 0.8 to 1 GB/s). BASE_FETCH_JOBS=1 is the one-at-a-time behaviour of 3.0
-  # to 3.10. 3.24.0: six on every machine. The three under 32 GiB of memory never applied on a pod (a container's
+  # to 3.10. 3.25.0: six on every machine. The three under 32 GiB of memory never applied on a pod (a container's
   # /proc/meminfo is the host's), only on a small own box, and since hf_xet 1.3.0 a transfer's buffers are bounded
   # (adaptive concurrency, no chunk cache).
   local n="${BASE_FETCH_JOBS:-6}"
@@ -611,7 +611,7 @@ _base_fetch_one(){ # <spec KIND|rel|url|bytes|dest> → rc of the download
 _base_now(){ if [ -n "${EPOCHREALTIME:-}" ]; then echo "${EPOCHREALTIME/,/.}"; else date +%s; fi; }   # epoch seconds, to the microsecond on bash 5
 _BASE_DL_TSV=""
 _base_dl_record(){ # <epoch start> <epoch end> <bytes> <sha256 secs> <source> <via> <result> <rel> → one line of the run's
-  # per-file record, state/logs/<the run's log>.downloads.tsv (3.24.0): the Install Speed Scorecard charts it, podctl fetches it
+  # per-file record, state/logs/<the run's log>.downloads.tsv (3.25.0): the Install Speed Scorecard charts it, podctl fetches it
   # with the rest of state/logs. Seconds and MB/s (decimal, 10^6 bytes) are wall clock, the sha256 re-read included.
   [ -n "${BASE_STATE:-}" ] || return 0
   if [ -z "$_BASE_DL_TSV" ]; then
@@ -649,7 +649,7 @@ _base_alive(){ local p c=0; for p in "$@"; do if kill -0 "$p" 2>/dev/null; then 
 _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE_FETCH_JOBS at a time, reported in queue order
   local n spec i=0 rc t0 logd rel secs ts vs via e0 e1 hfbin pids=()
   n="$(_base_fetch_jobs)"
-  hfbin="$(_base_hf_bin)"; [ -z "$hfbin" ] || _base_hf_can_verify "$hfbin" || true   # 3.24.0: asked once, inherited by every job
+  hfbin="$(_base_hf_bin)"; [ -z "$hfbin" ] || _base_hf_can_verify "$hfbin" || true   # 3.25.0: asked once, inherited by every job
   if [ "$n" = "1" ]; then                          # exactly the 3.0 behaviour: live output, one file after another
     for spec in "$@"; do
       IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
@@ -1057,7 +1057,7 @@ base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (
 
 # ---------------------------------------------------------------- gen-models: fill/verify bytes from the Hub
 _base_hub_sha256(){ # <url> → the file's sha256 as the Hub publishes it (x-linked-etag on an LFS file), or nothing.
-  # 3.24.0: and as Civitai states it for that file (its API, through py/fetch_ranges.py info)
+  # 3.25.0: and as Civitai states it for that file (its API, through py/fetch_ranges.py info)
   local url="$1" out e
   if [ "$(_base_source "$url")" = civitai ]; then
     e="$(_base_fetch_ranges info "$url" 2>/dev/null | sed -n 's/^RESULT .*"sha256": "\([0-9a-f]\{64\}\)".*/\1/p' | tail -1)"
@@ -1072,7 +1072,7 @@ _base_hub_sha256(){ # <url> → the file's sha256 as the Hub publishes it (x-lin
   return 0
 }
 base_gen_hashes(){ # <pkg dir> [--check] → models.sha256 beside the script: each Hub file's sha256, taken from the Hub (3.4.0),
-  # and each Civitai file's, from Civitai (3.24.0)
+  # and each Civitai file's, from Civitai (3.25.0)
   # Nothing is downloaded or hashed here. --check writes nothing and exits 1 when the file is missing or differs.
   local d="${1%/}" check="${2:-}" s rows cat fam purp file url bytes note alts h tmp rc=0
   _base_tmp                                                             # here, not inside the $( ) below: a temp dir made in a subshell is never cleaned

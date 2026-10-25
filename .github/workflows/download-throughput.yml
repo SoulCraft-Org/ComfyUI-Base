@@ -1,4 +1,4 @@
-# How fast each download leg is on a real link (ComfyUI Base 3.24.0). Not a gate on speed: it fails only when a leg
+# How fast each download leg is on a real link (ComfyUI Base 3.25.0). Not a gate on speed: it fails only when a leg
 # breaks (a wrong size, a wrong sha256, a refusal), and writes what each leg did to the run's summary, so a change to
 # the model stage (lib/50-models.sh, lib/52-models-early.sh, py/fetch_ranges.py) shows its effect on MB/s here before a
 # pod pays for it. Small public files only, no token, nothing kept:
