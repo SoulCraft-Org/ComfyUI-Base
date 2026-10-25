@@ -552,19 +552,151 @@ def test_unit_podctl_upload_verifies_size_and_sha256_on_both_sides(tmp_path):
     digest = hashlib.sha256(f.read_bytes()).hexdigest()
     bin_ = tmp_path / "bin"; bin_.mkdir()
     log = tmp_path / "calls.log"
-    (bin_ / "scp").write_text('#!/bin/bash\necho "scp $*" >> "%s"\nexit 0\n' % log); (bin_ / "scp").chmod(0o755)
-    # the remote sha256sum answers with whatever the test plants in remote.txt
-    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\ncat "%s/remote.txt"\n' % (log, tmp_path)); (bin_ / "ssh").chmod(0o755)
+    # the remote sha256sum answers with whatever the test plants in remote.txt, once scp has sent something (3.24.0: the
+    # probe before the send finds nothing on a fresh machine)
+    (bin_ / "scp").write_text('#!/bin/bash\necho "scp $*" >> "%s"\ntouch "%s/sent"\nexit 0\n' % (log, tmp_path)); (bin_ / "scp").chmod(0o755)
+    (bin_ / "ssh").write_text('#!/bin/bash\necho "ssh $*" >> "%s"\n[ -f "%s/sent" ] && cat "%s/remote.txt"\nexit 0\n' % (log, tmp_path, tmp_path)); (bin_ / "ssh").chmod(0o755)
     env = {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])}
     (tmp_path / "remote.txt").write_text("%d %s  /workspace/packages/Pkg-runpod.zip\n" % (f.stat().st_size, digest))
     out = podctl.upload([f], "/workspace/packages", env=env)
     calls = log.read_text()
     assert "scp " in calls and "runpod:/workspace/packages/" in calls and "mkdir -p /workspace/packages" in calls
     assert "Pkg-runpod.zip" in out and "ok" in out
-    (tmp_path / "remote.txt").write_text("12 0000  /workspace/packages/Pkg-runpod.zip\n")
+    (tmp_path / "remote.txt").write_text("12 0000  /workspace/packages/Pkg-runpod.zip\n"); (tmp_path / "sent").unlink()
     with pytest.raises(podctl.PodctlError) as ei:
         podctl.upload([f], "/workspace/packages", env=env)
     assert "sha256" in str(ei.value) or "size" in str(ei.value)
+
+
+def _pod_dir_ssh(tmp_path, root):
+    """An ssh and an scp on PATH that act on a local directory standing in for the machine: ssh drops its options and the
+    host and runs the command in bash with /workspace mapped to `root`; scp copies into the mapped directory. Every call
+    is logged, one line each."""
+    import shlex
+    bin_ = tmp_path / "bin"; bin_.mkdir(exist_ok=True); log = tmp_path / "calls.log"
+    (bin_ / "ssh").write_text(
+        '#!/bin/bash\necho "ssh" >> %s\nwhile [ "$1" = "-o" ]; do shift 2; done\nshift\n'
+        'exec bash -c "${1//\\/workspace/%s}"\n' % (shlex.quote(str(log)), root))
+    (bin_ / "scp").write_text(
+        '#!/bin/bash\necho "scp $*" >> %s\nwhile [ "${1#-}" != "$1" ]; do [ "$1" = "-o" ] && shift; shift; done\n'
+        'dest="${@: -1}"; dest="${dest#*:}"; dest="${dest/\\/workspace/%s}"; set -- "${@:1:$(($# - 1))}"; cp "$@" "$dest"\n'
+        % (shlex.quote(str(log)), str(root)))
+    for b in ("ssh", "scp"):
+        (bin_ / b).chmod(0o755)
+    return {**os.environ, "PATH": "%s:%s" % (bin_, os.environ["PATH"])}, log
+
+
+def test_unit_podctl_upload_sends_only_what_the_machine_lacks_in_three_round_trips(tmp_path):
+    """3.24.0. The 2026-10-17 install paid a new ssh connection for every command: mkdir, scp and sha256 for the base zip,
+    then again for the package's. Now one upload takes every zip: a probe (mkdir and the sums of what is already there),
+    ONE scp of the files that differ, one check of what was sent. A file already there with the same size and sha256 is
+    not sent again, and is still reported, because the probe proved it the same way the check proves a sent one."""
+    import shutil
+    if not shutil.which("sha256sum"):
+        pytest.skip("no sha256sum on this machine (the pod has GNU coreutils)")
+    podctl = _load()
+    root = tmp_path / "pod"; root.mkdir()
+    env, log = _pod_dir_ssh(tmp_path, root)
+    a = tmp_path / "a.zip"; a.write_bytes(b"a" * 1000)
+    b = tmp_path / "b.zip"; b.write_bytes(b"b" * 2000)
+    out = podctl.upload([a, b], "/workspace/packages", env=env)
+    calls = log.read_text().splitlines()
+    assert [c.split()[0] for c in calls] == ["ssh", "scp", "ssh"], calls                      # probe, one scp, one check
+    assert "a.zip" in calls[1] and "b.zip" in calls[1]
+    assert (root / "packages" / "b.zip").read_bytes() == b.read_bytes()
+    assert out.count("ok  ") == 2 and "not sent" not in out
+    # the same two again: nothing is sent, one round trip
+    log.write_text("")
+    out = podctl.upload([a, b], "/workspace/packages", env=env)
+    assert log.read_text().splitlines() == ["ssh"] and out.count("(already there: not sent)") == 2, out
+    # one changed: only that one goes
+    b.write_bytes(b"B" * 2000); log.write_text("")
+    out = podctl.upload([a, b], "/workspace/packages", env=env)
+    calls = log.read_text().splitlines()
+    assert [c.split()[0] for c in calls] == ["ssh", "scp", "ssh"] and "b.zip" in calls[1] and "a.zip" not in calls[1], calls
+    assert (root / "packages" / "b.zip").read_bytes() == b"B" * 2000
+    # and a file the machine holds under that name with other bytes (same size) is re-sent, never trusted by its name
+    (root / "packages" / "a.zip").write_bytes(b"x" * 1000); log.write_text("")
+    podctl.upload([a, b], "/workspace/packages", env=env)
+    assert "a.zip" in log.read_text() and (root / "packages" / "a.zip").read_bytes() == a.read_bytes()
+
+
+def test_unit_podctl_lease_release_is_one_round_trip_and_never_drops_another_holders(tmp_path, monkeypatch):
+    """3.24.0: release was a read and then a remove, a round trip each. The machine now decides in one command: the file
+    goes when it is empty, holds no holder (unreadable: free), or names this holder exactly as lease_encode writes it."""
+    podctl = _load()
+    root = tmp_path / "pod"; root.mkdir()
+    env, log = _pod_dir_ssh(tmp_path, root)
+    monkeypatch.setenv("PATH", env["PATH"])
+    lease = root / "gpu.lease"
+    monkeypatch.setattr(podctl, "LEASE_PATH", str(lease))
+    def put(holder, purpose=""):
+        lease.write_text(podctl.lease_encode(holder, purpose, 30, session="") + "\n")
+    put("someone-else", 'install for "holder": "me"')                 # my name inside another field must not match
+    log.write_text("")
+    assert podctl.lease_release("me") is False and lease.exists()
+    assert log.read_text().splitlines() == ["ssh"]
+    put("me2")                                                          # a longer name is another holder
+    assert podctl.lease_release("me") is False and lease.exists()
+    put("me")
+    assert podctl.lease_release("me") is True and not lease.exists()
+    assert podctl.lease_release("me") is True                           # already gone
+    lease.write_text("not json\n")
+    assert podctl.lease_release("me") is True and not lease.exists()    # unreadable reads as free, so it goes
+
+
+def test_unit_podctl_command_sessions_share_one_connection_that_never_forwards(monkeypatch):
+    """3.24.0: one ssh connection per machine (ControlMaster), because a handshake to a pod is about 11 round trips: 1.8 s to
+    EU-RO-1, about 21 of them per install. The master is whichever command comes first, so it carries the command sessions'
+    ClearAllForwardings and never binds the Host block's LocalForwards (the tunnel is its own session). The socket path
+    must fit a unix socket (103 bytes on macOS) or the run goes unmultiplexed; PODCTL_SSH_MUX=0 turns it off."""
+    podctl = _load()
+    opts = podctl.ssh_mux_opts({"PODCTL_SSH_MUX_DIR": "/tmp/pcm"})
+    joined = " ".join(opts)
+    assert "ControlMaster=auto" in joined and "ControlPath=/tmp/pcm/%C" in joined and "ControlPersist=" in joined
+    assert "ServerAliveInterval=" in joined                              # a stopped machine's master does not linger
+    assert podctl.ssh_mux_opts({"PODCTL_SSH_MUX": "0"}) == []
+    assert podctl.ssh_mux_opts({"PODCTL_SSH_MUX_DIR": "/" + "d" * 70}) == []       # the socket would not fit
+    for cmd in (podctl.SSH_CMD, podctl.SCP_CMD):
+        assert "ClearAllForwardings=yes" in cmd
+    assert not any("Control" in a for a in podctl.tunnel_argv(host="h", port=1, key="k"))
+
+
+def test_unit_podctl_ssh_retries_a_dead_master_only_before_the_command_started(tmp_path, monkeypatch):
+    """A master whose machine was stopped or restarted fails the next session request before the command starts: that one
+    case closes the master and runs the command again. A failure after the command started is never retried, because
+    a second launch of an install would be a second install."""
+    import subprocess
+    podctl = _load()
+    calls = []
+    answers = []
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        if "-O" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return answers.pop(0)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    answers[:] = [subprocess.CompletedProcess([], 255, "", "mux_client_request_session: read from master failed: Broken pipe"),
+                  subprocess.CompletedProcess([], 0, "ok\n", "")]
+    r = podctl.ssh_run("echo ok")
+    assert r.returncode == 0 and r.stdout == "ok\n"
+    if any(a.startswith("ControlPath=") for a in podctl.SSH_CMD):
+        assert any("-O" in c and "exit" in c for c in calls), calls
+    calls.clear()
+    answers[:] = [subprocess.CompletedProcess([], 255, "", "Connection to 1.2.3.4 closed by remote host.")]
+    assert podctl.ssh_run("launch").returncode == 255 and len(calls) == 1
+
+
+def test_unit_podctl_install_sees_the_end_of_a_step_within_a_second(tmp_path):
+    """3.24.0: the poll waits on the machine, looking for STEP RC once a second, so a step that ends early is seen at
+    once, however long --every is. A sleep here between polls saw it every/2 seconds late on average."""
+    import time
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path); io = LocalPodIO(tmp_path / "pod")
+    t0 = time.monotonic()
+    assert podctl.install("pod1", [pkg], io, every=30, timeout=600, today="2026-10-25", save_pins=False) == 0
+    assert time.monotonic() - t0 < 15, "a 30 s poll interval held a finished step"
+    assert io.slept == 0
 
 
 def test_unit_podctl_cli_upload_takes_the_pod_then_files():
@@ -708,7 +840,8 @@ def test_unit_podctl_install_runs_the_documented_sequence_and_stops_at_the_first
     out = capsys.readouterr().out
     assert rc == 0, out
     cmds = io.cmds
-    assert [u[0][0].split("/")[-1] for u in io.uploads] == ["comfyui-base.zip", "My Pkg-runpod.zip"]
+    # 3.24.0: every zip in ONE upload, after every zip was checked: three round trips in all, not three per item
+    assert [[pathlib.Path(f).name for f in u[0]] for u in io.uploads] == [["comfyui-base.zip", "My Pkg-runpod.zip"]]
     # 3.2.0: with a package after it, the base is INSTALLED (and its suite run once per base version), never run as a
     # second whole pipeline: the package's run already does everything the base's own run did
     extract = [c for c in cmds if "zipfile -e" in c]; selfs = [c for c in cmds if "install-self" in c and "nohup" not in c]
@@ -787,7 +920,10 @@ def test_unit_podctl_install_launches_the_run_detached_and_polls_it(tmp_path):
     io = SleepingPodIO(tmp_path / "pod")
     rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-09-06", save_pins=False)
     assert rc == 0
-    assert io.slept >= 1, "the launch blocked until the step ended: the poll loop never had to wait"
+    # 3.24.0: the wait is on the machine (each poll waits there up to `every` s), so the proof is the polls: a launch that
+    # blocked until the step ended would find STEP RC at the very first one
+    polls = [c for c in io.cmds if "grep -q" in c and "STEP RC=" in c and "nohup" not in c]
+    assert len(polls) >= 2, "the launch blocked until the step ended: the poll loop never had to wait"
     run = [c for c in io.cmds if "STEP RC=" in c and "nohup" in c][0]
     assert "{ nohup setsid" in run and run.rstrip().endswith("& }"), run
 
@@ -1548,7 +1684,7 @@ def test_unit_podctl_a_restart_required_run_prints_the_restart_to_approve(tmp_pa
     orig = io.remote
     def remote(cmd):
         rc, out, err = orig(cmd)
-        if cmd.startswith("cat ") and "STEP RC=1" in out:
+        if "grep -q" in cmd and "STEP RC=1" in out:
             out = out.replace("STEP RC=1", "  !! restart required: driver 580.178.04 -> 615.71.09\nSTEP RC=1")
         return rc, out, err
     io.remote = remote

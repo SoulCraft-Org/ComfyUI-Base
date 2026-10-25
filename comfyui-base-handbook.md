@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.23.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.24.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -230,8 +230,9 @@ holds the interface and a recipe.
 ### 1.1 RunPod (proven)
 
 **The one command (2.0.14).** Once a pod is reachable (`podctl ensure`), the whole documented sequence is
-`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. For each item in order,
-the local zip is checked current, the volume size is recorded for the disk gate, the zip is uploaded and extracted,
+`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. Every local zip is checked
+current first, the volume size is recorded for the disk gate, and every zip goes up in one upload (3.24.0: a zip already
+on the machine with the same size and sha256 is not sent again). Then for each item in order the zip is extracted,
 `--check` runs on the pod (non-zero stops everything), the real run goes detached (`BASE_RESTART=1` for a package;
 `--comfy-ref <ref>` for a newer ComfyUI, that install only) and is polled until `STEP RC=`, the pod's `state/logs` are
 copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block is printed, and a green run writes the pack records
@@ -666,7 +667,9 @@ nothing changed, and it stops only on what would stop the real run before that r
 suite, which would only test the server the real run is about to replace. `podctl install --base --pkg <dir>` installs
 the base and runs ONE pipeline, the package's (it already covers every stage the base's own run would); the base's suite
 runs on a machine once per base version (`state/base-suite.ok`). A retry of the same zip against the same base skips the
-Mac gate, and podctl polls every 5 s.
+Mac gate. podctl polls every 5 s, and since 3.24.0 the wait is on the machine (STEP RC is looked for once a second there),
+so the end of a step is seen within a second. Every ssh, scp and log fetch of one run shares ONE connection (3.24.0,
+ControlMaster; `PODCTL_SSH_MUX=0` turns it off).
 
 **A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
 moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
@@ -844,6 +847,22 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.24.0: `podctl install` spends seconds, not most of a minute, around the package run (2026-10-25). The 2026-10-17
+  release run's "16:10 install, 395 s package run" was read as 9.5 minutes of driver overhead. It was not: the first
+  attempt died in the run script before podctl ran, the pod was stopped, fixed and resumed 11:39 later, and the install
+  clock was never re-stamped; the real `podctl install` took 277 s, and the "395 s" is the stage table's sum, which
+  counts the background stages beside the foreground (the package run's wall clock was 221 s). podctl's own share was
+  about 54 s: 46 s before the run, 8 s after. Most of it was connections: about 21 ssh handshakes, each about 11 round
+  trips (1.8 s to EU-RO-1 from the maintainer's Mac at 164 ms), because no command shared a connection. Now one
+  ControlMaster per machine carries every ssh, scp and log fetch of a run (2 round trips a command, measured 0.13 s
+  against 0.77 s); its master carries ClearAllForwardings like every command session, so it never binds the Host
+  block's forwards, and a dead master is retried once only when the session request failed before the command
+  started (a second launch would be a second install). Every zip is checked first and all of them go up in one upload
+  (probe, one scp, one check), and a zip already there with the same size and sha256 is not sent again. The poll waits
+  on the machine, so a finished step is seen within a second instead of 2.5 s later on average plus a handshake. The
+  lease is read once, and released in one round trip; the volume size is recorded once per run. A stale package zip now
+  stops before the base changes anything. Expected: about 35 s less per install to EU-RO-1, about 10 s to US-CA.
+  Exercised against the suite's stand-ins only (no pod).
 - 3.23.0: `podctl` binds no vendor port on the workstation when told not to (2026-10-24). The tunnel's local sides were
   the remote ports plus `PODCTL_TUNNEL_OFFSET` (0-1000), so every session bound 8188, 8888, 9199 and 11434 or a few
   ports above them. A workstation whose rule is that local listeners sit in each account's own block (3100-3199 for the
