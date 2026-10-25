@@ -2912,8 +2912,9 @@ def test_unit_an_early_start_waits_for_code_a_models_row_delivers_and_can_be_tur
     r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") + 'BASE_EARLY_LAUNCH=0; _base_launch_early; echo "S=[$BASE_EARLY_STATE] D=$BASE_EARLY_DONE"', env=env)
     assert "S=[] D=0" in r.stdout and "IMPORTCHECK" not in r.stdout and _starts(log) == 0, r.stdout + r.stderr
     r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
-              '_base_launch_early; _base_stop_comfy(){ echo STOPPED; }; _base_early_abandon; echo "S=[$BASE_EARLY_STATE]"', env=env)
-    assert "STOPPED" in r.stdout and "S=[]" in r.stdout, r.stdout + r.stderr
+              '_base_launch_early; _base_stop_comfy(){ touch "%s"; }; _base_early_abandon; echo "S=[$BASE_EARLY_STATE]"' % (tmp_path / "stopped"), env=env)
+    # abandon stops quietly (the summary prints no stop line), so the stand-in leaves a mark instead of a line
+    assert (tmp_path / "stopped").exists() and "S=[]" in r.stdout, r.stdout + r.stderr
 
 
 def test_unit_the_pipeline_starts_early_after_pre_models_and_asks_for_the_server_every_half_second():
