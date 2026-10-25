@@ -369,7 +369,7 @@ _base_wait_server(){ # <i> → 0 when server i>0 answers on its port; patient wh
   while [ "$waited" -lt "$limit" ]; do
     if curl -sf --max-time 5 "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then echo "  server $i up on 127.0.0.1:$port"; return 0; fi
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then echo "  server $i: its process is gone after $waited s"; return 1; fi
-    sleep 2; waited=$((waited + 2))
+    sleep 1; waited=$((waited + 1))          # 3.24.0: every second (was 2): a closed port answers at once, so asking costs nothing
   done
   return 1
 }
@@ -380,7 +380,7 @@ _base_wait_comfy(){ # [grace s] → 0 when HOSTPORT answers; patient while a Com
   local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}" alive
   [ -n "$tries" ] && limit=$((tries * 2))            # older callers (and the suite) size it in 2 s tries
   while [ "$waited" -lt "$limit" ]; do
-    sleep 2; waited=$((waited + 2))
+    sleep 1; waited=$((waited + 1))          # 3.24.0: every second (was 2): the start is seen up to a second sooner
     if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited s"; return 0; fi
     if [ -n "${_BASE_WAIT_PID:-}" ]; then alive="$(kill -0 "$_BASE_WAIT_PID" 2>/dev/null && echo 1 || true)"
     else alive="$(_base_comfy_pids 2>/dev/null || true)"; fi

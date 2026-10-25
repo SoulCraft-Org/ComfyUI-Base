@@ -183,10 +183,13 @@ _base_python_moved(){ # BASE_PY_MOVED: how many Python packages differ from the 
 }
 
 _base_outdated(){ # → "name installed latest" for every package still behind, torch's closure excluded
-  local idx=() closure
+  # 3.24.0: the closure is left out of the query too (--exclude), not only out of the answer: its two dozen packages were
+  # looked up on PyPI and NVIDIA's index on every scan, and the newest pass scans twice
+  local idx=() closure ex=() n
   while IFS= read -r a; do idx+=("$a"); done < <(_base_uv_index_args | grep -v -- '--find-links\|wheels$' || true)
   closure="$(_base_torch_closure)"
-  _base_uv pip list --python "$PY" --outdated --format json ${idx[@]+"${idx[@]}"} 2>/dev/null | "$PY" -c '
+  for n in $closure; do ex+=(--exclude "$n"); done
+  _base_uv pip list --python "$PY" --outdated --format json ${ex[@]+"${ex[@]}"} ${idx[@]+"${idx[@]}"} 2>/dev/null | "$PY" -c '
 import json, re, sys
 closure = set(sys.argv[1].split())
 def canon(n): return re.sub(r"[-_.]+", "-", n).lower()

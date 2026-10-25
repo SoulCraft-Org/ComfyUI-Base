@@ -824,10 +824,12 @@ base_consolidate(){ # what is already installed elsewhere on this pod: strays of
   hdr "CONSOLIDATE · what is already installed on this pod"
   local VOLROOT="${BASE_PERSIST_ROOT:-$BASE_VOLUME}"; [ -n "$BASE_FAKE_ROOT" ] && VOLROOT="$BASE_FAKE_ROOT"
   local d name url sha cnr why branch other rows
-  # ---- other ComfyUI trees: reported, never touched
+  # ---- other ComfyUI trees: reported, never touched. 3.24.0: the template image's seed is not one (a head start, read by
+  # the venv build, lib/30-venv.sh): neither its tree nor its venv is reported, so neither costs a du on a fresh volume.
+  # A pack of ours inside it is still a stray below, and moved in: the image's clone is fetched, not cloned again.
   local others=()
   while IFS= read -r d; do
-    if [ -n "$d" ] && [ -f "$d/main.py" ] && [ -d "$d/comfy" ] && [ "$d" != "$COMFY" ]; then others+=("$d"); fi
+    if [ -n "$d" ] && [ -f "$d/main.py" ] && [ -d "$d/comfy" ] && [ "$d" != "$COMFY" ] && ! _base_in_image_seed "$d"; then others+=("$d"); fi
   done < <(_base_find_dirs 'ComfyUI' 'ComfyUI-*' 'comfyui')
   if [ "${#others[@]}" -gt 0 ]; then
     for other in "${others[@]}"; do warn "another ComfyUI tree: $other ($(_base_bytes_to_gb "$(_base_dir_bytes "$other")") GB) — this run uses $COMFY; models may be split across two libraries"; done
@@ -857,7 +859,7 @@ base_consolidate(){ # what is already installed elsewhere on this pod: strays of
   # ---- orphaned venvs and backups: reported with sizes, never removed here
   local vfound=0 vb
   while IFS= read -r d; do
-    if [ -z "$d" ] || [ "$d" = "$VENV" ]; then continue; fi
+    if [ -z "$d" ] || [ "$d" = "$VENV" ] || _base_in_image_seed "$d"; then continue; fi
     vb="$(_base_dir_bytes "$d")"; vfound=$((vfound + 1))
     case "$d" in
       *.pre-*) note "venv backup: $d ($(_base_bytes_to_gb "$vb") GB) — kept as the rollback for $VENV; rm -rf '$d' to reclaim it";;
