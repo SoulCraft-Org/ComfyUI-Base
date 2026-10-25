@@ -49,7 +49,7 @@ jobs:
         run: |
           uv venv -q "$RUNNER_TEMP/fetch"
           uv pip install -q --python "$RUNNER_TEMP/fetch/bin/python" --upgrade "huggingface_hub[hf-xet]"
-          "$RUNNER_TEMP/fetch/bin/python" -c 'import huggingface_hub, hf_xet; print("huggingface_hub", huggingface_hub.__version__, "hf_xet", hf_xet.__version__)'
+          "$RUNNER_TEMP/fetch/bin/python" -c 'import hf_xet, importlib.metadata as m; print("huggingface_hub", m.version("huggingface_hub"), "hf_xet", m.version("hf_xet"))'
 
       - name: every leg, timed
         run: |
