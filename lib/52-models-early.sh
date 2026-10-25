@@ -16,6 +16,8 @@
 #                    the main venv is rebuilt or upgraded while the downloads run, and the hf it is replacing must not be
 #                    the one downloading. Every download uses it once it exists (the model stage, fetch-later), with the
 #                    main venv's hf as the fallback. It is left as it is while a fetch-later still runs from it.
+#                    3.24.0: Civitai and a big GitHub file come through py/fetch_ranges.py on the system Python, a small
+#                    GitHub file through curl: neither needs hf, so they go early even when the fetch venv cannot be built.
 #   stopping         an install that stops before the join (a failed venv, a restart required, an ERR) stops its early
 #                    downloads too; hf and curl resume from the staging folder on the next run.
 #   off              BASE_MODELS_FOREGROUND=1 (the 3.10 order), a dry run, a seed build (no models), a buyer's machine
@@ -81,7 +83,14 @@ _base_models_early(){ # the background half: what goes early, then those downloa
   if [ "${#specs[@]}" -eq 0 ]; then note "nothing to download early: every row is in place, LOCAL, later, or a move away"; return 0; fi
   echo "  ${#specs[@]} item(s), $(_base_bytes_to_gb "$need") GB"
   if ! _base_disk_gate "$need"; then note "nothing downloaded early: the model stage judges the disk again and stops the run there"; return 0; fi
-  if [ "$BASE_NO_NET" != "1" ] && ! _base_fetch_tool; then note "no downloader of its own: the model stage downloads everything, as before"; return 0; fi
+  if [ "$BASE_NO_NET" != "1" ] && ! _base_fetch_tool; then
+    # 3.24.0: Civitai and GitHub come through curl and the system Python, never hf: those still go early
+    local nohf=() _u
+    for spec in "${specs[@]}"; do IFS='|' read -r _ _ _u _ <<< "$spec"; [ "$(_base_source "$_u")" = hf ] || nohf+=("$spec"); done
+    if [ "${#nohf[@]}" -eq 0 ]; then note "no downloader of its own: the model stage downloads everything, as before"; return 0; fi
+    note "no hf of its own: the ${#nohf[@]} Civitai and GitHub file(s) go early, the model stage downloads the Hub's"
+    specs=("${nohf[@]}")
+  fi
   mkdir -p "$STAGING"; [ "$BASE_NO_NET" = "1" ] || _base_xet_check
   _base_fetch_queue "${specs[@]}"
   rmdir "$STAGING" 2>/dev/null || true

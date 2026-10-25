@@ -92,7 +92,8 @@ run once per machine as **step one**; then each workflow package is **step two**
    ComfyUI it did not start before starting its own (3.0.3).
 8. **One deletion prompt, default No.** Duplicates, superseded files (only inside the package's own family
    folders) and partials, never a file another installed package claims (the ledger). `BASE_YES=1` approves.
-9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, pypi.org, pypi.nvidia.com,
+9. **Privacy and secrets.** Outbound hosts are huggingface.co, github.com, civitai.com (3.24.0; with the storage its
+   download URLs redirect to, which never receives the token), pypi.org, pypi.nvidia.com,
    download.pytorch.org, the distribution's apt mirrors and developer.download.nvidia.com (NVIDIA's CUDA repository); a `MODELS` row may name no other host. Nothing is uploaded. `--disable-api-nodes` is
    launch-arg hygiene. Tokens come from the shell env, else the machine's own environment (PID 1's: `HF_TOKEN` or its
    aliases `HUGGING_FACE_HUB_TOKEN` / `HF_HUB_TOKEN`), else `state/tokens.env` (0600), else one prompt. Template
@@ -512,7 +513,9 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   name with spaces (the tail of a `why` that held a `|`) or a seventh field is refused when the tables are validated.
   Leave it off unless the remote's HEAD is genuinely stale.
 - `MODELS` rows: `category|Family|Purpose|file|url|bytes|note|alts` — `bytes` exact (`base.sh gen-models <dir>`
-  fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), `LOCAL`, or
+  fills it from the Hub); `url` is a Hugging Face `resolve` URL, a GitHub URL (a release asset), a Civitai download
+  URL (3.24.0: `https://civitai.com/api/download/models/<versionId>`, its query only Civitai's file selectors `fileId`,
+  `type`, `format`, `size`, `fp`, never a token), `LOCAL`, or
   `hf://owner/repo` with `file` ending in `/` for a repo snapshot; no other host is accepted; `alts` are legacy
   basenames the index may adopt. Pin a row to a commit (3.12.0): `resolve/<40-hex commit>/<path>` for a file,
   `hf://owner/repo@<40-hex commit>` for a snapshot (a branch after the `@` is refused). The revision a row names is
@@ -600,8 +603,10 @@ background (3.11.0, below)] → the venv snapshot → `pkg_pre_venv` → venv �
 MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
 either version moves) → `pkg_pre_models` → [join the model downloads] →
-models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub, curl for
-GitHub; disk gate first) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
+models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub;
+3.24.0: Civitai, and a GitHub file of `BASE_RANGE_MIN_MB` (256) or more, over `BASE_RANGE_CONNS` (16) connections, hashed as
+they land (`py/fetch_ranges.py`); curl for a smaller GitHub file; disk gate first; one line per file in
+`state/logs/<run>.downloads.tsv`) → prune (one prompt; `unclaimed` reported) → sync workflow paths → `pkg_post_models` →
 import check (3.15.0: from the local copy; with `BASE_RESTART=1` and no server answering, deferred to the restart, whose
 own start is judged from its slice of `comfyui.log` by the same rules) → hygiene → boot (boot.sh, tools venv, boot.env) →
 ledger → restart hand-off (or `BASE_RESTART=1`) →
@@ -844,6 +849,38 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.24.0: the customer's own downloads, as fast as each source allows (Paul, 2026-10-25: every model, LoRA and file
+  comes from the buyer's own Hugging Face and Civitai accounts). Read first, from the sources' own documentation. The
+  Hub is fully Xet-backed and `hf_transfer` is deprecated (`HF_HUB_ENABLE_HF_TRANSFER` no longer does anything);
+  `HF_XET_HIGH_PERFORMANCE=1`, already set, is the fast path, so the Hub leg keeps hf. Civitai answers its download
+  URL with a 307 to a presigned storage URL (24 h), whose storage serves byte ranges (206) and refuses a HEAD; it states
+  each file's SHA256 at `/api/v1/model-versions/<id>`, and its documentation strongly prefers the
+  `Authorization: Bearer` header to a `?token=` that "leaks the token into access logs and caches". What changed.
+  (1) Civitai rows: `https://civitai.com/api/download/models/<versionId>`, with only Civitai's own file selectors in the
+  query; a `token=` (or anything else) in the URL is refused when the rows are validated. civitai.com joins §0.9's
+  hosts. (2) `py/fetch_ranges.py`, standard library only, on the system Python: it follows the redirect itself, so
+  `CIVITAI_TOKEN` (a 0600 header file, as every Hub `curl` already uses) reaches civitai.com and never the storage, argv,
+  a URL or the log; it asks for byte 0 to learn the size (a size that is not the row's stops before anything is
+  written), then fetches 8 MiB blocks over up to 16 kept-alive connections, each written at its offset and hashed from
+  memory in order, so the sha256 needs no second read of the file (workers stay at most connections + 4 blocks ahead
+  of the hash: about 160 MiB per file). The expected hash is `models.sha256`'s, else the one Civitai states for that
+  file. `<file>.ranges` records the hashed prefix; an interrupted transfer resumes from it. Because the file has its
+  full size from the first block on, the model stage moves it only on the helper's own verdict, never on its size.
+  A refusal (401/403) says once whether `CIVITAI_TOKEN` is missing or refused; a 404, a wrong size or a wrong hash is
+  said once too. A GitHub file of 256 MiB or more takes the same leg; a smaller one keeps curl. `gen-models` reads a
+  Civitai row's size and `gen-hashes` its sha256 through the same helper. (3) Six files at once on every machine:
+  the three under 32 GiB never applied on a pod (a container reads the host's `/proc/meminfo`), and hf_xet's buffers are
+  bounded since 1.3.0. (4) `hf cache verify --help` was asked once per file, a Python start inside the file's slot; it is
+  asked once before the queue forks. (5) When the fetch venv cannot be built, the Civitai and GitHub files still start
+  beside the venv build (they need no hf). (6) A per-file record beside the run's log, `<run>.downloads.tsv`: start
+  and end (epoch seconds, to the microsecond on bash 5), seconds, bytes, MB/s (10^6 bytes), the sha256 seconds, the
+  source (`hf`, `civitai`, `github`), the transport (`hf-xet`, `ranges x<n>`, `curl`) and the result, for every file
+  the early pass, the model stage and `fetch-later` fetched; podctl fetches it with the rest of `state/logs`, and the
+  console's line for each file now names its source and transport. `.github/workflows/download-throughput.yml` times
+  each leg on a runner (a public Hub VAE and a public Civitai LoRA) and writes the MB/s to the run's summary. The unit
+  tier covers the helper against a local Civitai stand-in (redirect, token on the first hop only, ranges, resume, the
+  stated hash, a source without ranges), the row rules, the leg choice, the record, the held move and the probe asked
+  once. No pod used; the Hub leg is unchanged except for the probe.
 - 3.23.0: `podctl` binds no vendor port on the workstation when told not to (2026-10-24). The tunnel's local sides were
   the remote ports plus `PODCTL_TUNNEL_OFFSET` (0-1000), so every session bound 8188, 8888, 9199 and 11434 or a few
   ports above them. A workstation whose rule is that local listeners sit in each account's own block (3100-3199 for the

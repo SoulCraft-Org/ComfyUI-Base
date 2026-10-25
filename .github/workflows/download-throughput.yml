@@ -1,0 +1,90 @@
+# How fast each download leg is on a real link (ComfyUI Base 3.24.0). Not a gate on speed: it fails only when a leg
+# breaks (a wrong size, a wrong sha256, a refusal), and writes what each leg did to the run's summary, so a change to
+# the model stage (lib/50-models.sh, lib/52-models-early.sh, py/fetch_ranges.py) shows its effect on MB/s here before a
+# pod pays for it. Small public files only, no token, nothing kept:
+#   the Hub     Comfy-Org/Qwen-Image_ComfyUI's VAE (254 MB, pinned): hf download (hf_xet, high performance), then
+#               `hf cache verify` (the sha256 re-read, timed apart), then the same file through py/fetch_ranges.py
+#   Civitai     Pixel Art XL (model 120096, version 135931, 171 MB, rated PG): py/fetch_ranges.py with Civitai's own
+#               sha256, against one curl stream of the same URL
+name: download-throughput
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/download-throughput.yml"
+      - "py/fetch_ranges.py"
+      - "lib/50-models.sh"
+      - "lib/52-models-early.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: download-throughput-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  throughput:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HF_URL: https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/1f12b17be14c89b026c51a91d67c32f84bb047bc/split_files/vae/qwen_image_vae.safetensors
+      HF_REPO: Comfy-Org/Qwen-Image_ComfyUI
+      HF_REV: 1f12b17be14c89b026c51a91d67c32f84bb047bc
+      HF_FILE: split_files/vae/qwen_image_vae.safetensors
+      HF_BYTES: "253806246"
+      CIV_URL: https://civitai.com/api/download/models/135931
+      CIV_BYTES: "170543052"
+      HF_XET_HIGH_PERFORMANCE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: the pod's downloader (huggingface_hub[hf-xet] at its newest, as lib/52-models-early.sh builds it)
+        run: |
+          uv venv -q "$RUNNER_TEMP/fetch"
+          uv pip install -q --python "$RUNNER_TEMP/fetch/bin/python" --upgrade "huggingface_hub[hf-xet]"
+          "$RUNNER_TEMP/fetch/bin/python" -c 'import huggingface_hub, hf_xet; print("huggingface_hub", huggingface_hub.__version__, "hf_xet", hf_xet.__version__)'
+
+      - name: every leg, timed
+        run: |
+          set -euo pipefail
+          hf="$RUNNER_TEMP/fetch/bin/hf"; d="$RUNNER_TEMP/dl"; rows="$RUNNER_TEMP/rows.md"; : > "$rows"
+          now(){ date +%s.%N; }
+          row(){ # <leg> <bytes> <t0> <t1> <note>
+            awk -v l="$1" -v b="$2" -v a="$3" -v z="$4" -v n="$5" 'BEGIN{ s = z - a; printf "| %s | %.1f | %.2f | %.1f | %s |\n", l, b / 1e6, s, b / 1e6 / s, n }' | tee -a "$rows"
+          }
+          size(){ stat -c %s "$1"; }
+
+          rm -rf "$d"; mkdir -p "$d/hf"
+          t0=$(now); "$hf" download "$HF_REPO" "$HF_FILE" --revision "$HF_REV" --local-dir "$d/hf" --quiet; t1=$(now)
+          [ "$(size "$d/hf/$HF_FILE")" = "$HF_BYTES" ] || { echo "::error::the Hub's file is not $HF_BYTES bytes"; exit 1; }
+          row "Hub · hf download (hf_xet)" "$HF_BYTES" "$t0" "$t1" "the pod's leg"
+          t0=$(now); "$hf" cache verify "$HF_REPO" --revision "$HF_REV" --local-dir "$d/hf"; t1=$(now)
+          row "Hub · hf cache verify (sha256 re-read)" "$HF_BYTES" "$t0" "$t1" "after the transfer, in its slot"
+
+          t0=$(now); python3 -I py/fetch_ranges.py get "$HF_URL" "$d/hf-ranges.safetensors" --bytes "$HF_BYTES" | tee "$d/hf-ranges.out"; t1=$(now)
+          want="$(sed -n 's/^\([0-9a-f]\{64\}\)  .*/\1/p' < <(sha256sum "$d/hf/$HF_FILE"))"
+          grep -q "\"sha256\": \"$want\"" "$d/hf-ranges.out" || { echo "::error::fetch_ranges.py hashed the Hub file differently"; exit 1; }
+          row "Hub · fetch_ranges.py (16 connections)" "$HF_BYTES" "$t0" "$t1" "comparison only; sha256 while it lands"
+
+          t0=$(now); python3 -I py/fetch_ranges.py get "$CIV_URL" "$d/civ.safetensors" --bytes "$CIV_BYTES" | tee "$d/civ.out"; t1=$(now)
+          grep -q '"verified": true' "$d/civ.out" || { echo "::error::Civitai stated no sha256 for the file, or it was not checked"; exit 1; }
+          row "Civitai · fetch_ranges.py (16 connections)" "$CIV_BYTES" "$t0" "$t1" "the pod's leg; Civitai's sha256 checked while it lands"
+          t0=$(now); curl -fsSL -o "$d/civ-curl.safetensors" "$CIV_URL"; t1=$(now)
+          [ "$(size "$d/civ-curl.safetensors")" = "$CIV_BYTES" ] || { echo "::error::curl got a different size"; exit 1; }
+          row "Civitai · curl (one stream)" "$CIV_BYTES" "$t0" "$t1" "what one connection gives"
+          rm -rf "$d"
+
+          {
+            echo "### Download legs on this runner"
+            echo
+            echo "| leg | MB | seconds | MB/s | note |"
+            echo "|---|---:|---:|---:|---|"
+            cat "$rows"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -5,7 +5,9 @@
 #   dest      = category/Family[/Purpose]/file   (Family empty only for the freeform categories LLM, custom_nodes/<Pack>,
 #               embeddings, sams, depthanything, SEEDVR2, RMBG and grounding-dino, which write category/[Purpose/]file;
 #               vae_approx is flat: ComfyUI's preview loader wants the file right there)
-#   url       = https://huggingface.co/<repo>/resolve/<revision>/<path>  |  https://github.com/...  (Hugging Face and GitHub only)
+#   url       = https://huggingface.co/<repo>/resolve/<revision>/<path>  |  https://github.com/...
+#             | https://civitai.com/api/download/models/<versionId>[?fileId=…&type=…&format=…]   (3.24.0: the buyer's own
+#             |          Civitai account, CIVITAI_TOKEN in a header file; never a token= in the URL)
 #             | LOCAL   (must already exist somewhere on the pod; relocated into place, else the run FAILS — a file, or
 #             |          with a trailing / on file, a snapshot FOLDER of that name holding a config.json)
 #             | hf://owner/repo[@<commit>]  with file ending in "/"  (a repo snapshot into that directory)
@@ -69,7 +71,9 @@ _base_model_rows(){ # prints validated MODELS rows; exit 1 on any violation (mes
                 if ! [[ "$url" =~ ^hf://[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*(@[0-9a-f]{40})?$ ]]; then
                   echo "  !! an hf:// url is hf://owner/repo, pinned as hf://owner/repo@<40-hex commit> ($url)" >&2; bad=1; continue; fi;;
       https://huggingface.co/*|https://github.com/*) ;;
-      *) echo "  !! url host not on the privacy list (huggingface.co, github.com) or not LOCAL/hf://: $url" >&2; bad=1; continue;;
+      https://civitai.com/*) if ! _base_civitai_url_ok "$url"; then   # 3.24.0
+                               echo "  !! a Civitai url is https://civitai.com/api/download/models/<versionId>[?fileId=…&type=…&format=…&size=…&fp=…], with no token in it ($file)" >&2; bad=1; continue; fi;;
+      *) echo "  !! url host not on the privacy list (huggingface.co, github.com, civitai.com) or not LOCAL/hf://: $url" >&2; bad=1; continue;;
     esac
     if [ "$bytes" = "0" ] && [ "$url" != "LOCAL" ]; then echo "  !! bytes=0 is only allowed with url=LOCAL ($file) — run: base.sh gen-models" >&2; bad=1; continue; fi
     case "$seen" in *" $(_base_lower "$file") "*) echo "  !! $file is declared twice" >&2; bad=1; continue;; esac
@@ -223,10 +227,20 @@ _base_hf_verify(){ # <hf> <repo> <revision> <dir> [--fail-on-missing-files] → 
   # sha256 (LFS) or git hash the Hub states for that revision. `hf cache verify` is the Hub's own check; an hf too old to
   # have it verifies nothing and says so (the size check still stands).
   local hfbin="$1" repo="$2" rev="${3:-main}" dir="$4" out; shift 4
-  if ! "$hfbin" cache verify --help >/dev/null 2>&1; then note "sha256 not checked: this hf has no 'cache verify' (the size was)"; return 0; fi
+  # 3.24.0: whether this hf has it is asked once per hf (_base_hf_can_verify, before the queue forks), not once per file:
+  # each ask was a Python start inside the file's download slot
+  if ! _base_hf_can_verify "$hfbin"; then note "sha256 not checked: this hf has no 'cache verify' (the size was)"; return 0; fi
   if out="$("$hfbin" cache verify "$repo" --revision "$rev" --local-dir "$dir" "$@" 2>&1)"; then return 0; fi
   printf '%s\n' "$out" | grep -vi 'do not exist on the remote' | tail -6
   return 1
+}
+_BASE_HF_VERIFY_OF=""; _BASE_HF_VERIFY_CAN=""
+_base_hf_can_verify(){ # <hf> → 0 when it has `hf cache verify`; asked once per hf binary and remembered in this shell
+  if [ "$_BASE_HF_VERIFY_OF" != "$1" ]; then
+    _BASE_HF_VERIFY_OF="$1"; _BASE_HF_VERIFY_CAN=0
+    if "$1" cache verify --help >/dev/null 2>&1; then _BASE_HF_VERIFY_CAN=1; fi
+  fi
+  [ "$_BASE_HF_VERIFY_CAN" = 1 ]
 }
 # The record of what was verified (3.12.0): state/verified.tsv, "<dest>\t<commit>\t<etag>", appended, the last line per
 # dest wins. A file is hashed ONCE, when it downloads; every later run takes its size and this record and hashes nothing.
@@ -266,6 +280,11 @@ _base_pin_moved(){ # <dest> <url> → 0 when the row pins a commit other than th
 # ---------------------------------------------------------------- sizes
 _base_expected(){ # <url> → exact:<bytes> from the Hub (x-linked-size beats content-length; a non-2xx final hop counts for nothing) | approx:0
   local url="$1" out xl cl st
+  if [ "$(_base_source "$url")" = civitai ]; then   # 3.24.0: its storage refuses a HEAD; one byte asked for names the total
+    out="$(_base_fetch_ranges info "$url" 2>/dev/null | sed -n 's/^RESULT .*"bytes": \([0-9]*\).*/\1/p' | tail -1)"
+    if [[ "$out" =~ ^[0-9]+$ ]] && [ "$out" -gt 0 ]; then echo "exact:$out"; else echo "approx:0"; fi
+    return 0
+  fi
   _base_hub_auth "$url"
   out="$(curl -sIL --max-time 40 --retry 2 ${BASE_HUB_AUTH[@]+"${BASE_HUB_AUTH[@]}"} "$url" 2>/dev/null | tr -d '\r' || true)"
   xl="$(printf '%s\n' "$out" | awk 'tolower($1)=="x-linked-size:"{v=$2} END{print v}')"
@@ -307,11 +326,80 @@ _base_curl_dl(){ # <staged file> <url> [curl args] — the GitHub leg: curl, res
   if curl -fL --retry 3 -C - --max-time 3600 "$@" -o "$staged" "$url" > "$out" 2>&1; then rm -f "$out"; return 0; fi
   tail -3 "$out"; rm -f "$out"; return 1
 }
+
+# ---------------------------------------------------------------- 3.24.0: the ranged leg (py/fetch_ranges.py)
+# Civitai, and a GitHub file of BASE_RANGE_MIN_MB or more, come over BASE_RANGE_CONNS connections at once, each block
+# hashed from memory as it lands: size and sha256 are judged with no second read of the file. The token rides a 0600
+# header file to civitai.com only, never to the storage it redirects to, never argv, never a URL.
+_base_source(){ # <url> → hf | civitai | github | local: where a row's bytes come from (the per-file record's "source")
+  case "$1" in
+    hf://*|https://huggingface.co/*) echo hf;;
+    https://civitai.com/*) echo civitai;;
+    https://github.com/*) echo github;;
+    *) echo local;;
+  esac
+}
+_base_civitai_url_ok(){ # <url> → 0 for a download URL of one model version, its query only Civitai's own file selectors
+  local u="$1" q re_url='^https://civitai[.]com/api/download/models/[0-9]+([?][A-Za-z0-9=&._-]*)?$' \
+        re_q='^(&(fileId|type|format|size|fp)=[A-Za-z0-9._-]+)+$'
+  [[ "$u" =~ $re_url ]] || return 1
+  q="${u#*\?}"; [ "$q" != "$u" ] || return 0
+  [[ "&$q" =~ $re_q ]]                             # only the selectors: a token=, or anything else, is refused
+}
+_base_ranged(){ # <url> → 0 when the ranged leg fetches it: always Civitai; GitHub from BASE_RANGE_MIN_MB up
+  case "$(_base_source "$1")" in
+    civitai) return 0;;
+    github) local min="${BASE_RANGE_MIN_MB:-256}"; [[ "$min" =~ ^[0-9]+$ ]] || min=256
+            [ "${2:-0}" -ge $(( min * 1048576 )) ];;
+    *) return 1;;
+  esac
+}
+_base_row_sha256(){ # <file basename> → the sha256 models.sha256 beside the script states for it, or nothing
+  _base_model_hashes 2>/dev/null | awk -F'|' -v f="$1" '$1==f{print $2; exit}'
+  return 0
+}
+_base_fetch_ranges(){ # <get|info> <url> [args] → py/fetch_ranges.py, with CIVITAI_TOKEN's header file when the URL is Civitai's
+  local verb="$1" url="$2" auth=(); shift 2
+  if [ "$(_base_source "$url")" = civitai ] && [ -n "${CIVITAI_TOKEN:-}" ]; then
+    [ -n "${BASE_TMPD:-}" ] || _base_tmp
+    local f; f="$(_base_auth_file CIVITAI_TOKEN)" && auth=(--auth-file "$f")
+  fi
+  if [ -n "$BASE_FAKE_ROOT" ] && [ -n "${BASE_FAKE_ORIGIN:-}" ]; then   # the suite's local server, never in a real run
+    url="${BASE_FAKE_ORIGIN%/}/${url#https://*/}"
+  fi
+  "$SYS_PY" "$BASE_DIR/py/fetch_ranges.py" "$verb" "$url" "$@" ${auth[@]+"${auth[@]}"}
+}
+_base_ranged_dl(){ # <staged file> <url> <bytes> → 0 on a file of that size whose sha256 is the stated one (when one is stated).
+  # Three attempts, each resuming the last; a refusal, a missing file, a wrong size or a wrong hash is said once.
+  local staged="$1" url="$2" bytes="$3" sha out rc attempt conns="${BASE_RANGE_CONNS:-16}" src
+  [[ "$conns" =~ ^[1-9][0-9]*$ ]] || conns=16
+  sha="$(_base_row_sha256 "$(basename "$staged")")"; src="$(_base_source "$url")"
+  BASE_DL_VIA="ranges"
+  for attempt in 1 2 3; do
+    rc=0; out="$(_base_fetch_ranges get "$url" "$staged" --bytes "$bytes" --conns "$conns" ${sha:+--sha256 "$sha"} 2>&1)" || rc=$?
+    if [ "$rc" = 0 ]; then
+      BASE_DL_VIA="$(printf '%s\n' "$out" | sed -n 's/^RESULT //p' | tail -1 | "$SYS_PY" -c 'import json,sys
+r = json.load(sys.stdin); print("ranges x%d%s" % (r["conns"], "" if r["verified"] else ", size only"))' 2>/dev/null || echo ranges)"
+      return 0
+    fi
+    printf '%s\n' "$out" | grep -v '^RESULT ' | tail -5
+    case "$rc" in
+      2|3|5) return 1;;
+      4) if [ "$src" = civitai ] && [ -z "${CIVITAI_TOKEN:-}" ]; then err "Civitai wants an account for this file: give the install a CIVITAI_TOKEN (civitai.com → Account settings → API keys) and re-run"
+         elif [ "$src" = civitai ]; then err "Civitai refused CIVITAI_TOKEN for this file: the key is wrong, or this account may not download it (early access, or a licence to accept on its page)"; fi
+         return 1;;
+    esac
+    [ "$attempt" = 3 ] || { note "attempt $attempt failed: retrying (the transfer resumes)"; sleep 5; }
+  done
+  return 1
+}
 _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets BASE_DL_SECS
-  local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS rfile="" tv
+  local url="$1" dest="$2" bytes="$3" base stage staged rc=1 attempt t0=$SECONDS rfile="" tv held=0
   base="$(basename "$dest")"; stage="$STAGING/$base.d"; mkdir -p "$stage"
   BASE_VERIFY_SECS=0                                # 3.22.0: how long the sha256 re-read took (the timeline's "sha256" span)
+  BASE_DL_VIA="hf-xet"                              # 3.24.0: the transport, for the per-file record
   if [ "$BASE_NO_NET" = "1" ] && [ "${BASE_FAKE_DL:-}" != "real" ]; then   # BASE_FAKE_DL=real: the real branches with stubbed tools on PATH
+    BASE_DL_VIA="fake"
     if [ "${BASE_FAKE_DL:-}" = "fail" ]; then err "fake download failed (BASE_FAKE_DL=fail)"; rm -rf "$stage"; return 1; fi
     staged="$stage/$base"; _base_sparse "$staged" "$bytes"      # fake: a sparse file at the declared size
   elif [[ "$url" == https://huggingface.co/*/resolve/* ]]; then
@@ -341,21 +429,28 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
       fi
       BASE_VERIFY_SECS=$(( SECONDS - tv ))
     fi
+  elif _base_ranged "$url" "$bytes"; then
+    staged="$stage/$base"      # 3.24.0: Civitai, or a big GitHub file: many connections, hashed as it lands, resumable
+    # its file has the full size from the first block on (each block is written where it belongs), so the size below
+    # proves nothing here: only the helper's own verdict lets it move; a failed one stays staged, to resume
+    if ! _base_ranged_dl "$staged" "$url" "$bytes"; then
+      held=1; [ -f "$staged" ] && note "the transfer is kept in $stage: the next run resumes it"
+    fi
   else
-    staged="$stage/$base"      # github releases and the like: curl, resumable
+    staged="$stage/$base"; BASE_DL_VIA="curl"   # github releases and the like: curl, resumable
     for attempt in 1 2 3; do
       _base_curl_dl "$staged" "$url" && break
       [ "$attempt" = 3 ] || { note "attempt $attempt failed — retrying (the transfer resumes)"; sleep 5; }
     done
   fi
-  if [ -f "$staged" ] && _base_size_ok "$(_base_fsize "$staged")" "$bytes"; then
+  if [ "$held" = 0 ] && [ -f "$staged" ] && _base_size_ok "$(_base_fsize "$staged")" "$bytes"; then
     mkdir -p "$(dirname "$dest")"
     if mv "$staged" "$dest"; then
       [ -z "${rfile:-}" ] || _base_verified_meta "$dest" "$stage/.cache/huggingface/download/$rfile.metadata"   # a Hub file, verified above
       rm -rf "$stage"; rc=0
     fi
     BASE_DL_SECS=$(( SECONDS - t0 ))
-  else
+  elif [ "$held" = 0 ]; then
     [ -f "$staged" ] && err "staged file has $(_base_fsize "$staged") bytes, expected $bytes — kept in $stage for resume"
   fi
   return $rc
@@ -363,11 +458,11 @@ _base_download(){ # <url> <dest> <bytes> → 0 on a verified file in place; sets
 _base_snapshot(){ # <hf://owner/repo[@commit]> <dest dir> <bytes> → a repo snapshot in place, verified by total size and by
   # the Hub's own hashes for that revision (3.12.0)
   local repo rev dest="$2" bytes="$3" hfbin attempt rargs=() ok=0 tv
-  BASE_VERIFY_SECS=0
+  BASE_VERIFY_SECS=0; BASE_DL_VIA="hf-xet"
   IFS='|' read -r repo rev _ <<< "$(_base_hf_ref "$1")"
   [ -n "$rev" ] && rargs=(--revision "$rev")
   mkdir -p "$dest"
-  if [ "$BASE_NO_NET" = "1" ]; then _base_sparse "$dest/.fake-snapshot" "$bytes"; return 0; fi
+  if [ "$BASE_NO_NET" = "1" ]; then BASE_DL_VIA="fake"; _base_sparse "$dest/.fake-snapshot" "$bytes"; return 0; fi
   hfbin="$(_base_hf_bin)"
   if [ -z "$hfbin" ]; then err "hf CLI missing"; return 1; fi
   local _dlout
@@ -502,21 +597,38 @@ _base_progress(){ # [stage] → state/progress.json from the queue, the stand-in
 
 # ---------------------------------------------------------------- fetching: one at a time, or BASE_FETCH_JOBS at once
 _base_fetch_jobs(){ # 3.11.0: six at once by default (one Xet file does not fill a pod's link; about three to six do, measured
-  # 2026-10-16: six files 1.7 GB/s together, one 0.8 to 1 GB/s), three on a machine under 32 GiB of memory (each high
-  # performance transfer keeps its own buffers). BASE_FETCH_JOBS=1 is the one-at-a-time behaviour of 3.0 to 3.10.
-  local n="${BASE_FETCH_JOBS:-}" kb
-  if [ -z "$n" ]; then
-    kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || true)"
-    if [[ "$kb" =~ ^[0-9]+$ ]] && [ "$kb" -lt 33554432 ]; then n=3; else n=6; fi
-  fi
+  # 2026-10-16: six files 1.7 GB/s together, one 0.8 to 1 GB/s). BASE_FETCH_JOBS=1 is the one-at-a-time behaviour of 3.0
+  # to 3.10. 3.24.0: six on every machine. The three under 32 GiB of memory never applied on a pod (a container's
+  # /proc/meminfo is the host's), only on a small own box, and since hf_xet 1.3.0 a transfer's buffers are bounded
+  # (adaptive concurrency, no chunk cache).
+  local n="${BASE_FETCH_JOBS:-6}"
   if [[ "$n" =~ ^[1-9][0-9]*$ ]]; then echo "$n"; else note "BASE_FETCH_JOBS='$n' is not a positive integer: fetching one file at a time" >&2; echo 1; fi
 }
 _base_fetch_one(){ # <spec KIND|rel|url|bytes|dest> → rc of the download
   local kind rel url bytes dest; IFS='|' read -r kind rel url bytes dest <<<"$1"
   if [ "$kind" = "SNAP" ]; then _base_snapshot "$url" "$dest" "$bytes"; else _base_download "$url" "$dest" "$bytes"; fi
 }
-_base_fetch_fold(){ # <rc> <secs> <spec> [<t0> <sha256 secs>] → the verdict line and the run's counters, in the caller's shell
-  local rc="$1" secs="$2" kind rel url bytes dest _sz t0="${4:-}" vs="${5:-0}"; IFS='|' read -r kind rel url bytes dest <<<"$3"
+_base_now(){ if [ -n "${EPOCHREALTIME:-}" ]; then echo "${EPOCHREALTIME/,/.}"; else date +%s; fi; }   # epoch seconds, to the microsecond on bash 5
+_BASE_DL_TSV=""
+_base_dl_record(){ # <epoch start> <epoch end> <bytes> <sha256 secs> <source> <via> <result> <rel> → one line of the run's
+  # per-file record, state/logs/<the run's log>.downloads.tsv (3.24.0): the Install Speed Scorecard charts it, podctl fetches it
+  # with the rest of state/logs. Seconds and MB/s (decimal, 10^6 bytes) are wall clock, the sha256 re-read included.
+  [ -n "${BASE_STATE:-}" ] || return 0
+  if [ -z "$_BASE_DL_TSV" ]; then
+    if [ -n "${BASE_LOG:-}" ]; then _BASE_DL_TSV="${BASE_LOG%.log}.downloads.tsv"
+    else _BASE_DL_TSV="$BASE_STATE/logs/${PKG_ID:-base}_$(_base_ts).downloads.tsv"; fi
+  fi
+  mkdir -p "$(dirname "$_BASE_DL_TSV")" 2>/dev/null || return 0
+  [ -s "$_BASE_DL_TSV" ] || printf '# start\tend\tseconds\tbytes\tMB_s\tsha256_s\tsource\tvia\tresult\tfile  (epoch seconds; ComfyUI Base %s)\n' "${BASE_VERSION:-?}" > "$_BASE_DL_TSV" 2>/dev/null
+  awk -v a="$1" -v b="$2" -v n="$3" -v v="$4" -v s="$5" -v w="$6" -v r="$7" -v f="$8" 'BEGIN{
+    d = b - a; if (d < 0) d = 0
+    printf "%.3f\t%.3f\t%.3f\t%.0f\t%s\t%s\t%s\t%s\t%s\t%s\n", a, b, d, n, (d > 0 ? sprintf("%.1f", n / 1000000 / d) : "-"), v, s, w, r, f }' >> "$_BASE_DL_TSV" 2>/dev/null || true
+  return 0
+}
+_base_fetch_fold(){ # <rc> <secs> <spec> [<t0> <sha256 secs> <via> <epoch start> <epoch end>] → the verdict line, the run's
+  # counters and the per-file record, in the caller's shell
+  local rc="$1" secs="$2" kind rel url bytes dest _sz t0="${4:-}" vs="${5:-0}" via="${6:-}" e0="${7:-}" e1="${8:-}" src
+  IFS='|' read -r kind rel url bytes dest <<<"$3"; src="$(_base_source "$url")"
   [[ "$secs" =~ ^[0-9]+$ ]] || secs=0; [[ "$vs" =~ ^[0-9]+$ ]] || vs=0
   [ "$vs" -le "$secs" ] || vs="$secs"              # the re-read is inside the job's own seconds
   if [[ "$t0" =~ ^[0-9]+$ ]]; then                 # 3.22.0: the timeline's spans; the re-read is the job's last step
@@ -526,19 +638,23 @@ _base_fetch_fold(){ # <rc> <secs> <spec> [<t0> <sha256 secs>] → the verdict li
   if [ "$rc" = "0" ]; then
     if [ "$kind" = "SNAP" ]; then _sz="$bytes"; else _sz="$(_base_fsize "$dest")"; fi
     BASE_DL_BYTES=$(( BASE_DL_BYTES + _sz )); BASE_DL_TIME=$(( BASE_DL_TIME + secs ))
-    ok "$rel downloaded ($(_base_bytes_to_gb "$_sz") GB, verified) · $(_base_rate "$_sz" "$secs")$( [ "$vs" -eq 0 ] || echo " (sha256 ${vs}s of it)")"
+    ok "$rel downloaded ($(_base_bytes_to_gb "$_sz") GB, verified) · $(_base_rate "$_sz" "$secs")$( [ "$vs" -eq 0 ] || echo " (sha256 ${vs}s of it)") · $src${via:+, $via}"
     MODEL_DL+=("$rel"); DL_DESTS+=("$dest"); MODEL_DL_GB="$(_base_add_gb "$MODEL_DL_GB" "$(_base_bytes_to_gb "$bytes")")"
-  else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); fi
+  else err "download failed: $rel"; MODEL_FAIL+=("$rel"); MODEL_FAIL_GB="$(_base_add_gb "$MODEL_FAIL_GB" "$(_base_bytes_to_gb "$bytes")")"; BASE_FAILED+=("model: $rel not obtained"); _sz=0; fi
+  if [[ "$e0" =~ ^[0-9.]+$ ]] && [[ "$e1" =~ ^[0-9.]+$ ]]; then   # a fold with no clock (the early pass's failures, settled) records nothing
+    _base_dl_record "$e0" "$e1" "$_sz" "$vs" "$src" "${via:--}" "$( [ "$rc" = 0 ] && echo ok || echo failed )" "$rel"
+  fi
 }
 _base_alive(){ local p c=0; for p in "$@"; do if kill -0 "$p" 2>/dev/null; then c=$((c + 1)); fi; done; echo "$c"; }   # <pid>... → how many still run
 _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE_FETCH_JOBS at a time, reported in queue order
-  local n spec i=0 rc t0 logd rel secs ts vs pids=()
+  local n spec i=0 rc t0 logd rel secs ts vs via e0 e1 hfbin pids=()
   n="$(_base_fetch_jobs)"
+  hfbin="$(_base_hf_bin)"; [ -z "$hfbin" ] || _base_hf_can_verify "$hfbin" || true   # 3.24.0: asked once, inherited by every job
   if [ "$n" = "1" ]; then                          # exactly the 3.0 behaviour: live output, one file after another
     for spec in "$@"; do
       IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
-      BASE_DL_SECS=0; BASE_VERIFY_SECS=0; t0=$SECONDS; rc=0; _base_fetch_one "$spec" || rc=$?
-      _base_fetch_fold "$rc" "$(( SECONDS - t0 ))" "$spec" "$t0" "${BASE_VERIFY_SECS:-0}"
+      BASE_DL_SECS=0; BASE_VERIFY_SECS=0; BASE_DL_VIA=""; t0=$SECONDS; e0="$(_base_now)"; rc=0; _base_fetch_one "$spec" || rc=$?
+      _base_fetch_fold "$rc" "$(( SECONDS - t0 ))" "$spec" "$t0" "${BASE_VERIFY_SECS:-0}" "$BASE_DL_VIA" "$e0" "$(_base_now)"
     done
     return 0
   fi
@@ -549,7 +665,8 @@ _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE
     spec="${!i}"                                   # the i-th argument: queue order is kept for the report below
     # 3.11.0: only this queue's own jobs fill a slot or are waited for; the run has other background work by now
     while [ "$(_base_alive ${pids[@]+"${pids[@]}"})" -ge "$n" ]; do sleep 1; done
-    ( t0=$SECONDS; rc=0; BASE_VERIFY_SECS=0; _base_fetch_one "$spec" > "$logd/$i.log" 2>&1 || rc=$?; echo "$rc|$(( SECONDS - t0 ))|$t0|${BASE_VERIFY_SECS:-0}" > "$logd/$i.rc" ) &
+    ( t0=$SECONDS; e0="$(_base_now)"; rc=0; BASE_VERIFY_SECS=0; BASE_DL_VIA=""; _base_fetch_one "$spec" > "$logd/$i.log" 2>&1 || rc=$?
+      echo "$rc|$(( SECONDS - t0 ))|$t0|${BASE_VERIFY_SECS:-0}|$BASE_DL_VIA|$e0|$(_base_now)" > "$logd/$i.rc" ) &
     pids+=("$!")
   done
   wait ${pids[@]+"${pids[@]}"} 2>/dev/null || true
@@ -557,8 +674,8 @@ _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE
   for spec in "$@"; do
     i=$((i + 1)); IFS='|' read -r _ rel _ <<<"$spec"; echo -e "\n${CYA}→ $rel${NC}"
     [ -f "$logd/$i.log" ] && cat "$logd/$i.log"
-    IFS='|' read -r rc secs ts vs < "$logd/$i.rc" 2>/dev/null || { rc=1; secs=0; ts=""; vs=0; }
-    _base_fetch_fold "$rc" "$secs" "$spec" "$ts" "$vs"
+    IFS='|' read -r rc secs ts vs via e0 e1 < "$logd/$i.rc" 2>/dev/null || { rc=1; secs=0; ts=""; vs=0; via=""; e0=""; e1=""; }
+    _base_fetch_fold "$rc" "$secs" "$spec" "$ts" "$vs" "$via" "$e0" "$e1"
   done
   return 0
 }
@@ -939,8 +1056,14 @@ base_prune(){ # legacy leftovers, duplicates, superseded, partials → ONE y/N (
 }
 
 # ---------------------------------------------------------------- gen-models: fill/verify bytes from the Hub
-_base_hub_sha256(){ # <url> → the file's sha256 as the Hub publishes it (x-linked-etag on an LFS file), or nothing
+_base_hub_sha256(){ # <url> → the file's sha256 as the Hub publishes it (x-linked-etag on an LFS file), or nothing.
+  # 3.24.0: and as Civitai states it for that file (its API, through py/fetch_ranges.py info)
   local url="$1" out e
+  if [ "$(_base_source "$url")" = civitai ]; then
+    e="$(_base_fetch_ranges info "$url" 2>/dev/null | sed -n 's/^RESULT .*"sha256": "\([0-9a-f]\{64\}\)".*/\1/p' | tail -1)"
+    if [ -n "$e" ]; then echo "$e"; fi
+    return 0
+  fi
   [[ "$url" == https://huggingface.co/* ]] || return 0                 # the Hub is the one host that states it on a HEAD
   _base_hub_auth "$url"
   out="$(curl -sIL --max-time 40 --retry 2 ${BASE_HUB_AUTH[@]+"${BASE_HUB_AUTH[@]}"} "$url" 2>/dev/null | tr -d '\r' || true)"
@@ -948,7 +1071,8 @@ _base_hub_sha256(){ # <url> → the file's sha256 as the Hub publishes it (x-lin
   if [[ "$e" =~ ^[0-9a-f]{64}$ ]]; then echo "$e"; fi
   return 0
 }
-base_gen_hashes(){ # <pkg dir> [--check] → models.sha256 beside the script: each Hub file's sha256, taken from the Hub (3.4.0)
+base_gen_hashes(){ # <pkg dir> [--check] → models.sha256 beside the script: each Hub file's sha256, taken from the Hub (3.4.0),
+  # and each Civitai file's, from Civitai (3.24.0)
   # Nothing is downloaded or hashed here. --check writes nothing and exits 1 when the file is missing or differs.
   local d="${1%/}" check="${2:-}" s rows cat fam purp file url bytes note alts h tmp rc=0
   _base_tmp                                                             # here, not inside the $( ) below: a temp dir made in a subshell is never cleaned
@@ -962,7 +1086,7 @@ base_gen_hashes(){ # <pkg dir> [--check] → models.sha256 beside the script: ea
     case "$file" in */) continue;; esac
     h="$(_base_hub_sha256 "$url")"
     if [ -n "$h" ]; then printf '%s  %s\n' "$h" "$file" >> "$tmp"
-    else echo "  ○ $file: the host states no sha256 for $url (only the Hub does): left out" >&2; fi
+    else echo "  ○ $file: the host states no sha256 for $url (the Hub and Civitai do): left out" >&2; fi
   done <<< "$rows"
   sort -k2 -o "$tmp" "$tmp"
   if [ "$check" = "--check" ]; then
