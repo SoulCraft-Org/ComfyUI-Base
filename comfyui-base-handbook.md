@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.22.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.23.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -238,11 +238,14 @@ copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block is printed
 it printed (each pack's HEAD) into the local script and rebuilds its zip. A run that upgraded the NVIDIA driver stops with
 "restart required" and prints the `podctl restart` a person approves; the same install then continues. A red run stops with the console's path: the log is the deliverable, the fix loop
 starts there. `podctl tunnel <pod>` is the one ssh session that forwards ports (8188, 8888, each app port the machine
-serves (3.9.0), and 9199 and 11434 beside them:
-the base runs no metrics exporter and no inference server, but a package may run one on the machine and reach
-it on loopback, which is the shape a package takes when its point is that nothing leaves the box) for the canvas tools and
-the browser; it prints them first as named localhost links (`ComfyUI http://localhost:8188`, `Jupyter Terminal
-http://localhost:8888/lab?token=…`, one per app), which is how a `--private` pod's ports are named. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
+serves (3.9.0); the ssh-config block also carries 9199: the base runs no metrics exporter, but a package may run one
+on the machine and read it on loopback) for the canvas tools and the browser; it prints them first as named localhost
+links (`ComfyUI http://localhost:8188`, `Jupyter Terminal http://localhost:8888/lab?token=…`, one per app), which is
+how a `--private` pod's ports are named. Those are the local numbers with nothing set. `PODCTL_TUNNEL_OFFSET=N` adds N
+to each, and `PODCTL_TUNNEL_BASE=<port>` (3.23.0) moves every local side into a block of the workstation's own:
+machine N takes `base+10N` to `base+10N+9`, ComfyUI, JupyterLab and 9199 at the first three, the app ports after them
+by port. The remote ports never move (`hosts/README.md` has the details). 11434 is no longer forwarded (3.23.0);
+`--port 11434` forwards it for a package that runs an inference server on the machine. `podctl prune <pod>` lists the old-layout folders an earlier layout left under `/workspace/packages`
 (`<Display Name>/` with a `<Display Name> Script.sh`, and `ComfyUI Base/`) and their workflow copies in ComfyUI's
 browser; `--yes` removes exactly those, after the re-install has put the `<name>/` folders beside them. `--pkg` takes
 the repository-relative package path (`<brand>/packages/<name>`) or a bare `<name>` that one brand has.
@@ -803,9 +806,10 @@ There are two transports and the difference is not cosmetic:
 
 The lifecycle and discovery tools need the tree, and the tree is on the machine — which is why the server is
 installed there and ssh is the default. The ssh transport passes `ClearAllForwardings=yes`: the `Host` block
-`podctl ssh-config` writes carries four `LocalForward` lines, and a second session binding them while a tunnel
+`podctl ssh-config` writes carries three `LocalForward` lines, and a second session binding them while a tunnel
 holds them prints warnings onto the very stdio channel MCP is speaking. The tunnel transport takes the alias's
-own local port (`tunnel_locals`), so two machines never point at one tunnel.
+own local port (`tunnel_locals`: the offset, or the slot under `PODCTL_TUNNEL_BASE`), so two machines never point at
+one tunnel.
 
 **What this repository does NOT ship.** No `.mcp.json` is committed, and no settings file approves one
 (`enabledMcpjsonServers`, `enableAllProjectMcpServers`). This is a public toolchain many people clone: Claude Code
@@ -837,6 +841,21 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.23.0: `podctl` binds no vendor port on the workstation when told not to (2026-10-24). The tunnel's local sides were
+  the remote ports plus `PODCTL_TUNNEL_OFFSET` (0-1000), so every session bound 8188, 8888, 9199 and 11434 or a few
+  ports above them. A workstation whose rule is that local listeners sit in each account's own block (3100-3199 for the
+  first account, 3200-3299 for the next) and that the vendors' numbers stay empty could not follow it: no offset
+  reaches 31xx from 8188. `PODCTL_TUNNEL_BASE=<port>` now puts machine N's local sides at `base+10N` onwards: ComfyUI,
+  JupyterLab and 9199 at the first three slots, the app ports after them by port, more than ten refused. Unset, nothing
+  changes. The ssh-config block, `tunnel`, `jupyter`, `mcp --over tunnel` and `create`'s hint read the same numbers
+  (`tunnel_local_ports`). That also fixes an older split: `podctl tunnel`'s default ports were bound as 8188 and 8888
+  whatever the offset said, while ssh-config, jupyter and mcp printed the offset ports; a plain port is now sent as
+  LOCAL:REMOTE whenever the two differ. 11434 (Ollama's) is no longer forwarded. 2.9.1 kept it in case a package ran an
+  inference server on the machine. No package of the repositories around the base does (photo-auditor dropped its
+  Ollama tier in 2.0.0, 2026-10-17), and a workstation that keeps 11434 empty cannot run a session that binds it. The
+  machine still reserves the port for APP_PORTS, and `--port 11434` forwards it. `SSH_BLOCK` is built from
+  `TUNNEL_SERVICES` now, so the two cannot drift apart. The unit tier covers the block and its refusals, the tunnel
+  plan under a base and under an offset, and the block's lines. No pod used; this changes only the Mac side.
 - 3.22.1: two CI fixes (2026-10-18). (1) A package's CI log named 4 of the 7 tests that failed (2026-10-17): the
   runner's `-rs` put only skips in pytest's short summary, and `_build/verify.sh` cut the FAILURES section with
   `| head -200`, which also broke awk's pipe. The runner now passes `-rfEs`, and `_verify_failures` prints every FAILED

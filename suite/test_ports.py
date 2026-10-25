@@ -476,6 +476,19 @@ def test_unit_tunnel_forwards_the_machines_app_ports_and_prints_named_localhost_
     # nothing read from the machine: this tree's declarations name and add the ports
     ports, lines = podctl.tunnel_plan([8188, 8888], False, [], [(8189, "v", "V App", "v")], None)
     assert ports == [8188, 8888, 8189] and "(no token read: podctl jupyter <pod>)" in lines[1] and "V App" in lines[2]
+    # 3.23.0: under $PODCTL_TUNNEL_BASE every plain port binds its slot in the block and the links name those ports; the remote
+    # side is untouched, and a LOCAL:REMOTE typed by hand is kept. Before, the tunnel bound 8188 and 8888 whatever the offset was.
+    env = {podctl.TUNNEL_BASE_ENV: "3180"}
+    ports, lines = podctl.tunnel_plan([8188, 8888], False, apps, [], tok, env=env)
+    assert ports == ["3180:8188", "3181:8888", "3183:8189"], ports
+    assert lines == ["tunnel  ComfyUI           http://localhost:3180",
+                     "tunnel  Jupyter Terminal  http://localhost:3181/lab?token=abc123",
+                     "tunnel  Video Thing App   http://localhost:3183"], lines
+    assert "-L" in podctl.tunnel_argv(ports, host="h", port=22, key="/k") and \
+        "3180:127.0.0.1:8188" in podctl.tunnel_argv(ports, host="h", port=22, key="/k")
+    assert podctl.tunnel_plan(["9000:8188"], True, [], [], None, env=env)[0] == ["9000:8188"]
+    ports, _ = podctl.tunnel_plan([8188, 8888], False, apps, [], tok, env={podctl.TUNNEL_OFFSET_ENV: "1"})
+    assert ports == ["8189:8188", "8889:8888", "8190:8189"], ports
     a = podctl.build_parser().parse_args(["tunnel", "p1"]); assert not getattr(a, "port_given", False)
     a = podctl.build_parser().parse_args(["tunnel", "p1", "--port", "9000"]); assert a.port_given and a.port == [9000]
     cmd = podctl.tunnel_facts_cmd()

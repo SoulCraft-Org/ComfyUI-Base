@@ -105,21 +105,30 @@ VOLUME_ROOT = "/workspace"                              # the persistent root on
 # 2.11.0: this was a hard-coded map of one brand's three machine aliases, which meant anybody else's fleet
 # silently shared 8188 and could only fix it by editing the base - the one thing a consumer must never do.
 TUNNEL_OFFSET_ENV = "PODCTL_TUNNEL_OFFSET"
-# 11434 is Ollama's. The base installs no inference server and never will: the port is forwarded because a
-# PACKAGE may run one on the machine and talk to it on loopback, which is the shape a package uses when its
-# whole point is that nothing leaves the box. Forwarding it costs nothing when no package does, and its
-# absence would be silent and confusing. It is not a leftover; do not remove it without checking the
-# packages of the repository around the base.
-TUNNEL_SERVICES = [("comfy", 8188), ("jupyter", 8888), ("metrics", 9199), ("ollama", 11434)]
+# 3.23.0: an offset moves the local ports but keeps them on the vendors' numbers (8188 and 8888 plus a little),
+# and a workstation may have a rule that its local listeners sit in a block of its own: one account's 3100-3199,
+# say, beside another account's 3200-3299, on one machine. No offset in 0-1000 reaches such a block, so
+# $PODCTL_TUNNEL_BASE puts every local side there instead: machine N of the fleet (its offset) takes the ten
+# ports base+10N .. base+10N+9, the services below at fixed slots and the app ports after them, by port. The
+# remote ports never move. Unset, nothing changes. Which block is a fact about somebody's workstation, so it
+# comes from the environment like the offset, and the base names no machine.
+TUNNEL_BASE_ENV = "PODCTL_TUNNEL_BASE"
+TUNNEL_STRIDE = 10
+# 9199 is a metrics exporter's: the base runs none, but a PACKAGE may run one on the machine and read it on
+# loopback. 3.23.0: 11434 (Ollama's) is no longer forwarded. No package of the repositories around the base
+# talks to an inference server on the machine (the one that did, a photo auditor, dropped it in its 2.0.0),
+# and a workstation rule that keeps 11434 empty cannot coexist with a session that binds it. The machine still
+# reserves the port (lib/75-boot.sh, py/app_proxy.py), so a package that runs one later reaches it with
+# `podctl tunnel <pod> --port 11434`, which lands in the block like any other port.
+TUNNEL_SERVICES = [("comfy", 8188), ("jupyter", 8888), ("metrics", 9199)]
 SSH_BLOCK = ("Host {alias}\n  HostName {host}\n  Port {port}\n  User {user}\n  IdentityFile {key}\n  StrictHostKeyChecking accept-new\n"
-             "  LocalForward {comfy} localhost:8188\n  LocalForward {jupyter} localhost:8888\n"
-             "  LocalForward {metrics} localhost:9199\n  LocalForward {ollama} localhost:11434\n")
+             + "".join("  LocalForward {%s} localhost:%d\n" % (name, remote) for name, remote in TUNNEL_SERVICES))
 
 
 def tunnel_offset(env=None):
     """How far this machine's local ports sit from the defaults. $PODCTL_TUNNEL_OFFSET, else 0. A bad value is
     refused rather than silently treated as 0, because 0 is exactly the collision it was set to avoid."""
-    raw = ((env or os.environ).get(TUNNEL_OFFSET_ENV) or "").strip()
+    raw = ((os.environ if env is None else env).get(TUNNEL_OFFSET_ENV) or "").strip()
     if not raw:
         return 0
     try:
@@ -131,12 +140,52 @@ def tunnel_offset(env=None):
     return off
 
 
+def tunnel_base(env=None):
+    """The first local port of this workstation's block, $PODCTL_TUNNEL_BASE, else None (the remote ports plus
+    the offset, as before 3.23.0). Refused, never ignored, when it is not a whole number or when this machine's
+    ten ports (base + 10 x offset onwards) would leave 1024-65535: ignoring it would bind the very ports it was
+    set to keep empty."""
+    env = os.environ if env is None else env
+    raw = (env.get(TUNNEL_BASE_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        base = int(raw)
+    except ValueError:
+        raise PodctlError("%s=%r is not a whole number" % (TUNNEL_BASE_ENV, raw))
+    first = base + TUNNEL_STRIDE * tunnel_offset(env)
+    if base < 1024 or first + TUNNEL_STRIDE - 1 > 65535:
+        raise PodctlError("%s=%d with %s=%d puts this machine's ports at %d-%d, outside 1024-65535" % (
+            TUNNEL_BASE_ENV, base, TUNNEL_OFFSET_ENV, tunnel_offset(env), first, first + TUNNEL_STRIDE - 1))
+    return base
+
+
+def tunnel_local_ports(remotes, env=None):
+    """{remote: local} for every plain port a tunnel forwards. Without a base: the remote port plus the offset.
+    With one: the services at their fixed slots, every other port after them in port order, so one app keeps
+    one local port however the list was gathered. More ports than the stride holds is refused, because the
+    eleventh would sit in the next machine's slots."""
+    env = os.environ if env is None else env
+    off, base = tunnel_offset(env), tunnel_base(env)
+    remotes = [int(r) for r in remotes]
+    if base is None:
+        return {r: r + off for r in remotes}
+    fixed = {remote: slot for slot, (_, remote) in enumerate(TUNNEL_SERVICES)}
+    others = sorted(set(r for r in remotes if r not in fixed))
+    slots = dict(fixed)
+    slots.update((r, len(fixed) + i) for i, r in enumerate(others))
+    if max([slots[r] for r in remotes] + [0]) >= TUNNEL_STRIDE:
+        raise PodctlError("%d ports to forward, but a machine has %d local slots under %s (%s): forward fewer with --port" % (
+            len(fixed) + len(others), TUNNEL_STRIDE, TUNNEL_BASE_ENV, ", ".join(str(r) for r in others)))
+    return {r: base + TUNNEL_STRIDE * off + slots[r] for r in remotes}
+
+
 def tunnel_locals(alias=None, env=None):
-    """The local port for each service on this machine: the remote port plus this deployment's offset, so two
-    machines never contend for one number. `alias` is accepted and ignored; it is kept so the call sites and
-    the suite read the same as before 2.11.0."""
-    off = tunnel_offset(env)
-    return {name: remote + off for name, remote in TUNNEL_SERVICES}
+    """The local port for each service on this machine: the remote port plus this deployment's offset, or its
+    slot in $PODCTL_TUNNEL_BASE's block (3.23.0), so two machines never contend for one number. `alias` is
+    accepted and ignored; it is kept so the call sites and the suite read the same as before 2.11.0."""
+    local = tunnel_local_ports([remote for _, remote in TUNNEL_SERVICES], env)
+    return {name: local[remote] for name, remote in TUNNEL_SERVICES}
 
 
 def _block_for(alias, user, key):
@@ -1717,16 +1766,21 @@ def parse_link_fact(text):
     return _last_line(head.partition("--link--")[2])
 
 
-def tunnel_plan(ports, given, machine_apps, declared, token, names=None):
+def tunnel_plan(ports, given, machine_apps, declared, token, names=None, env=None):
     """The ports to forward and the named localhost links to print: [ports], [lines].
     Without --port: ComfyUI, JupyterLab and every app port the machine serves (else the ones this tree declares).
-    With --port: exactly those. A forwarded port is named by the base, then the machine's apps, then this tree's."""
+    With --port: exactly those. A forwarded port is named by the base, then the machine's apps, then this tree's.
+    3.23.0: a plain port comes back as LOCAL:REMOTE when its local side is not its own number (tunnel_local_ports:
+    the offset, or a slot in $PODCTL_TUNNEL_BASE's block). Before, the tunnel bound 8188 and 8888 whatever the
+    offset said, while ssh-config, jupyter and mcp printed the offset ports. LOCAL:REMOTE as typed is kept."""
     apps = list(machine_apps or []) or [(a[0], a[1], a[2]) for a in (declared or [])]
     ports = list(ports or TUNNEL_PORTS)
     if not given:
         for a in apps:
             if int(a[0]) not in [int(str(p).rpartition(":")[2]) for p in ports]:
                 ports.append(int(a[0]))
+    local = tunnel_local_ports([p for p in ports if ":" not in str(p)], env)
+    ports = [p if ":" in str(p) or local[int(p)] == int(p) else "%d:%d" % (local[int(p)], int(p)) for p in ports]
     named = dict(names or BASE_PORT_NAMES)
     for a in reversed(list(declared or [])):
         named.setdefault(int(a[0]), a[2])
@@ -1785,7 +1839,7 @@ def cmd_tunnel(prov, args):
 #           run tools work; the ones that need the tree do not, because the tree is on the other machine.
 #
 # ssh is the default because the smaller set is rarely what anyone wanted. ClearAllForwardings is not
-# optional: the Host block ssh-config writes carries four LocalForward lines, and a second session binding
+# optional: the Host block ssh-config writes carries the LocalForward lines, and a second session binding
 # them while `podctl tunnel` holds them prints warnings onto the stdio channel MCP is trying to speak.
 MCP_ENV = {"DO_NOT_TRACK": "1", "COMFY_NO_TELEMETRY": "1"}   # comfy-cli ships mixpanel and posthog; rule 9 says nothing is uploaded
 MCP_VENV_DIRNAME = ".venv-cu130"
@@ -2255,7 +2309,7 @@ def cmd_create(prov, args):
     pod_id = prov.create_machine(args.name, args.gpu, loc, args.data_gb, os_gb=args.os_gb, pubkey=pub, spot=args.spot,
                                  wait=not args.no_wait, ssh_config=args.ssh_config, **extra)
     print("next: podctl ensure %s · podctl install %s --base --pkg <dir> (or buyer-install with --runtime and the zips)%s" % (
-        pod_id, pod_id, (" · podctl tunnel %s, then ComfyUI is http://localhost:8188" % pod_id) if private else ""))
+        pod_id, pod_id, (" · podctl tunnel %s, then ComfyUI is http://localhost:%d" % (pod_id, tunnel_locals()["comfy"])) if private else ""))
 
 
 def cmd_pause(prov, args):
@@ -2356,8 +2410,8 @@ def build_parser():
     p = sub.add_parser("tunnel", help="the ONE ssh session that forwards ports (ComfyUI 8188, Jupyter Terminal 8888, each app port the "
                                       "machine serves) and prints them as named localhost links; runs until killed")
     p.add_argument("pod"); p.add_argument("--port", type=tunnel_port, action=_FreshAppend, default=list(TUNNEL_PORTS),
-                   help="repeatable; default 8188, 8888 and the machine's app ports. LOCAL:REMOTE shifts the local side, e.g. --port 8190:8188 "
-                        "reaches a second machine's ComfyUI on 8190 while the first keeps 8188")
+                   help="repeatable; default 8188, 8888 and the machine's app ports, each REMOTE port bound locally at its offset or its "
+                        "slot under $PODCTL_TUNNEL_BASE. LOCAL:REMOTE picks the local side by hand, e.g. --port 8190:8188")
     p = sub.add_parser("mcp", help="write the .mcp.json that points an MCP client at this machine's ComfyUI (Comfy MCP)")
     p.add_argument("pod")
     p.add_argument("--over", choices=("ssh", "tunnel"), default="ssh",

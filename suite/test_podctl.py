@@ -290,7 +290,6 @@ Host runpod
   IdentityFile ~/.ssh/id_ed25519
   LocalForward 8188 localhost:8188
   LocalForward 9199 localhost:9199
-  LocalForward 11434 localhost:11434
 
 Host other
   HostName 10.0.0.1
@@ -1407,7 +1406,7 @@ def test_unit_each_workflow_gets_its_own_local_port():
     assert seen == {0: 8188, 1: 8189, 2: 8190}, seen
     # every service moves together, or the second machine's jupyter collides while its comfy does not
     two = m.tunnel_locals(env={m.TUNNEL_OFFSET_ENV: "2"})
-    assert two == {"comfy": 8190, "jupyter": 8890, "metrics": 9201, "ollama": 11436}, two
+    assert two == {"comfy": 8190, "jupyter": 8890, "metrics": 9201}, two
     # a bad value is refused, never silently read as 0 - 0 is the collision it was set to avoid
     for bad in ("x", "-1", "9999"):
         try:
@@ -1415,6 +1414,45 @@ def test_unit_each_workflow_gets_its_own_local_port():
         except m.PodctlError:
             pass
     assert m._block_for("any-alias", "root", "/k").count("LocalForward 8188 localhost:8188") == 1
+
+
+def test_unit_tunnel_base_puts_every_local_port_in_the_workstations_block(monkeypatch):
+    """3.23.0: a workstation may keep its local listeners in a block of its own (3100-3199 for one account, 3200-3299 for
+    the next) and the vendors' numbers empty. No offset in 0-1000 reaches such a block from 8188, so $PODCTL_TUNNEL_BASE
+    gives each machine ten local ports there: the services at fixed slots, the app ports after them by port. The remote
+    side never moves. 11434 is no longer forwarded at all (no package runs an inference server on the machine)."""
+    m = _load()
+    assert [r for _, r in m.TUNNEL_SERVICES] == [8188, 8888, 9199]
+    assert "11434" not in m.SSH_BLOCK and m._block_for("a", "root", "/k").count("LocalForward") == 3
+    assert m.tunnel_base(env={}) is None
+    env = {m.TUNNEL_BASE_ENV: "3180"}
+    assert m.tunnel_locals(env=env) == {"comfy": 3180, "jupyter": 3181, "metrics": 3182}
+    # machine N of the fleet takes the next ten: two machines never share a port, and neither leaves the block
+    env1 = {m.TUNNEL_BASE_ENV: "3180", m.TUNNEL_OFFSET_ENV: "1"}
+    assert m.tunnel_locals(env=env1) == {"comfy": 3190, "jupyter": 3191, "metrics": 3192}
+    # app ports follow the services in PORT order, so one app keeps one local port however the list was gathered
+    assert m.tunnel_local_ports([8189, 8188, 8201], env) == {8188: 3180, 8189: 3183, 8201: 3184}
+    assert m.tunnel_local_ports([8201, 8189], env) == {8189: 3183, 8201: 3184}
+    # without a base nothing changes: the remote port plus the offset
+    assert m.tunnel_local_ports([8188, 8189], {m.TUNNEL_OFFSET_ENV: "2"}) == {8188: 8190, 8189: 8191}
+    # refused, never ignored: ignoring it would bind the very ports it was set to keep empty
+    for bad in ({m.TUNNEL_BASE_ENV: "x"}, {m.TUNNEL_BASE_ENV: "80"}, {m.TUNNEL_BASE_ENV: "65530"},
+                {m.TUNNEL_BASE_ENV: "60000", m.TUNNEL_OFFSET_ENV: "1000"}):
+        try:
+            m.tunnel_base(env=bad); raise AssertionError("accepted %r" % bad)
+        except m.PodctlError:
+            pass
+    try:
+        m.tunnel_local_ports(list(range(9000, 9008)), env); raise AssertionError("an eleventh port took the next machine's slot")
+    except m.PodctlError as e:
+        assert "--port" in str(e)
+    # the ssh-config block, the jupyter hint and the mcp tunnel transport all read the same numbers
+    monkeypatch.setenv(m.TUNNEL_BASE_ENV, "3180")
+    blk = m._block_for("a", "root", "/k")
+    assert "LocalForward 3180 localhost:8188\n  LocalForward 3181 localhost:8888\n  LocalForward 3182 localhost:9199\n" in blk, blk
+    assert m.mcp_server("a", "tunnel")["env"]["COMFYUI_URL"] == "http://127.0.0.1:3180"
+    for vendor in ("8188", "8888", "9199", "11434"):
+        assert "LocalForward %s " % vendor not in blk
 
 
 # ---------------------------------------------------------------- 2.7.0: the .mcp.json podctl writes
@@ -1426,7 +1464,7 @@ def test_unit_mcp_over_ssh_runs_the_server_on_the_machine():
     srv = podctl.mcp_server("runpod", "ssh", bin_path="/workspace/ComfyUI/.venv-cu130/bin/comfy-mcp")
     assert srv["command"] == "ssh"
     a = srv["args"]
-    # not cosmetic: the Host block ssh-config writes carries four LocalForward lines, and a second session
+    # not cosmetic: the Host block ssh-config writes carries the LocalForward lines, and a second session
     # binding them while `podctl tunnel` holds them prints warnings onto the stdio channel MCP speaks.
     assert "ClearAllForwardings=yes" in a, a
     assert a[-2] == "runpod", a
