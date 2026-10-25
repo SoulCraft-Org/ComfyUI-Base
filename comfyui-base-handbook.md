@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.27.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.27.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -869,6 +869,11 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.27.1: the canvas tools default to their own testbed port (2026-10-25). `snapshot.py`, `probe.py` and `panels.py` took
+  `--server` from `BASE_SERVER`, else `127.0.0.1:8199`. A runner Space now runs two runners, each with its own
+  `TESTBED_PORT` (8199 and 8299, workspace `ci/hf-runner/`), and a bare 8199 is the other runner's testbed mid-gate (a
+  package job reached it on 2026-10-25). The default is now `BASE_SERVER`, else `127.0.0.1:$TESTBED_PORT`, else 8199;
+  `test_build_tools_default_to_their_own_testbed_port` holds every `_build` tool to it.
 - 3.27.0: a first install starts ComfyUI beside its model downloads, not after them (2026-10-25). On 2026-10-17 the App's
   cold start (16 s on a B200: Python, torch, CUDA and ComfyUI's own nodes; the custom nodes under 1 s) came after the
   models join (30 s), prune, sync, the post-models hook, the import check and hygiene, though nothing in those needs a
