@@ -298,7 +298,12 @@ _base_start_cmd(){ # the exact launch line, in one place, so the hand-off prints
   printf '%s%s%s%s main.py --listen %s --port %s --enable-cors-header%s%s' "${hf:+env HF_HOME=$hf }" "${ff:+env VHS_FORCE_FFMPEG_PATH=$ff }" "${le:+env $le }" "$PY" "$(_base_comfy_listen)" "$PORT" "${pv:+ $pv}" "${extra:+ $extra}"
 }
 _base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), started together; 0 when server 0 answers
-  local extra=() w pv=() i rc
+  _base_spawn_comfy || return 1
+  _base_wait_spawned
+}
+_base_spawn_comfy(){ # 3.27.0: the start without the wait, so an install can start ComfyUI beside its model downloads and wait
+  # after them (lib/80-server.sh _base_launch_early). What the wait needs is left in BASE_SPAWN_N and BASE_SPAWN_PID.
+  local extra=() w pv=() i
   _base_local_dirs
   local _BASE_SERVER_N="" _BASE_WAIT_PID=""                         # read by the calls below (bash's dynamic scope)
   _BASE_SERVER_N="$(_base_server_count)"                            # counted once: every call below reads it
@@ -323,6 +328,13 @@ _base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), sta
     _base_spawn_server "$i"
     i=$((i + 1))
   done
+  BASE_SPAWN_N="$_BASE_SERVER_N"; BASE_SPAWN_PID=""
+  if [ "$_BASE_SERVER_N" -gt 1 ]; then BASE_SPAWN_PID="$(cat "$st/comfyui.pid" 2>/dev/null || true)"; fi
+  return 0
+}
+_base_wait_spawned(){ # 3.27.0: wait for what _base_spawn_comfy started; 0 when server 0 answers
+  local rc i
+  local _BASE_SERVER_N="${BASE_SPAWN_N:-1}" _BASE_WAIT_PID="${BASE_SPAWN_PID:-}"   # the spawn's view, for the calls below
   # MEASURED on a live pod: the custom nodes alone import for over three minutes
   # (ComfyUI-SeedVR2_VideoUpscaler 67 s, and thirty more packs behind it), so a flat 180 s window
   # declared `restart FAILED`, skipped smoke and combos, and failed the whole install — while the
@@ -332,7 +344,6 @@ _base_start_comfy(){ # every server this machine runs (3.20.0: one per GPU), sta
   # of silence. So the wait is patient while the process lives and gives up the moment it does not,
   # and it says which of the two happened.
   # 3.20.0: server 0's answer is the result; with N servers its own pid says whether it lives (any main.py would)
-  if [ "$_BASE_SERVER_N" -gt 1 ]; then _BASE_WAIT_PID="$(cat "$st/comfyui.pid" 2>/dev/null || true)"; fi
   _base_wait_comfy; rc=$?
   i=1
   while [ "$i" -lt "$_BASE_SERVER_N" ]; do      # started together, so by now these are up or nearly; one that fails is named
@@ -363,13 +374,13 @@ _base_spawn_server(){ # <i> → server i started in the background with the laun
      if [ "$_BASE_SERVER_N" -gt 1 ]; then echo $! > "$pidf" 2>/dev/null || true; fi; })      # one server needs no pid file
 }
 _base_wait_server(){ # <i> → 0 when server i>0 answers on its port; patient while its own process lives (3.20.0)
-  local i="$1" pid port waited=0 limit="${BASE_START_WAIT:-600}" tries="${BASE_START_TRIES:-}"
+  local i="$1" pid port waited=0 half=0 limit="${BASE_START_WAIT:-600}" tries="${BASE_START_TRIES:-}"
   [ -n "$tries" ] && limit=$((tries * 2))
   port="$(_base_server_port "$i")"; pid="$(cat "$(_base_server_state)/comfyui-gpu$i.pid" 2>/dev/null || true)"
   while [ "$waited" -lt "$limit" ]; do
     if curl -sf --max-time 5 "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1; then echo "  server $i up on 127.0.0.1:$port"; return 0; fi
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then echo "  server $i: its process is gone after $waited s"; return 1; fi
-    sleep 1; waited=$((waited + 1))          # 3.26.0: every second (was 2): a closed port answers at once, so asking costs nothing
+    sleep 0.5; half=$((half + 1)); waited=$((half / 2))
   done
   return 1
 }
@@ -377,11 +388,14 @@ _base_wait_comfy(){ # [grace s] → 0 when HOSTPORT answers; patient while a Com
   # grace (3.0.3): how long no process at all still means "not started yet" rather than "died". A start through the boot
   # unit runs sshd, JupyterLab and the extensions first, so ComfyUI appears seconds after the unit does, not at once.
   # 3.20.0 _BASE_WAIT_PID: server 0's own pid, when N servers run; then only that process counts as alive
-  local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}" alive
+  local grace="${1:-0}" seen=0 tries="${BASE_START_TRIES:-}" waited=0 limit="${BASE_START_WAIT:-600}" alive half=0
   [ -n "$tries" ] && limit=$((tries * 2))            # older callers (and the suite) size it in 2 s tries
+  # 3.27.0: asked every half second (every second since 3.26.0, every 2 s before); the process
+  # check and the progress lines keep their 2 s rhythm, and `waited` stays whole seconds
   while [ "$waited" -lt "$limit" ]; do
-    sleep 1; waited=$((waited + 1))          # 3.26.0: every second (was 2): the start is seen up to a second sooner
-    if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited s"; return 0; fi
+    sleep 0.5; half=$((half + 1)); waited=$((half / 2))
+    if curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1; then echo "  up after $waited$([ $((half % 2)) = 1 ] && echo .5) s"; return 0; fi
+    [ $((half % 4)) -eq 0 ] || continue
     if [ -n "${_BASE_WAIT_PID:-}" ]; then alive="$(kill -0 "$_BASE_WAIT_PID" 2>/dev/null && echo 1 || true)"
     else alive="$(_base_comfy_pids 2>/dev/null || true)"; fi
     if [ -n "$alive" ]; then seen=1

@@ -163,6 +163,7 @@ _base_restart_proven(){ # _base_restart_comfy; when the import check rode along 
   local off rc=0
   if [ "${BASE_IMPORT_DEFERRED:-0}" != "1" ]; then _base_restart_comfy; return $?; fi
   off="$(_base_log_size "$COMFY_LOG")"
+  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then off="${BASE_EARLY_OFF:-$off}"; fi   # 3.27.0: that start's own slice
   _base_restart_comfy || rc=$?
   BASE_IMPORT_DEFERRED=0
   _base_tmp; local log="$BASE_TMPD/import_check.log"
@@ -196,6 +197,11 @@ _base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactl
   # one holding :8188 and 34 GB of VRAM. Where the unit owns ComfyUI the restart goes through the unit, so the server
   # is always the unit's and a unit restart replaces it. BASE_RESTART_VIA says which way it went (unit | direct).
   BASE_RESTART_VIA=direct
+  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then         # 3.27.0: started beside the downloads, and nothing it reads at start moved
+    BASE_EARLY_STATE=used; BASE_RESTART_VIA=early
+    echo "  the start made beside the model downloads (nothing it reads at start has changed since)"
+    _base_wait_spawned; return
+  fi
   if _base_boot_unit_owns; then
     echo "  through the boot unit: systemctl stop, then start, comfy-base-boot (JupyterLab restarts with it)"
     if _base_root systemctl stop comfy-base-boot.service; then
@@ -209,6 +215,85 @@ _base_restart_comfy(){ # 3.0.3: stop every ComfyUI on this machine, bring exactl
   fi
   _base_stop_comfy || return 1
   _base_start_comfy
+}
+# ---------------------------------------------------------------- 3.27.0: the first start beside the model downloads
+# A first install (no ComfyUI answering, BASE_RESTART=1) used to start ComfyUI only after everything else: the models join,
+# prune, sync, the post-models hook, hygiene. The start is a cold one (16 s on a B200 on 2026-10-17: Python, torch, CUDA,
+# ComfyUI's own nodes; the custom nodes under 1 s), and nothing in the model stages needs it, nor it them: ComfyUI's file
+# lists re-check their folders, so a model that lands after the start is listed without one. So the start goes first,
+# right after pkg_pre_models, and base_restart waits for it at its old place; the import check rides it as before (3.15.0).
+# What ComfyUI reads ONCE, at start, must be final before it: the launch args (hygiene, so hygiene runs first), the
+# extra_model_paths.yaml (a package registers its folders from pkg_hygiene, which hygiene calls), the custom_nodes
+# (a MODELS row that delivers code, a custom_nodes/ row, is waited for), the Python packages, the ComfyUI tree. All of it
+# is fingerprinted at the start; if any of it moved by base_restart, the early server is stopped and started again
+# exactly as before, so the worst case is today's single start plus a wasted one. BASE_EARLY_LAUNCH=0 turns it off.
+_base_launch_inputs_sum(){ # a fingerprint of everything ComfyUI reads only at start
+  local cn="${CN:-$COMFY/custom_nodes}"
+  {
+    echo "comfy ${COMFY_NEW:-} py ${BASE_PY_MOVED:-0}"
+    _base_launch_args 2>/dev/null || true
+    cat "${EXTRA_YAML:-$COMFY/extra_model_paths.yaml}" 2>/dev/null || true
+    cat "${ARGS_FILE:-/nonexistent}" 2>/dev/null || true
+    # each pack folder, and the .py files at its top (where a custom_nodes/ MODELS row lands); never __pycache__,
+    # which the running server itself writes
+    { find -L "$cn" -mindepth 1 -maxdepth 1 -not -name __pycache__ 2>/dev/null; find -L "$cn" -mindepth 2 -maxdepth 2 -name '*.py' 2>/dev/null; } \
+      | while IFS= read -r f; do printf '%s %s\n' "$f" "$(wc -c < "$f" 2>/dev/null | tr -d ' ')"; done | LC_ALL=C sort
+  } | cksum
+}
+_base_code_rows_landed(){ # [wait s] → 0 when every MODELS row that delivers code (custom_nodes/…) is on disk at its declared size
+  local wait="${1:-60}" row rel dest bytes t=0 missing
+  while :; do
+    missing=""
+    for row in ${MODELS[@]+"${MODELS[@]}"}; do
+      rel="$(_base_dest_rel "$row")"
+      case "$rel" in custom_nodes/*) ;; *) continue;; esac
+      dest="$(_base_dest_path "$rel")"; bytes="$(echo "$row" | cut -d'|' -f6)"
+      if [ ! -f "$dest" ]; then missing="$rel"; break; fi
+      if [[ "$bytes" =~ ^[0-9]+$ ]] && [ "$bytes" -gt 0 ] && [ "$(wc -c < "$dest" | tr -d ' ')" != "$bytes" ]; then missing="$rel"; break; fi
+    done
+    [ -z "$missing" ] && return 0
+    [ "$t" -ge "$wait" ] && { note "not started early: $missing (code a MODELS row delivers) is not on disk yet"; return 1; }
+    sleep 1; t=$((t + 1))
+  done
+}
+_base_launch_early(){ # after pkg_pre_models: a first install's start, now, beside the downloads (see above); base_restart waits
+  BASE_EARLY_STATE=""; BASE_EARLY_DONE=0
+  [ "${BASE_EARLY_LAUNCH:-1}" = "1" ] && [ "$BASE_DRY" != "1" ] && [ "$BASE_NO_NET" != "1" ] && [ "${BASE_SEED:-0}" != "1" ] || return 0
+  case "$BASE_VENV_RESULT" in failed*|rolled*) return 0;; esac
+  [ -x "$PY" ] || return 0
+  _base_import_rides_launch || return 0              # exactly the first-install case: BASE_RESTART=1 and no server answering
+  _base_boot_unit_owns && return 0                   # a unit-owned server starts through the unit, at the end, as before
+  # Loopback only: until boot install starts the app ports (after base_models and base_prune), nothing outside the machine
+  # reaches a 127.0.0.1 server, so no prompt can meet a half-filled snapshot folder or a file prune is moving. ComfyUI binds
+  # loopback on every machine since 3.14.0; this keeps the early start from ever being the exception.
+  case "$(_base_comfy_listen)" in 127.*|localhost|::1) ;; *) return 0;; esac
+  hdr "COMFYUI · started now, beside the model downloads (BASE_EARLY_LAUNCH=0 starts it after them)"
+  BASE_EARLY_DONE=1                                  # the import check and hygiene below are not repeated at their old place
+  base_import_check || true
+  _base_own_packs_judge "${BASE_TMPD:-/nonexistent}/import_check.log" || true
+  base_hygiene || true
+  [ "${BASE_BLOCK_RESTART:-0}" != "1" ] || { note "not started early: the import check stopped the start"; return 0; }
+  [ "${BASE_IMPORT_DEFERRED:-0}" = "1" ] || return 0
+  _base_code_rows_landed "${BASE_EARLY_CODE_WAIT:-60}" || return 0
+  _base_stop_comfy || return 0
+  BASE_EARLY_OFF="$(_base_log_size "$COMFY_LOG")"
+  BASE_EARLY_SUM="$(_base_launch_inputs_sum)"
+  _base_spawn_comfy || return 0
+  BASE_EARLY_STATE=launched
+  ok "ComfyUI is starting; the install waits for it after the models (its log: $COMFY_LOG)"
+}
+_base_early_decide(){ # at base_restart: reuse the early start when nothing it reads at start moved, else stop it
+  [ "${BASE_EARLY_STATE:-}" = "launched" ] || return 0
+  if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then
+    echo "  the early start is stopped: a check after it blocks the start"; _base_stop_comfy || true; BASE_EARLY_STATE=""; return 0
+  fi
+  if [ "$(_base_launch_inputs_sum)" = "${BASE_EARLY_SUM:-}" ]; then BASE_EARLY_STATE=reuse; return 0; fi
+  echo "  something ComfyUI reads at start changed after the early start (the args, extra_model_paths.yaml, custom_nodes, Python packages): it starts again"
+  BASE_EARLY_STATE=stale
+}
+_base_early_abandon(){ # a run that ends before base_restart leaves no server it started early behind
+  [ "${BASE_EARLY_STATE:-}" = "launched" ] || return 0
+  _base_stop_comfy >/dev/null 2>&1 || true; BASE_EARLY_STATE=""
 }
 _base_restart_hint(){ # the exact commands that restart ComfyUI by hand, for the hand-off
   local pids
@@ -239,8 +324,10 @@ base_restart(){ # reports what needs a restart and prints the exact launch line;
   # 3.3.0: Python packages this run moved (the newest pass, a repaired module): the running server has the old ones loaded
   if [ "${BASE_PY_MOVED:-0}" -gt 0 ] 2>/dev/null; then BASE_RESTART_WHY+=("$BASE_PY_MOVED Python package(s) moved; the running server still has the old ones loaded"); fi
   if [ "${BASE_IMPORT_DEFERRED:-0}" = "1" ]; then BASE_RESTART_WHY+=("the import check rides this start (3.15.0)"); fi
+  _base_early_decide
   local live=0
   curl -sf --max-time 5 "http://$HOSTPORT/system_stats" >/dev/null 2>&1 && live=1
+  if [ "${BASE_EARLY_STATE:-}" = "reuse" ]; then live=0; fi   # 3.27.0: the server answering is this run's own early start
   if [ "$live" = 0 ]; then
     if [ "${BASE_BLOCK_RESTART:-0}" = "1" ]; then miss "do NOT start ComfyUI — the import check failed; fix that first"; BASE_RESTART_RESULT="do not start (import check failed)"; BASE_RESTART_NEEDED=1; return 0; fi
     if [ "$BASE_RESTART" = "1" ]; then       # opting in means a running server at the end, whether or not one was running before (2.0.11)

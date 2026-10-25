@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.26.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.27.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -500,7 +500,9 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   quota's count. Inter-op threads, the GPU and CUDA kernels are unaffected. On a machine with no quota torch keeps its
   own default (the physical cores it sees), the right number there.
 - Hooks, called if defined, dry-run aware via `$BASE_DRY`: `pkg_pre_venv pkg_post_venv pkg_pre_models
-  pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`, and `pkg_cmd_<name>` per
+  pkg_post_models pkg_hygiene pkg_import_check pkg_post_install pkg_summary`. 3.27.0: register model folders
+  (`_base_yaml_register`) from `pkg_hygiene`, not `pkg_post_models`: hygiene runs before a first install's early start, and
+  ComfyUI reads `extra_model_paths.yaml` only at start, so a folder registered later costs a second start. And `pkg_cmd_<name>` per
   `PKG_COMMANDS` row `name|function|help`. A failing hook fails the run. A package whose `pkg_post_venv` compiles
   something (SageAttention) is listed for re-run after any venv rebuild.
 - `PACKS` rows: `dir|url|sha|cnr_id|why[|branch]`: `sha` is 40 hex, the last-tested record (every run takes the pack to
@@ -603,7 +605,8 @@ background (3.11.0, below)] → the venv snapshot → `pkg_pre_venv` → venv �
 `pkg_post_venv` → own packs (VENDORED_PACKS mirrored from the zip, 3.2.0) → packs pip (the derived, pin-free set) → Comfy
 MCP → newest (every package still behind forced to its newest; 3.3.0: each force is carried as a floor, `state/lift/forced.txt`,
 so the next run's first resolve keeps it; a force a package refused is remembered in `refused.tsv` and tried again only when
-either version moves) → `pkg_pre_models` → [join the model downloads] →
+either version moves) → `pkg_pre_models` → [3.27.0, a first install (`BASE_RESTART=1`, no server answering): the import
+check, hygiene, then ComfyUI started NOW, beside the downloads; base_restart waits for it below] → [join the model downloads] →
 models (one index over the volume; a staged run stands in for the `MODELS_LATER` rows; `BASE_FETCH_JOBS` files at once; move on the same device else copy-verify-delete; hf-xet for the Hub;
 3.25.0: Civitai, and a GitHub file of `BASE_RANGE_MIN_MB` (256) or more, over `BASE_RANGE_CONNS` (16) connections, hashed as
 they land (`py/fetch_ranges.py`); curl for a smaller GitHub file; disk gate first; one line per file in
@@ -866,6 +869,24 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.27.0: a first install starts ComfyUI beside its model downloads, not after them (2026-10-25). On 2026-10-17 the App's
+  cold start (16 s on a B200: Python, torch, CUDA and ComfyUI's own nodes; the custom nodes under 1 s) came after the
+  models join (30 s), prune, sync, the post-models hook, the import check and hygiene, though nothing in those needs a
+  server and the server needs none of them: ComfyUI's file lists re-check their folders, so a model that lands after the
+  start is listed. Now, when no server answers and `BASE_RESTART=1` (the case where the import check already rides the
+  launch, 3.15.0), the import check and hygiene run right after `pkg_pre_models` and ComfyUI is started there; `base_restart`
+  waits for that start at its old place and judges its imports from its own log slice. What ComfyUI reads only at start
+  (the launch args, `extra_model_paths.yaml`, the custom_nodes folders and their top-level .py files, the ComfyUI tree,
+  moved Python packages) is fingerprinted at the start; if any of it changed by the restart, the early server is stopped
+  and started again exactly as before, so the worst case is the old single start plus a wasted one. A MODELS row that
+  delivers code (`custom_nodes/<Pack>/x.py`) is waited for at its declared size (`BASE_EARLY_CODE_WAIT`, 60 s) before the
+  start; a run that stops before its restart stops the server it started; a boot-unit host starts through the unit at the
+  end, as before. The early server listens on 127.0.0.1 (ComfyUI always does since 3.14.0), and the app ports that front
+  it start at boot install, after base_models and base_prune, so no prompt can reach it while a snapshot
+  folder fills or prune moves a file. The server is asked whether it is up every 0.5 s (every second since 3.26.0). `BASE_EARLY_LAUNCH=0` keeps the old order.
+  A package that registers model folders from `pkg_post_models` (video-replacer-minimax-h3 5.9.0 did; 5.9.1 moved them) gets the second
+  start until it moves those lines to `pkg_hygiene`. Expected: up to 16 s less pod to App ready, capped by the join's
+  length. Exercised by the unit tier's stand-ins only (no pod).
 - 3.26.0: the Python side of a fresh install (Paul's priority 3, install speed, 2026-10-25). Read from the last Video
   Replacer pod (yswh3tkypxhxev, `runpod/comfyui:1.4.7-cuda13.0`, base 3.20.0) and the code: VENV's 116 s held the uv
   picks (about 14 uv compiles, measured at about 1 s each cold and near 0 warm, so a few seconds in all), 4.1 GB of

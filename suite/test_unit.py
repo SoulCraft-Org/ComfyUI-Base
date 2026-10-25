@@ -2849,6 +2849,84 @@ def test_unit_restart_opt_in_starts_a_server_when_none_runs(tmp_path):
     assert "R=started" not in r.stdout and not log.exists() and "import check failed" in r.stdout, r.stdout + r.stderr
 
 
+# 3.27.0: a first install starts ComfyUI beside its model downloads; base_restart waits for that start at its old place
+_EARLY = ('PKG_DIR=/nonexistent; WF_NAME=w.json; base_env_setup; base_discover quiet; BASE_NO_NET=0; BASE_DRY=0; PY="%s"; COMFY_LOG="%s"; '
+          'BASE_START_TRIES=3; BASE_RESTART=1; BASE_VENV_RESULT=built; '
+          'base_import_check(){ BASE_IMPORT_DEFERRED=1; echo IMPORTCHECK; }; base_hygiene(){ echo HYGIENE; }; _base_own_packs_judge(){ :; }; '
+          '_base_import_packs(){ :; }; _base_import_result_ok(){ :; }; ')
+
+
+def _starts(log):
+    return log.read_text().count("python argv:") if log.exists() else 0
+
+
+def test_unit_a_first_install_starts_comfyui_beside_the_downloads_and_the_restart_adopts_that_start(tmp_path):
+    """2026-10-17: ComfyUI's cold start (16 s on a B200) came after the models join, prune, sync, the post-models hook and
+    hygiene, though nothing in those needs it. The start now goes right after pkg_pre_models, the import check and hygiene
+    just before it (ComfyUI reads the args at start), and base_restart waits for that same start: ONE start in all."""
+    _pod(tmp_path); bin_, log = _launch_stubs(tmp_path)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_}
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; echo "S=$BASE_EARLY_STATE D=$BASE_EARLY_DONE"; MODEL_DL=(one); base_restart; '
+              'echo "R=$BASE_RESTART_RESULT VIA=$BASE_RESTART_VIA FAILED=${#BASE_FAILED[@]}"', env=env)
+    out = r.stdout
+    assert "S=launched D=1" in out and "R=started VIA=early FAILED=0" in out, out + r.stderr
+    assert out.index("IMPORTCHECK") < out.index("HYGIENE") < out.index("main.py"), out
+    assert "beside the model downloads" in out and _starts(log) == 1, (out, log.read_text())
+
+
+def test_unit_an_early_start_starts_again_when_what_comfyui_reads_at_start_changed(tmp_path):
+    """extra_model_paths.yaml, the args and the custom_nodes are read once, at start. A package that registers a folder
+    after the early start (from pkg_post_models, not pkg_hygiene) gets today's behaviour: the server is started again."""
+    _pod(tmp_path); bin_, log = _launch_stubs(tmp_path)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_}
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; printf "pkg:\\n    text_cond: /x\\n" > "$COMFY/extra_model_paths.yaml"; MODEL_DL=(one); base_restart; '
+              'echo "R=$BASE_RESTART_RESULT VIA=$BASE_RESTART_VIA"', env=env)
+    assert "starts again" in r.stdout and "VIA=direct" in r.stdout and _starts(log) == 2, r.stdout + r.stderr
+    # a model that lands after the start changes nothing it reads at start: adopted, one start
+    log.unlink(); (tmp_path / "up").unlink()
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; mkdir -p "$M/loras"; echo x > "$M/loras/late.safetensors"; MODEL_DL=(one); base_restart; echo "VIA=$BASE_RESTART_VIA"', env=env)
+    assert "VIA=early" in r.stdout and _starts(log) == 1, r.stdout + r.stderr
+
+
+def test_unit_an_early_start_waits_for_code_a_models_row_delivers_and_can_be_turned_off(tmp_path):
+    """A MODELS row may deliver code (custom_nodes/<Pack>/x.py, 5.9.0's viggle_turbo.py): a start before it lands would
+    import the pack without it. Such a row is waited for, at its declared size; past the wait, no early start (today's
+    order). BASE_EARLY_LAUNCH=0 keeps today's order outright, and a run that stops before its restart stops the server."""
+    _pod(tmp_path); bin_, log = _launch_stubs(tmp_path)
+    env = {"BASE_FAKE_ROOT": str(tmp_path), "PATH": "%s:/usr/bin:/bin" % bin_}
+    row = 'MODELS=("custom_nodes|PackZ||z.py|https://example.invalid/z.py|10||code"); BASE_EARLY_CODE_WAIT=0; '
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") + row + '_base_launch_early; echo "S=[$BASE_EARLY_STATE]"', env=env)
+    assert "S=[]" in r.stdout and "custom_nodes/PackZ/z.py" in r.stdout and _starts(log) == 0, r.stdout + r.stderr
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") + row +
+              'mkdir -p "$CN/PackZ"; printf 0123456789 > "$CN/PackZ/z.py"; _base_launch_early; echo "S=[$BASE_EARLY_STATE]"', env=env)
+    assert "S=[launched]" in r.stdout, r.stdout + r.stderr
+    import time
+    for _ in range(50):                                     # the spawned stub runs in the background: let it finish first
+        if (tmp_path / "up").exists() and log.exists():
+            break
+        time.sleep(0.1)
+    log.unlink(missing_ok=True); (tmp_path / "up").unlink(missing_ok=True)
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") + 'BASE_EARLY_LAUNCH=0; _base_launch_early; echo "S=[$BASE_EARLY_STATE] D=$BASE_EARLY_DONE"', env=env)
+    assert "S=[] D=0" in r.stdout and "IMPORTCHECK" not in r.stdout and _starts(log) == 0, r.stdout + r.stderr
+    r = _bash(_EARLY % (bin_ / "python", tmp_path / "comfyui.log") +
+              '_base_launch_early; _base_stop_comfy(){ touch "%s"; }; _base_early_abandon; echo "S=[$BASE_EARLY_STATE]"' % (tmp_path / "stopped"), env=env)
+    # abandon stops quietly (the summary prints no stop line), so the stand-in leaves a mark instead of a line
+    assert (tmp_path / "stopped").exists() and "S=[]" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_the_pipeline_starts_early_after_pre_models_and_asks_for_the_server_every_half_second():
+    src = code_only((BASE / "lib" / "95-summary.sh").read_text())
+    i, j, k = src.index("_base_hook pkg_pre_models"), src.index("_base_launch_early"), src.index("_base_models_early_join || true")
+    assert i < j < k, "the early start goes after pkg_pre_models and before the models join"
+    assert "_base_early_abandon" in src[src.index("base_summary(){"):]
+    wait = code_only((BASE / "lib" / "85-launch.sh").read_text())
+    body = wait[wait.index("_base_wait_comfy(){"):wait.index("_base_wait_comfy(){") + 2000]
+    assert "sleep 0.5" in body and "sleep 2" not in body
+
+
 def test_unit_the_hand_off_line_is_runnable_as_printed(tmp_path):
     """The stage's hand-off was `cd … && nohup HF_HOME=/x python main.py …`: nohup executes "HF_HOME=/x" as a command.
     Whatever _base_start_cmd prints must run verbatim after nohup (2.0.11)."""
@@ -3303,15 +3381,16 @@ def test_unit_start_waits_while_the_process_lives_and_gives_up_when_it_dies(tmp_
 
 
 def test_unit_the_restart_is_seen_within_a_second_of_answering(tmp_path):
-    # 3.26.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing
+    # 3.26.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing.
+    # 3.27.0: every half second (the early start's wait), reported to the half second
     bin_ = tmp_path / "bin"; bin_.mkdir()
     (bin_ / "curl").write_text("#!/bin/bash\nexit 0\n"); (bin_ / "curl").chmod(0o755)
     r = _bash('HOSTPORT=127.0.0.1:8188; _base_comfy_pids(){ echo 424242; }; _base_wait_comfy; echo RC=$?', env={"PATH": "%s:/usr/bin:/bin" % bin_})
-    assert "up after 1 s" in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
+    assert "up after 0.5 s" in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
     src = (BASE / "lib" / "85-launch.sh").read_text(encoding="utf-8")
     for fn, nxt in (("_base_wait_server(){", "_base_wait_comfy(){"), ("_base_wait_comfy(){", "\n}\n")):
         body = src[src.index(fn):]; body = body[:body.index(nxt, len(fn))]
-        assert "sleep 1; waited=$((waited + 1))" in body and "sleep 2" not in body, fn
+        assert "sleep 0.5; half=$((half + 1))" in body and "sleep 2" not in body and "sleep 1;" not in body, fn
 
 
 # ---------------------------------------------------------------- T21: the two modes of 2.1.0 (a baked template image)
