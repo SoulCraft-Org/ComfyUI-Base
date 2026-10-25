@@ -3303,7 +3303,7 @@ def test_unit_start_waits_while_the_process_lives_and_gives_up_when_it_dies(tmp_
 
 
 def test_unit_the_restart_is_seen_within_a_second_of_answering(tmp_path):
-    # 3.24.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing
+    # 3.25.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing
     bin_ = tmp_path / "bin"; bin_.mkdir()
     (bin_ / "curl").write_text("#!/bin/bash\nexit 0\n"); (bin_ / "curl").chmod(0o755)
     r = _bash('HOSTPORT=127.0.0.1:8188; _base_comfy_pids(){ echo 424242; }; _base_wait_comfy; echo RC=$?', env={"PATH": "%s:/usr/bin:/bin" % bin_})

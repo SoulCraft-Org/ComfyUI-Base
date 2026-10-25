@@ -1,11 +1,11 @@
-"""unit tier, 3.24.0: the template image's head start.
+"""unit tier, 3.25.0: the template image's head start.
 
 The template image (runpod-template's ghcr comfyui-base) carries a seed built at the volume's own paths under
 /opt/comfy-seed: ComfyUI, a venv, the managed CPython it boots from, and uv's cache with every wheel of that venv
-unpacked. A podctl pod never copies the seed, so before 3.24.0 its venv downloaded and unpacked all 4.1 GB again on the
+unpacked. A podctl pod never copies the seed, so before 3.25.0 its venv downloaded and unpacked all 4.1 GB again on the
 image that already held them. A venv built on such a machine now reads those wheels, and the picks, the newest pass and
 everything else about the install are as before. Every test runs the real library against a throwaway tree."""
-import os, pathlib, subprocess, pytest
+import functools, http.server, os, pathlib, shutil, subprocess, sys, threading, zipfile, pytest
 pytestmark = pytest.mark.unit
 BASE = pathlib.Path(__file__).resolve().parents[1]
 
@@ -44,7 +44,7 @@ def test_unit_across_filesystems_the_images_wheels_are_copied_without_a_hardlink
 
 
 def test_unit_no_image_cache_leaves_the_volumes_own_cache_alone(tmp_path):
-    vol, seed, pre = _seeded(tmp_path, cache=False)                       # an image without the cache (built before 3.24.0)
+    vol, seed, pre = _seeded(tmp_path, cache=False)                       # an image without the cache (built before 3.25.0)
     r = _bash(pre + '_base_venv_image_cache; echo "UV=$UV_CACHE_DIR LINK=${UV_LINK_MODE:-default}"')
     assert "UV=%s LINK=default" % (vol / ".cache" / "uv") in r.stdout and "the image's" not in r.stdout, r.stdout + r.stderr
     # a cache that is not on the volume has no twin in the seed: it is never swapped
@@ -95,3 +95,63 @@ def test_unit_consolidate_neither_reports_nor_sizes_the_images_seed(tmp_path):
     assert "another ComfyUI tree: %s" % (root / "old" / "ComfyUI") in out, out
     assert "other venv: %s" % (root / "old" / "ComfyUI" / ".venv-cu130") in out, out
     assert "comfy-seed" not in out, out
+
+
+@pytest.mark.skipif(not shutil.which("uv"), reason="needs uv (CI's verify job has it)")
+def test_unit_the_image_cache_resolves_the_same_versions_as_a_cold_cache_never_older(tmp_path):
+    """An install change must never change the render, so the image's cache may spare downloads and nothing else. Its
+    danger is the index LISTINGS it holds from the build day: an index that sent a long max-age has uv trust them, and
+    then a package released since resolves to its old version (shown here: the unguarded cache installs demo 1.0).
+    _base_venv_image_cache drops those listings, so a build on the image freezes exactly what a cold cache does."""
+    idx = tmp_path / "idx"; (idx / "simple" / "demo").mkdir(parents=True); (idx / "files").mkdir()
+
+    def wheel(v):
+        n = "demo-%s-py3-none-any.whl" % v; di = "demo-%s.dist-info" % v
+        with zipfile.ZipFile(idx / "files" / n, "w") as z:
+            z.writestr("demo.py", "V = %r\n" % v)
+            z.writestr(di + "/METADATA", "Metadata-Version: 2.1\nName: demo\nVersion: %s\n" % v)
+            z.writestr(di + "/WHEEL", "Wheel-Version: 1.0\nGenerator: t\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+            z.writestr(di + "/RECORD", "")
+        return n
+
+    def listing(*vs):
+        (idx / "simple" / "demo" / "index.html").write_text("".join('<a href="/files/%s">%s</a>\n' % (wheel(v), wheel(v)) for v in vs))
+
+    class Index(http.server.SimpleHTTPRequestHandler):
+        def end_headers(self):
+            self.send_header("Cache-Control", "max-age=31536000, public"); super().end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Index, directory=str(idx)))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/simple" % srv.server_address[1]
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("UV_", "BASE_"))}
+
+    def uv(cache, *a):
+        return subprocess.run(["uv", *a], capture_output=True, text=True, env=dict(env, UV_CACHE_DIR=str(cache)), check=True).stdout
+
+    def build(name, cache):
+        v = tmp_path / name; uv(cache, "venv", "-q", "--python", sys.executable, str(v))
+        uv(cache, "pip", "install", "-q", "--python", str(v / "bin" / "python"), "--index-url", url, "demo")
+        return uv(cache, "pip", "freeze", "--python", str(v / "bin" / "python")).strip()
+
+    try:
+        seed = tmp_path / "seed" / ".cache" / "uv"
+        listing("1.0"); build("image-build", seed)                            # the image's build day
+        listing("1.0", "2.0")                                                 # a release since then
+        stale = tmp_path / "stale"; shutil.copytree(seed, stale, symlinks=True)
+        assert build("unguarded", stale) == "demo==1.0"                      # the danger, shown
+        cold = build("cold", tmp_path / "cold")
+        assert cold == "demo==2.0"
+        vol = tmp_path / "vol"; (vol / ".cache" / "uv").mkdir(parents=True); (vol / "ComfyUI").mkdir()
+        g = tmp_path / "guarded"; uv(tmp_path / "x", "venv", "-q", "--python", sys.executable, str(g))
+        r = subprocess.run(["bash", "-c", 'source "%s/base.sh"; BASE_PERSIST_ROOT="%s"; BASE_IMAGE_SEED="%s"; UV_CACHE_DIR="%s/.cache/uv"; VENV="%s/ComfyUI/.venv"; '
+                            '_base_venv_image_cache >/dev/null; uv pip install -q --python "%s/bin/python" --index-url %s demo && uv pip freeze --python "%s/bin/python"'
+                            % (BASE, vol, tmp_path / "seed", vol, vol, g, url, g)], capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == cold, (r.stdout, cold)                    # parity: the freeze diff is empty
+        assert not list(seed.glob("simple-v*")) and list(seed.glob("archive-v0/*")), list(seed.iterdir())
+    finally:
+        srv.shutdown(); srv.server_close()

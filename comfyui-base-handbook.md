@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.24.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.25.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -230,8 +230,9 @@ holds the interface and a recipe.
 ### 1.1 RunPod (proven)
 
 **The one command (2.0.14).** Once a pod is reachable (`podctl ensure`), the whole documented sequence is
-`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. For each item in order,
-the local zip is checked current, the volume size is recorded for the disk gate, the zip is uploaded and extracted,
+`uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<package dir>"…`. Every local zip is checked
+current first, the volume size is recorded for the disk gate, and every zip goes up in one upload (3.24.0: a zip already
+on the machine with the same size and sha256 is not sent again). Then for each item in order the zip is extracted,
 `--check` runs on the pod (non-zero stops everything), the real run goes detached (`BASE_RESTART=1` for a package;
 `--comfy-ref <ref>` for a newer ComfyUI, that install only) and is polled until `STEP RC=`, the pod's `state/logs` are
 copied to `<item>/_build/podruns/<date>/pod-logs/`, the summary block is printed, and a green run writes the pack records
@@ -666,16 +667,20 @@ nothing changed, and it stops only on what would stop the real run before that r
 suite, which would only test the server the real run is about to replace. `podctl install --base --pkg <dir>` installs
 the base and runs ONE pipeline, the package's (it already covers every stage the base's own run would); the base's suite
 runs on a machine once per base version (`state/base-suite.ok`). A retry of the same zip against the same base skips the
-Mac gate, and podctl polls every 5 s.
+Mac gate. podctl polls every 5 s, and since 3.24.0 the wait is on the machine (STEP RC is looked for once a second there),
+so the end of a step is seen within a second. Every ssh, scp and log fetch of one run shares ONE connection (3.24.0,
+ControlMaster; `PODCTL_SSH_MUX=0` turns it off).
 
-**The image's head start** (3.24.0). On the template image (`runpod-template`, `ghcr.io/soulcraft-org/comfyui-base`),
-`BASE_IMAGE_SEED` (`/opt/comfy-seed`) holds a seed built at the volume's own paths, and from that image's 3.24.0 on, uv's
+**The image's head start** (3.25.0). On the template image (`runpod-template`, `ghcr.io/soulcraft-org/comfyui-base`),
+`BASE_IMAGE_SEED` (`/opt/comfy-seed`) holds a seed built at the volume's own paths, and from runpod-template#21 on, uv's
 cache with every wheel of the seed's venv (one copy in the layer: the cache's files are hardlinks of the venv's). A podctl
 pod never copies the seed (its boot guard runs only a `boot.sh` already on the volume), so its venv used to fetch the
 4.1 GB the image already held. A venv the run must build now reads the seed's cache, the twin of the volume's
 `.cache/uv`, for the rest of the run: the wheels it holds are linked into the venv (copied across filesystems,
 `UV_LINK_MODE=copy`) instead of downloaded and unpacked, and only what moved since the image was built is fetched.
-Every pick and the newest pass run as before; a reused venv keeps the volume's own cache. The image's CPython is copied
+Every pick and the newest pass run as before, and the versions are a cold cache's: the cache's index listings from the
+build day are deleted before uv reads it, so only immutable per-file entries (metadata, unpacked wheels) are reused. A
+reused venv keeps the volume's own cache. The image's CPython is copied
 onto a volume that has none of that minor before `uv python upgrade`, which still moves it to a newer patch. The seed is
 not a second install: CONSOLIDATE neither reports nor sizes its tree and venv, and moves a pack of ours out of it into
 `custom_nodes`, where the pack pass fetches it instead of cloning it.
@@ -856,14 +861,17 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
-- 3.24.0: the Python side of a fresh install (Paul's priority 3, install speed, 2026-10-25). Read from the last Video
+- 3.25.0: the Python side of a fresh install (Paul's priority 3, install speed, 2026-10-25). Read from the last Video
   Replacer pod (yswh3tkypxhxev, `runpod/comfyui:1.4.7-cuda13.0`, base 3.20.0) and the code: VENV's 116 s held the uv
   picks (about 14 uv compiles, measured at about 1 s each cold and near 0 warm, so a few seconds in all), 4.1 GB of
   wheels in 165 packages downloaded and unpacked (the torch closure, 3.0 GB in 23 of them, from download-r2.pytorch.org
   and pypi.nvidia.com; 1.1 GB from PyPI), the verify (`import torch` 3.5 s), and the `cuda-libraries-dev-13-0` apt
   that 3.22.0 moved beside it. (1) The template image's head start (§5): a venv the run must build reads uv's cache from
   the image's seed (`$BASE_IMAGE_SEED/.cache/uv`) for the rest of the run, so the wheels the image holds are linked or
-  copied instead of fetched; the image's CPython is copied onto a volume that has none of that minor; CONSOLIDATE no
+  copied instead of fetched, and the same versions as a cold cache: its index listings (`simple-v*`, `flat-index-v*`,
+  from the build day) are dropped first, since an index sending a long max-age would have uv trust them and resolve
+  older (the unit tier shows exactly that against a local index, then the empty freeze diff with the guard); the
+  image's CPython is copied onto a volume that has none of that minor; CONSOLIDATE no
   longer reports or sizes the seed's tree and venv. The image carries the cache from runpod-template's own change of
   the same day. (2) The torch pick is answered once per run for each minor and venv backend (`_base_torch_pick`): a fresh
   venv asked twice, four or five compiles each time; a failed pick is asked again. (3) The newest pass's outdated scan
@@ -877,6 +885,22 @@ for any invocation that somehow arrives without the environment. The suite asser
   names the run's own caches, and the swap comes later, at the venv). The
   unit tier covers each (`suite/test_image_start.py`; the pick, the scan, dpkg and the poll beside their neighbours).
   No pod used.
+- 3.24.0: `podctl install` spends seconds, not most of a minute, around the package run (2026-10-25). The 2026-10-17
+  release run's "16:10 install, 395 s package run" was read as 9.5 minutes of driver overhead. It was not: the first
+  attempt died in the run script before podctl ran, the pod was stopped, fixed and resumed 11:39 later, and the install
+  clock was never re-stamped; the real `podctl install` took 277 s, and the "395 s" is the stage table's sum, which
+  counts the background stages beside the foreground (the package run's wall clock was 221 s). podctl's own share was
+  about 54 s: 46 s before the run, 8 s after. Most of it was connections: about 21 ssh handshakes, each about 11 round
+  trips (1.8 s to EU-RO-1 from the maintainer's Mac at 164 ms), because no command shared a connection. Now one
+  ControlMaster per machine carries every ssh, scp and log fetch of a run (2 round trips a command, measured 0.13 s
+  against 0.77 s); its master carries ClearAllForwardings like every command session, so it never binds the Host
+  block's forwards, and a dead master is retried once only when the session request failed before the command
+  started (a second launch would be a second install). Every zip is checked first and all of them go up in one upload
+  (probe, one scp, one check), and a zip already there with the same size and sha256 is not sent again. The poll waits
+  on the machine, so a finished step is seen within a second instead of 2.5 s later on average plus a handshake. The
+  lease is read once, and released in one round trip; the volume size is recorded once per run. A stale package zip now
+  stops before the base changes anything. Expected: about 35 s less per install to EU-RO-1, about 10 s to US-CA.
+  Exercised against the suite's stand-ins only (no pod).
 - 3.23.0: `podctl` binds no vendor port on the workstation when told not to (2026-10-24). The tunnel's local sides were
   the remote ports plus `PODCTL_TUNNEL_OFFSET` (0-1000), so every session bound 8188, 8888, 9199 and 11434 or a few
   ports above them. A workstation whose rule is that local listeners sit in each account's own block (3100-3199 for the
