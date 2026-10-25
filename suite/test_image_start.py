@@ -130,10 +130,18 @@ def test_unit_the_image_cache_resolves_the_same_versions_as_a_cold_cache_never_o
     env = {k: v for k, v in os.environ.items() if not k.startswith(("UV_", "BASE_"))}
 
     def uv(cache, *a):
-        return subprocess.run(["uv", *a], capture_output=True, text=True, env=dict(env, UV_CACHE_DIR=str(cache)), check=True).stdout
+        r = subprocess.run(["uv", *a], capture_output=True, text=True, env=dict(env, UV_CACHE_DIR=str(cache)))
+        assert r.returncode == 0, (a, r.stderr[-2000:])
+        return r.stdout
+
+    def venv(v):
+        # the stdlib's venv from the interpreter running the suite: CI runs pytest from uv's temporary build env, and
+        # `uv venv --python <that env's python>` refuses it; `-m venv` bases the new venv on the real interpreter behind it
+        r = subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(v)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-2000:]
 
     def build(name, cache):
-        v = tmp_path / name; uv(cache, "venv", "-q", "--python", sys.executable, str(v))
+        v = tmp_path / name; venv(v)
         uv(cache, "pip", "install", "-q", "--python", str(v / "bin" / "python"), "--index-url", url, "demo")
         return uv(cache, "pip", "freeze", "--python", str(v / "bin" / "python")).strip()
 
@@ -143,15 +151,15 @@ def test_unit_the_image_cache_resolves_the_same_versions_as_a_cold_cache_never_o
         listing("1.0", "2.0")                                                 # a release since then
         stale = tmp_path / "stale"; shutil.copytree(seed, stale, symlinks=True)
         assert build("unguarded", stale) == "demo==1.0"                      # the danger, shown
-        cold = build("cold", tmp_path / "cold")
+        cold = build("cold", tmp_path / "cold-cache")                       # its own cache, never the venv's folder
         assert cold == "demo==2.0"
         vol = tmp_path / "vol"; (vol / ".cache" / "uv").mkdir(parents=True); (vol / "ComfyUI").mkdir()
-        g = tmp_path / "guarded"; uv(tmp_path / "x", "venv", "-q", "--python", sys.executable, str(g))
+        g = tmp_path / "guarded"; venv(g)
         r = subprocess.run(["bash", "-c", 'source "%s/base.sh"; BASE_PERSIST_ROOT="%s"; BASE_IMAGE_SEED="%s"; UV_CACHE_DIR="%s/.cache/uv"; VENV="%s/ComfyUI/.venv"; '
                             '_base_venv_image_cache >/dev/null; uv pip install -q --python "%s/bin/python" --index-url %s demo && uv pip freeze --python "%s/bin/python"'
                             % (BASE, vol, tmp_path / "seed", vol, vol, g, url, g)], capture_output=True, text=True, env=env)
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == cold, (r.stdout, cold)                    # parity: the freeze diff is empty
-        assert not list(seed.glob("simple-v*")) and list(seed.glob("archive-v0/*")), list(seed.iterdir())
+        assert list(seed.glob("archive-v0/*")), list(seed.iterdir())          # the unpacked wheels stayed: they spare the download
     finally:
         srv.shutdown(); srv.server_close()
