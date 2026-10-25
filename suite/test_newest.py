@@ -212,6 +212,44 @@ def test_unit_a_minor_without_torch_family_wheels_costs_one_small_compile_and_no
     assert "compile 3.14 full" in calls and "compile 3.14 torch_pick" in calls, calls
 
 
+def test_unit_a_fresh_venv_asks_for_its_torch_pick_once(tmp_path):
+    """3.26.0: with no venv to read a backend from, the backend pick and then the torch pick both asked torch_pick.py about
+    the same minor, four or five uv compiles each, the second set for an answer the run already had. It is kept now,
+    its reason included (the target line still says why)."""
+    env = _uv_new_python(tmp_path); log = tmp_path / "uv.log"; env["UV_LOG"] = str(log)
+    stub = os.path.dirname(env["UV"])
+    r = _bash('base_env_setup; export PATH="%s:$PATH"; hash -r; base_discover quiet; base_venv; echo RESULT=$BASE_VENV_RESULT BACKEND=$BASE_TORCH_BACKEND' % stub,
+              env={"BASE_FAKE_ROOT": str(tmp_path), "BASE_DRY": "1", **env})
+    assert "target: Python 3.14 · torch 2.14.1+cu130 (uv --torch-backend=auto: cu130)" in r.stdout and "BACKEND=cu130" in r.stdout, r.stdout + r.stderr
+    assert log.read_text().splitlines().count("compile 3.14 torch_pick") == 1, log.read_text()
+
+
+def test_unit_a_failed_torch_pick_is_asked_again_and_a_good_one_is_not(tmp_path):
+    n = tmp_path / "runs"
+    py = _stub(tmp_path, "torch_pick", f"""\
+        echo "$*" >> "{n}"
+        [ "$(wc -l < "{n}")" -gt 1 ] || {{ echo "the index did not answer" >&2; exit 1; }}
+        echo "2.14.1 cu130"; echo "uv --torch-backend=auto: cu130" >&2
+        """)
+    r = _bash(f'SYS_PY="{py}"; _base_tmp; _base_torch_pick 3.14 "" || echo FAILED; _base_torch_pick 3.14 ""; '
+              f'_base_torch_pick 3.14 "" 2>&1; _base_torch_pick 3.14 cu132 2>/dev/null')
+    assert r.stdout.split("\n")[:5] == ["FAILED", "2.14.1 cu130", "2.14.1 cu130", "uv --torch-backend=auto: cu130", "2.14.1 cu130"], r.stdout + r.stderr
+    assert len(n.read_text().splitlines()) == 3, n.read_text()      # the failure, its retry, and the other backend; the repeat was kept
+
+
+def test_unit_the_outdated_scan_does_not_ask_the_index_about_torchs_closure(tmp_path):
+    # 3.26.0: the closure is filtered out of the answer as before, and now out of the query too
+    d = tmp_path / "bin"; d.mkdir(); log = tmp_path / "uv.log"
+    _stub(d, "uv", f"""\
+        echo "$*" >> "{log}"
+        echo '[{{"name": "torch", "version": "2.14.0", "latest_version": "2.14.1"}}, {{"name": "rich", "version": "13.0", "latest_version": "14.0"}}]'
+        """)
+    r = _bash('PY=python3; _base_torch_closure(){ printf "torch\\nnvidia-cublas\\n"; }; _base_outdated', env={"PATH": f"{d}:{os.environ['PATH']}"})
+    assert r.stdout.split() == ["rich", "13.0", "14.0"], r.stdout + r.stderr
+    args = log.read_text()
+    assert "--outdated" in args and "--exclude torch" in args and "--exclude nvidia-cublas" in args, args
+
+
 def test_unit_no_cuda_or_index_literal_and_no_pin_remains_in_the_library():
     for p in [*(BASE / "lib").glob("*.sh"), *(BASE / "py").glob("*.py")]:
         code = "\n".join(l for l in p.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#"))
@@ -732,6 +770,19 @@ def test_unit_sudo_carries_the_non_interactive_settings(tmp_path):
     _stub(d, "sudo", 'echo "SUDO $*"\n'); _stub(d, "id", 'echo 1000\n')
     r = _bash("_base_apt update", env={"PATH": f"{d}:{os.environ['PATH']}"})
     assert "SUDO -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l" in r.stdout and "--force-confold" in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_dpkg_skips_its_fsync_on_a_runpod_container_and_nowhere_else(tmp_path):
+    # 3.26.0: a RunPod container's disk is the image's again at every start, so a crash mid-unpack leaves nothing behind;
+    # a VM keeps its disk, and every fsync with it
+    d = tmp_path / "bin"; d.mkdir()
+    _stub(d, "sudo", 'echo "SUDO $*"\n'); _stub(d, "id", 'echo 1000\n')
+    path = {"PATH": f"{d}:{os.environ['PATH']}"}
+    r = _bash("BASE_HOST=runpod; _base_apt full-upgrade", env=path)
+    assert "-o Dpkg::Options::=--force-unsafe-io full-upgrade" in r.stdout and "--force-confold" in r.stdout, r.stdout + r.stderr
+    for host in ("verda", "crusoe", "local", "vm"):
+        r = _bash(f"BASE_HOST={host}; _base_apt full-upgrade", env=path)
+        assert "SUDO" in r.stdout and "--force-unsafe-io" not in r.stdout, (host, r.stdout + r.stderr)
 
 
 # ---------------------------------------------------------------- H: what the install says it put on the store

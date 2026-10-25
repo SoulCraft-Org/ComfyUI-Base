@@ -129,7 +129,20 @@ _base_python_pick(){ # → newest CPython minor whose uv pip compile resolves th
   return 1
 }
 _base_uv_platform(){ case "$(uname -m)" in aarch64|arm64) echo aarch64-unknown-linux-gnu;; *) echo x86_64-unknown-linux-gnu;; esac; }
-_base_torch_pick(){ "$SYS_PY" "$BASE_DIR/py/torch_pick.py" "$1" "${2:-}"; }   # <x.y> [venv backend] → "<torch version> <backend>" (uv --torch-backend=auto)
+_base_torch_pick(){ # <x.y> [venv backend] → "<torch version> <backend>" (uv --torch-backend=auto), its reason on stderr
+  # 3.26.0: answered once per run for each pair. A fresh venv asked twice for the same minor (the backend pick, then the
+  # torch pick after the Python pick), four or five uv compiles each time. The answer is kept in the run's temp dir, which
+  # the caller has made (_base_tmp), so a command substitution finds it too; a failed pick is not kept, so it is asked again.
+  local k="" rc=0
+  [ -n "${BASE_TMPD:-}" ] && [ -d "$BASE_TMPD" ] && k="$BASE_TMPD/torch_pick.$1.${2:-none}"
+  if [ -z "$k" ]; then "$SYS_PY" "$BASE_DIR/py/torch_pick.py" "$1" "${2:-}"; return; fi
+  if [ ! -f "$k.ok" ]; then
+    "$SYS_PY" "$BASE_DIR/py/torch_pick.py" "$1" "${2:-}" > "$k.out" 2> "$k.err" || rc=$?
+    if [ "$rc" = 0 ]; then : > "$k.ok"; fi
+  fi
+  cat "$k.out"; cat "$k.err" >&2
+  return "$rc"
+}
 
 # ---------------------------------------------------------------- ownership and stamps
 _base_venv_owner(){ # → base | none
@@ -183,6 +196,51 @@ _base_venv_boot_line(){ # [venv] → the banner's "boots from" line, judged by t
   bh="$(_base_venv_base_home "$v")"; bv="$(_base_venv_base_verdict "$v")"
   if _base_venv_base_is_persistent "$v"; then echo "  boots from   ${bh:-?} · $bv"
   else echo -e "  boots from   ${bh:-?} · ${RED}$bv; this run rebuilds the venv${NC}"; fi
+}
+
+# ---------------------------------------------------------------- 3.26.0: the template image's head start
+# The template image (runpod-template's ghcr comfyui-base) carries a seed built at the volume's own paths, under
+# BASE_IMAGE_SEED (/opt/comfy-seed): ComfyUI, a venv, the managed CPython it boots from, and since 3.26.0 uv's cache with
+# every wheel of that venv unpacked (one copy in the layer: the cache's files are hardlinks of the venv's). A venv built
+# here needs no download for anything the image holds: uv reads the image's cache and links the files (copies them,
+# across filesystems), and fetches only what moved since the image was built. A head start, never a pin: every pick
+# still runs and every package still goes to its newest. A podctl pod never copies the seed (its boot guard runs only a
+# boot.sh already on the volume), so this is the only way the image's wheels reach its venv.
+_base_image_seed(){ printf '%s' "${BASE_IMAGE_SEED:-/opt/comfy-seed}"; }
+_base_in_image_seed(){ case "$1/" in "$(_base_image_seed)"/*) return 0;; esac; return 1; }
+_base_image_twin(){ # <path on the volume> → the same path inside the image's seed; nothing for a path off the volume
+  local root="${BASE_PERSIST_ROOT:-${BASE_FAKE_ROOT:-}}"
+  [ -n "$root" ] && [ -n "$1" ] || return 0
+  case "$1/" in "$root"/*) printf '%s%s' "$(_base_image_seed)" "${1#"$root"}";; esac
+  return 0
+}
+_base_dev(){ { stat -c %d "$1" || stat -f %d "$1"; } 2>/dev/null | head -1 || true; }   # <path> → its filesystem's device number
+_base_venv_image_cache(){ # a venv about to be built: uv reads the image's warm cache instead of downloading every wheel
+  # For the rest of the run, so the packs' pass and the newest pass read it too. The volume's own cache is left as it is.
+  local c how="linked"; c="$(_base_image_twin "${UV_CACHE_DIR:-}")"
+  [ -n "$c" ] && [ "$c" != "${UV_CACHE_DIR:-}" ] && [ -d "$c/archive-v0" ] && [ -w "$c" ] || return 0
+  # The same versions as a cold cache, never older (an install must not change the render): what the cache knows about
+  # an index's LISTINGS is from the image's build day, and an index that sent a long max-age would have uv trust it. So
+  # those buckets go before uv reads the cache; every listing is fetched fresh, exactly as on a cold cache. What stays is
+  # keyed by one exact, immutable file (a wheel's metadata, its unpacked files), so it can only spare a download.
+  rm -rf "$c"/simple-v* "$c"/flat-index-v* 2>/dev/null || true
+  export UV_CACHE_DIR="$c"
+  # across filesystems a hardlink cannot work: uv would try one, warn, and copy anyway
+  if [ "$(_base_dev "$c")" != "$(_base_dev "$(dirname "$VENV")")" ]; then export UV_LINK_MODE=copy; how="copied"; fi
+  note "uv cache: the image's ($c): the wheels it holds are $how into the venv, not downloaded; only what moved since the image was built is fetched"
+}
+_base_image_python(){ # <x.y>: the image's managed CPython for that minor, copied onto the volume when the volume has none
+  local dst="${UV_PYTHON_INSTALL_DIR:-}" src d got=""
+  src="$(_base_image_twin "$dst")"
+  [ -n "$src" ] && [ -d "$src" ] || return 0
+  if ls -d "$dst"/cpython-"$1".*-* >/dev/null 2>&1; then return 0; fi      # the volume has one: uv upgrades it as usual
+  for d in "$src"/cpython-"$1".*-* "$src"/cpython-"$1"-*; do              # the full version, then uv's minor-version link
+    case "$d" in *freethreaded*) continue;; esac
+    [ -e "$d" ] || [ -L "$d" ] || continue
+    mkdir -p "$dst" && cp -a "$d" "$dst/" && got="${got:-$(basename "$d")}"
+  done
+  if [ -n "$got" ]; then note "Python $1: the image's own $got, copied onto the volume (uv still moves it to a newer patch if there is one)"; fi
+  return 0
 }
 
 # ---------------------------------------------------------------- backups, swap-aside, rollback
@@ -272,6 +330,7 @@ _base_venv_build(){ # <python-mm> <torch> → sets BASE_VENV_RESULT to built | r
   local pymm="$1" tv="$2" ts rv step_fail=0 had=0 backend="${BASE_TORCH_BACKEND:?the torch backend is picked first}"
   ts="$(_base_ts)"
   [ -d "$VENV" ] && had=1 || true
+  _base_venv_image_cache                     # 3.26.0: the image's wheels, when the image carries them
   CONSTRAINTS="$BASE_STATE/constraints-torch.txt"
   _base_reqlift >/dev/null 2>&1 || true
   # (0) prove the whole set resolves BEFORE the old venv is touched — a throwaway venv in a temp dir
@@ -412,7 +471,10 @@ base_venv(){ # the stage: reuse when the probe passes, otherwise rebuild with ro
     *"held by the torch family"*) BASE_UPSTREAM+=("CUDA: $why");; esac
   # the newest patch of the chosen minor: uv keeps the old patch (a venv elsewhere may still use it) and moves venvs
   # created through its minor-version directory to the new one without a rebuild
-  if [ "$BASE_DRY" != "1" ]; then uv python upgrade "$pymm" >/dev/null 2>&1 || uv python install "$pymm" >/dev/null 2>&1 || true; fi
+  if [ "$BASE_DRY" != "1" ]; then
+    _base_image_python "$pymm"               # 3.26.0: the image's copy first, so a newer patch is the only download
+    uv python upgrade "$pymm" >/dev/null 2>&1 || uv python install "$pymm" >/dev/null 2>&1 || true
+  fi
   owner="$(_base_venv_owner)"
   # ---- reuse when the probe passes (the probe is HARD on a runtime-written interpreter, so a poisoned venv never reuses)
   if [ -x "$PY" ] && _base_venv_probe "$pymm" "$tv"; then

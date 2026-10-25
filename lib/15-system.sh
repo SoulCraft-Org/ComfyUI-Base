@@ -36,8 +36,12 @@ _base_root(){ # <VAR=val ...> <cmd ...>: as root; `env` carries the variables th
   if [ -n "${BASE_FAKE_APT:-}" ] || [ "$(id -u)" = "0" ]; then env "$@"; else sudo -n env "$@"; fi
 }
 _base_apt(){ # apt-get, never interactive, never restarting a service behind our back, waiting for another apt's lock
+  # 3.26.0: on RunPod dpkg skips its fsync per unpacked file (--force-unsafe-io). What that guards against is a crash in
+  # the middle of an unpack leaving the OS broken on disk; a RunPod container's disk is the image's again at every start,
+  # so nothing of the sort outlives the crash. A VM keeps its disk, and its dpkg keeps every fsync.
+  local io=(); if [ "${BASE_HOST:-}" = runpod ]; then io=(-o Dpkg::Options::=--force-unsafe-io); fi
   _base_root DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 \
-    apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=600 "$@"
+    apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=600 ${io[@]+"${io[@]}"} "$@"
 }
 _base_running_driver(){ # → the driver the running kernel has loaded, "mismatch" when NVML says the libraries moved, "" with none
   command -v nvidia-smi >/dev/null 2>&1 || { echo ""; return 0; }

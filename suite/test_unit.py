@@ -3302,6 +3302,18 @@ def test_unit_start_waits_while_the_process_lives_and_gives_up_when_it_dies(tmp_
     assert "RC=1" in r.stdout and "after 4 s" in r.stdout, r.stdout
 
 
+def test_unit_the_restart_is_seen_within_a_second_of_answering(tmp_path):
+    # 3.26.0: the wait asks every second, not every two; a closed port answers at once, so asking costs nothing
+    bin_ = tmp_path / "bin"; bin_.mkdir()
+    (bin_ / "curl").write_text("#!/bin/bash\nexit 0\n"); (bin_ / "curl").chmod(0o755)
+    r = _bash('HOSTPORT=127.0.0.1:8188; _base_comfy_pids(){ echo 424242; }; _base_wait_comfy; echo RC=$?', env={"PATH": "%s:/usr/bin:/bin" % bin_})
+    assert "up after 1 s" in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
+    src = (BASE / "lib" / "85-launch.sh").read_text(encoding="utf-8")
+    for fn, nxt in (("_base_wait_server(){", "_base_wait_comfy(){"), ("_base_wait_comfy(){", "\n}\n")):
+        body = src[src.index(fn):]; body = body[:body.index(nxt, len(fn))]
+        assert "sleep 1; waited=$((waited + 1))" in body and "sleep 2" not in body, fn
+
+
 # ---------------------------------------------------------------- T21: the two modes of 2.1.0 (a baked template image)
 
 def test_unit_noninteractive_means_no_tty_and_every_prompt_takes_its_default():
