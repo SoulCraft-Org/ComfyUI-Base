@@ -39,11 +39,33 @@ the one `host = "..."` of the `brand.toml` files in the repository this base sit
 `--provider` required), else `runpod`. An experimental provider says so once per run on stderr.
 
 `PODCTL_TUNNEL_OFFSET` (default 0) shifts every local port the driver forwards: ComfyUI 8188, JupyterLab 8888,
-9199 and 11434 all move together. With one GPU per workflow every machine serves 8188, so the second machine of
+9199 and each app port all move together. With one GPU per workflow every machine serves 8188, so the second machine of
 a fleet needs an offset or its tunnel silently reaches the first one. It is a fact about your fleet, not about
 the base or the host, so it lives beside `PODCTL_HOST` in your environment: `export PODCTL_HOST=gpu-two` and
 `export PODCTL_TUNNEL_OFFSET=1`. A value that is not a whole number in 0-1000 is refused rather than read as 0,
-because 0 is the collision it was set to avoid. `PODCTL_HOST` still
+because 0 is the collision it was set to avoid.
+
+`PODCTL_TUNNEL_BASE` (unset by default) is for a workstation that keeps its local listeners in a block of its own
+and the vendors' numbers (8188, 8888, 9199) empty, which no offset can reach. Set it to the first port of a ten-port
+run inside your block and every local side moves there; the remote ports stay where they are. Machine N of the fleet
+(`PODCTL_TUNNEL_OFFSET=N`) takes `base+10N` to `base+10N+9`:
+
+| local | remote | what |
+|---|---|---|
+| `base+10N` | 8188 | ComfyUI |
+| `base+10N+1` | 8888 | JupyterLab |
+| `base+10N+2` | 9199 | a package's metrics exporter, if it runs one |
+| `base+10N+3` … `+9` | every other port, lowest first | the machine's apps, or the ports `--port` names |
+
+Pick a base that leaves room for every machine: each machine takes 10 ports (base+10N … base+10N+9), so the whole
+fleet must fit inside your account's block, e.g. base 3150 for up to 5 machines in 3100–3199. A base like 3180 with a
+third machine would run into the next account's block. `export PODCTL_TUNNEL_BASE=3150` puts the first machine at
+3150-3159 and the second at 3160-3169. The ssh-config
+block, `podctl tunnel`, `jupyter`, `mcp --over tunnel` and `create`'s hint all print the same numbers. A value that
+is not a whole number, or that would put a machine's ten ports outside 1024-65535, is refused rather than ignored,
+and so is an eleventh port. `--port LOCAL:REMOTE` still picks a local side by hand. 11434 (Ollama's) has not been
+forwarded since 3.23.0, because no package runs an inference server on the machine; `--port 11434` forwards it, into
+the block, if one does. `PODCTL_HOST` still
 gives a session its own `Host <alias>` block; without it the alias is the provider's own name, so each host keeps its
 own block in `~/.ssh/config`.
 
