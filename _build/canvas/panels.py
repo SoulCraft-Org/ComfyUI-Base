@@ -64,7 +64,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pkg", default=os.environ.get("BASE_PKG", os.getcwd()), help="the package folder (default: the cwd)")
     ap.add_argument("--wf", default=None, help="the workflow (default: the package's '* Workflow.json', or $BASE_WF)")
-    ap.add_argument("--server", default=os.environ.get("BASE_SERVER") or "127.0.0.1:8199")
+    ap.add_argument("--server", default=os.environ.get("BASE_SERVER") or f"127.0.0.1:{os.environ.get('TESTBED_PORT') or 8199}")
     ap.add_argument("--out", default=None, help="default <pkg>/_build/snapshots/panels.json")
     a = ap.parse_args()
     spec, files = load_spec(a.pkg)

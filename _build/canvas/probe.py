@@ -48,7 +48,7 @@ JS_PROMPT = """async (state) => {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pkg", default=os.environ.get("BASE_PKG", os.getcwd()))
-    ap.add_argument("--wf", default=None); ap.add_argument("--server", default=os.environ.get("BASE_SERVER") or "127.0.0.1:8199")
+    ap.add_argument("--wf", default=None); ap.add_argument("--server", default=os.environ.get("BASE_SERVER") or f"127.0.0.1:{os.environ.get('TESTBED_PORT') or 8199}")
     ap.add_argument("--states", default=None, help="default <pkg>/_build/snapshots/probe/states.json"); ap.add_argument("--out", default=None)
     a = ap.parse_args()
     spec, files = load_spec(a.pkg)

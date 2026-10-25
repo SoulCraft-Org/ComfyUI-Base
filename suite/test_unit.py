@@ -3903,3 +3903,20 @@ def test_unit_the_boot_stops_a_comfyui_it_does_not_own_before_starting_its_own()
                        capture_output=True, text=True)
     assert r.returncode == 0 and len(r.stdout.split()) == 4, r.stdout + r.stderr
 
+
+def test_build_tools_default_to_their_own_testbed_port():
+    """3.27.1: a tool's --server default is BASE_SERVER, else 127.0.0.1:$TESTBED_PORT, else 8199. A runner Space runs two
+    runners (workspace ci/hf-runner/), each with its own TESTBED_PORT (8199, 8299); a bare 8199 default reached the other
+    runner's testbed in the middle of its gate (photo-auditor's engine job, 2026-10-25)."""
+    import re
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_build")
+    bare = []
+    for d, _, files in os.walk(root):
+        for f in files:
+            if f.endswith((".py", ".sh")):
+                p = os.path.join(d, f)
+                for i, line in enumerate(open(p, encoding="utf-8", errors="replace"), 1):
+                    if re.search(r"""(default=|:-)["']?127\.0\.0\.1:8199""", line) or re.search(r"""or ["']127\.0\.0\.1:8199["']""", line):
+                        bare.append(f"{os.path.relpath(p, root)}:{i}")
+    assert bare == [], bare
+
