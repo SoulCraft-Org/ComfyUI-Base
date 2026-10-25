@@ -302,6 +302,7 @@ def mac_public_key(path=None):
 
 def _ssh_hostname():
     import subprocess
+    _mux_ready()
     r = subprocess.run(SSH_CMD + ["-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=accept-new", SSH_ALIAS, "hostname"],
                        capture_output=True, text=True)
     if r.returncode != 0:
@@ -312,9 +313,70 @@ def _ssh_hostname():
 # ---------------------------------------------------------------- stop / start / restart, upload
 
 
-SSH_CMD = ["ssh", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"]
-SCP_CMD = ["scp", "-q", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"]
+# 3.24.0: ONE ssh connection per machine, not one per command. Every ssh_run, scp and log fetch opened its own, and a
+# handshake costs about 11 round trips: 1.8 s to EU-RO-1 from this Mac (164 ms, measured), about 21 of them per
+# `install`, which was most of the 54 s the 2026-10-17 run spent around its package run. Multiplexed, a command costs
+# 2 round trips (0.13 s against 0.77 s to GitHub's sshd, measured). The master is made by whichever command comes first
+# and carries ClearAllForwardings like every command session, so it never binds the Host block's LocalForwards; the
+# tunnel is its own session (-F /dev/null) and is untouched. %C hashes host, port and user, so a new pod, or a new
+# mapping after a start, gets its own master. A unix socket path holds at most 103 bytes on macOS, so a home too deep
+# for <dir>/%C runs unmultiplexed, as before. PODCTL_SSH_MUX=0 turns it off.
+SSH_MUX_PERSIST = 120            # seconds a master outlives its last command: run.sh's phases are seconds apart
+SSH_MUX_STALE = re.compile(r"mux_client_request_session: (?:read from master failed|session request failed)|mux_client_hello_exchange")
+
+
+def ssh_mux_opts(env=None):
+    env = os.environ if env is None else env
+    if (env.get("PODCTL_SSH_MUX") or "").strip() == "0":
+        return []
+    d = (env.get("PODCTL_SSH_MUX_DIR") or "").strip() or str(pathlib.Path.home() / ".cache" / "podctl" / "ssh")
+    if len(d) + len("/%C") + 38 > 103:
+        return []
+    return ["-o", "ControlMaster=auto", "-o", "ControlPath=%s/%%C" % d, "-o", "ControlPersist=%d" % SSH_MUX_PERSIST,
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]   # a stopped pod's master dies within a minute
+
+
+SSH_CMD = ["ssh", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"] + ssh_mux_opts()
+SCP_CMD = ["scp", "-q", "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=accept-new"] + ssh_mux_opts()
 TUNNEL_PORTS = [8188, 8888]      # ComfyUI, JupyterLab
+
+
+def _mux_ready():
+    """The ControlPath's folder (mode 700) before an ssh that may become the master; nothing when multiplexing is off."""
+    for a in SSH_CMD:
+        if a.startswith("ControlPath="):
+            d = pathlib.Path(a[len("ControlPath="):]).parent
+            try:
+                d.mkdir(parents=True, exist_ok=True); os.chmod(d, 0o700)
+            except OSError:
+                pass                     # ssh then says it cannot bind and runs the command unmultiplexed
+            return
+
+
+def mux_close(env=None):
+    """Close this alias's master now (`ssh -O exit`), best effort: before a stop or restart, so no command waits on a
+    master whose machine went away."""
+    import subprocess
+    if not any(a.startswith("ControlPath=") for a in SSH_CMD):
+        return
+    try:
+        subprocess.run(SSH_CMD + ["-O", "exit", SSH_ALIAS], capture_output=True, text=True, env=env or os.environ, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def mux_warm(env=None):
+    """Open the master in the background (a thread running `true`) so its handshake overlaps the provider's API read;
+    join it before the first real command. A no-op thread when multiplexing is off."""
+    import threading
+    def _open():
+        try:
+            ssh_run("true", env=env, timeout=30)
+        except Exception:                                    # pragma: no cover - the real command says what is wrong
+            pass
+    t = threading.Thread(target=_open if any(a.startswith("ControlPath=") for a in SSH_CMD) else (lambda: None), daemon=True)
+    t.start()
+    return t
 
 
 def tunnel_port(v):
@@ -346,10 +408,19 @@ def ssh_run(remote_cmd, env=None, timeout=None, input=None):
     `input` is fed to the remote command's stdin. That is the only way to hand a machine a SECRET: a value in
     remote_cmd becomes argv, and sshd runs a non-login command as `bash -c '<cmd>'`, so it lands in the remote
     /proc/<pid>/cmdline, which is world-readable on Linux, as well as in ps on this Mac. lib/boot.sh says the
-    same thing about JUPYTER_TOKEN: it rides the environment, never argv."""
+    same thing about JUPYTER_TOKEN: it rides the environment, never argv.
+
+    3.24.0: a master whose machine went away (stopped or restarted within SSH_MUX_PERSIST) fails the session request
+    before the command starts; that one case closes the master and runs the command once more on a fresh connection.
+    A failure after the command started is never retried: the command may have run."""
     import subprocess
-    return subprocess.run(SSH_CMD + [SSH_ALIAS, remote_cmd], capture_output=True, text=True,
-                          env=env or os.environ, timeout=timeout, input=input)
+    _mux_ready()
+    argv = SSH_CMD + [SSH_ALIAS, remote_cmd]
+    r = subprocess.run(argv, capture_output=True, text=True, env=env or os.environ, timeout=timeout, input=input)
+    if r.returncode == 255 and SSH_MUX_STALE.search(r.stderr or ""):
+        mux_close(env)
+        r = subprocess.run(argv, capture_output=True, text=True, env=env or os.environ, timeout=timeout, input=input)
+    return r
 
 
 def tunnel_argv(ports=None, host=None, port=None, key=None, user=None):
@@ -371,8 +442,28 @@ def tunnel_argv(ports=None, host=None, port=None, key=None, user=None):
     return argv + ["-p", str(int(port)), "%s@%s" % (user or SSH_USER, host)]
 
 
+def _sums_cmd(to, names, mkdir=False):
+    """The shell that prints 'size sha256  path' for each of `names` that exists under `to` (mkdir=True makes `to` first)."""
+    return "%scd %s && for f in %s; do [ -f \"$f\" ] && printf '%%s %%s  %%s\\n' \"$(stat -c %%s \"$f\")\" \"$(sha256sum \"$f\" | cut -d' ' -f1)\" \"$PWD/$f\"; done; true" % (
+        ("mkdir -p %s && " % _sq(to)) if mkdir else "", _sq(to), " ".join(_sq(n) for n in names))
+
+
+def _parse_sums(text):
+    sums = {}
+    for line in (text or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            sums[pathlib.Path(parts[2].strip()).name] = (int(parts[0]), parts[1])
+    return sums
+
+
 def upload(files, to, env=None):
-    """scp each file to <to>/ through the run's Host block, then compare size and sha256 on both sides. A mismatch fails."""
+    """Put files in <to>/ through the run's Host block, then compare size and sha256 on both sides. A mismatch fails.
+
+    3.24.0: three round trips for any number of files, and no bytes at all for a file the machine already has: one probe
+    (mkdir, then the size and sha256 of each file of that name already there), ONE scp for the files that differ, one
+    check of what was sent. A file whose size and sha256 already match is the same file, proven the same way the check
+    after a send proves it, so it is not sent again (a retry, a second install of an unchanged zip, a buyer's base zip)."""
     import hashlib
     import subprocess
     env = env or os.environ
@@ -380,29 +471,28 @@ def upload(files, to, env=None):
     for f in files:
         if not f.exists():
             raise PodctlError("no such file: %s" % f)
-    r = ssh_run("mkdir -p %s" % _sq(to), env=env)
+    local = {f.name: (f.stat().st_size, hashlib.sha256(f.read_bytes()).hexdigest()) for f in files}
+    r = ssh_run(_sums_cmd(to, local, mkdir=True), env=env)
     if r.returncode != 0:
         raise PodctlError("ssh %s mkdir failed: %s" % (SSH_ALIAS, r.stderr.strip()[-300:]))
-    r = subprocess.run(SCP_CMD + [str(f) for f in files] + ["%s:%s/" % (SSH_ALIAS, to)], capture_output=True, text=True, env=env)
-    if r.returncode != 0:
-        raise PodctlError("scp failed: %s" % r.stderr.strip()[-300:])
-    remote_cmd = "cd %s && for f in %s; do printf '%%s %%s  %%s\\n' \"$(stat -c %%s \"$f\")\" \"$(sha256sum \"$f\" | cut -d' ' -f1)\" \"$PWD/$f\"; done" % (
-        _sq(to), " ".join(_sq(f.name) for f in files))
-    r = ssh_run(remote_cmd, env=env)
-    if r.returncode != 0:
-        raise PodctlError("ssh %s sha256 failed: %s" % (SSH_ALIAS, r.stderr.strip()[-300:]))
-    remote = {}
-    for line in r.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3:
-            remote[pathlib.Path(parts[2].strip()).name] = (int(parts[0]), parts[1])
+    remote = _parse_sums(r.stdout)
+    send = [f for f in files if remote.get(f.name) != local[f.name]]
+    if send:
+        _mux_ready()
+        r = subprocess.run(SCP_CMD + [str(f) for f in send] + ["%s:%s/" % (SSH_ALIAS, to)], capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            raise PodctlError("scp failed: %s" % r.stderr.strip()[-300:])
+        r = ssh_run(_sums_cmd(to, [f.name for f in send]), env=env)
+        if r.returncode != 0:
+            raise PodctlError("ssh %s sha256 failed: %s" % (SSH_ALIAS, r.stderr.strip()[-300:]))
+        remote.update(_parse_sums(r.stdout))
     lines = []
     for f in files:
-        size, digest = f.stat().st_size, hashlib.sha256(f.read_bytes()).hexdigest()
+        size, digest = local[f.name]
         got = remote.get(f.name)
         if got != (size, digest):
             raise PodctlError("%s: size/sha256 differ after upload (local %d %s, remote %s)" % (f.name, size, digest[:12], got))
-        lines.append("ok  %10d  %s  %s/%s" % (size, digest[:12], to, f.name))
+        lines.append("ok  %10d  %s  %s/%s%s" % (size, digest[:12], to, f.name, "" if f in send else "  (already there: not sent)"))
     return "\n".join(lines)
 
 
@@ -867,9 +957,11 @@ class PodIO:
         return pathlib.Path(root) / h.hexdigest()
 
     def upload(self, files, to):
-        line = self.provider.record_volume(self.pod, env=self.env)
-        if line:
-            self.say(line)
+        if not getattr(self, "_volume_recorded", False):     # 3.24.0: once per run (an API read and an ssh each time before)
+            line = self.provider.record_volume(self.pod, env=self.env)
+            if line:
+                self.say(line)
+            self._volume_recorded = True
         self.say(upload(files, to, env=self.env))
     def remote(self, cmd):
         r = ssh_run(cmd, env=self.env)
@@ -892,6 +984,7 @@ class PodIO:
         import subprocess
         local_dir = pathlib.Path(local_dir); local_dir.mkdir(parents=True, exist_ok=True)
         pick = ("--newer %s " % _sq(newer_than)) if newer_than else ""
+        _mux_ready()
         with subprocess.Popen(SSH_CMD + [SSH_ALIAS, "tar -C %s %s-czf - ." % (_sq(remote_dir), pick)],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env) as src:
             dst = subprocess.run(["tar", "-xzf", "-", "-C", str(local_dir)], stdin=src.stdout, capture_output=True, env=self.env)
@@ -967,8 +1060,13 @@ def _run_logged(io, name, slug, inner, every=30, timeout=3 * 3600):
         io.say("STOP: could not start %s on the pod (exit %d)\n%s" % (name, rc, _tail(out + err))); return None, "", console
     io.say("  running: %s\n  console: %s" % (inner, console))
     waited, last_hdr, text = 0, "", ""
+    # 3.24.0: the wait happens ON THE MACHINE. Each poll looks for STEP RC once a second there, for up to `every` seconds,
+    # then returns the console: the end of a step is seen within a second, where a sleep here between polls saw it
+    # every/2 seconds late on average and each poll paid a connection of its own on top.
+    poll = ('f=%s; i=0; while [ "$i" -lt %d ] && ! grep -q "^STEP RC=" "$f" 2>/dev/null; do sleep 1; i=$((i+1)); done; cat "$f" 2>/dev/null'
+            % (_sq(console), max(1, int(every))))
     while True:
-        rc, out, err = io.remote("cat %s 2>/dev/null" % _sq(console))
+        rc, out, err = io.remote(poll)
         text = out
         m = STEP_RC.search(text)
         if m:
@@ -978,7 +1076,9 @@ def _run_logged(io, name, slug, inner, every=30, timeout=3 * 3600):
             last_hdr = hdrs[-1]; io.say("  %s" % last_hdr[:110])
         if waited >= timeout:
             io.say("STOP: %s did not finish within %d s — the run is still going on the pod; console: %s" % (name, timeout, console)); return None, text, console
-        io.sleep(every); waited += every
+        if rc == 255:
+            io.sleep(every)          # ssh itself failed, so nothing waited on the machine: wait here, never spin
+        waited += max(1, int(every))
 
 
 def _preflight(io, env, script):
@@ -1042,15 +1142,20 @@ def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_
     if not gpu_gate(io, io.say):
         return 1
     gpu_fit_note(io, items, io.say)
+    # 3.24.0: every zip is checked (and gated) first, then all of them go up in ONE upload: three round trips in all, not
+    # three per item, and a zip already on the machine with the same size and sha256 is not sent again. A stale package
+    # zip now stops the install before the base has changed anything on the machine.
+    zips = []
     for it in items:
-        io.say("══ %s ══" % it["name"])
         try:
-            z = it["zip"] if it.get("buyer") else io.check_zip(it["dir"])
+            zips.append(it["zip"] if it.get("buyer") else io.check_zip(it["dir"]))
             if not it.get("buyer") and not getattr(args_no_gate, "value", False) and hasattr(io, "gate"):
                 io.gate(it["dir"], io.say)
         except PodctlError as e:
             io.say("STOP: %s" % e); return 1
-        io.upload([z], pkgs_dir())
+    io.upload(zips, pkgs_dir())
+    for it, z in zip(items, zips):
+        io.say("══ %s ══" % it["name"])
         if it["kind"] == "base":
             rc, out, err = io.remote("cd " + _sq(pkgs_dir()) + " && python3 -m zipfile -e %s ." % _sq(z.name))
         else:
@@ -1344,6 +1449,7 @@ def cmd_runner(prov, args):
 
 def cmd_stop(prov, args):
     runner_off(args.pod)
+    mux_close()
     print(prov.stop(args.pod, wait=args.wait))
 
 
@@ -1361,6 +1467,7 @@ def cmd_deploy(prov, args):
 
 
 def cmd_restart(prov, args):
+    mux_close()
     print(prov.restart(args.pod, wait=args.wait, ssh_config=args.ssh_config))
     if args.wait:
         print(gpu_line_over_ssh())
@@ -1537,12 +1644,15 @@ def lease_take(holder, purpose, minutes, timeout=30):
 
 
 def lease_release(holder, timeout=30):
-    """Drop the lease if it is ours (or already gone). Never removes someone else's."""
-    cur = lease_read(timeout=timeout)
-    if cur and cur.get("holder") != holder:
-        return False
-    ssh_run("rm -f %s" % LEASE_PATH, timeout=timeout)
-    return True
+    """Drop the lease if it is ours (or already gone). Never removes someone else's.
+    3.24.0: one round trip, not a read and then a remove: the machine removes the file when it is empty, holds no holder
+    at all (unreadable, which lease_parse reads as free), or names this holder exactly as lease_encode writes it
+    (`"holder": <json>`; a holder inside another field is escaped there, so it cannot match)."""
+    import json as _json, shlex
+    mine = '"holder": %s' % _json.dumps(holder)
+    r = ssh_run('f=%s; if [ ! -s "$f" ] || grep -qF -- %s "$f" || ! grep -q \'"holder"\' "$f"; then rm -f "$f"; echo released; '
+                'else echo kept; fi' % (shlex.quote(LEASE_PATH), shlex.quote(mine)), timeout=timeout)
+    return "kept" not in (r.stdout or "")
 
 
 def cmd_pins(api, args):
@@ -1702,17 +1812,20 @@ def cmd_install(prov, args):
         dirs.append(resolve_pkg_dir(root, d))
     if not dirs:
         raise PodctlError("nothing to install: --base and/or --pkg <dir>")
+    warm = mux_warm()                    # 3.24.0: the one ssh connection opens while the provider's API answers
     pod = prov.pod(args.pod)
+    warm.join()
     # The lease before the upload: an install restarts ComfyUI, which kills whatever another session is
     # rendering or training. Advisory and expiring — see the lease block above.
     args_no_gate.value = bool(getattr(args, "no_gate", False))
     me = lease_me()
-    blocked, why = lease_blocks(lease_read(), me)
+    cur = lease_read()                   # 3.24.0: read once (it was read twice, a round trip each)
+    blocked, why = lease_blocks(cur, me)
     if blocked and not getattr(args, "force_lease", False):
         print("STOP: %s\n      wait for it, message that session, or pass --force-lease" % why)
         return 3
     minutes = max(20, int(args.timeout / 60) * len(dirs) // 4 or 20)
-    minutes = lease_minutes_keeping(lease_read(), me, minutes)      # an install inside a longer chain keeps the chain's window
+    minutes = lease_minutes_keeping(cur, me, minutes)      # an install inside a longer chain keeps the chain's window
     try:
         got = lease_take(me, "install: " + ", ".join(d.name for d in dirs), minutes)
         print("lease   held by %s until %s" % (got["holder"], got["expires"]))
@@ -2379,7 +2492,7 @@ def build_parser():
     p = sub.add_parser("install", help="the whole documented sequence, one command: upload, extract, preflight, run (everything to its newest), poll, copy logs, save the pack records")
     p.add_argument("pod"); p.add_argument("--base", action="store_true", help="ComfyUI Base as step one")
     p.add_argument("--pkg", action="append", help="a package directory (repeatable, in order); relative to the project folder")
-    p.add_argument("--every", type=int, default=5, help="poll interval in seconds (3.2.0: 5; a 30 s poll cost 15 s of dead time per step on average)"); p.add_argument("--timeout", type=int, default=3 * 3600, help="per item, seconds")
+    p.add_argument("--every", type=int, default=5, help="seconds each poll may wait ON THE MACHINE for the step to end (3.24.0: the end is seen within a second either way)"); p.add_argument("--timeout", type=int, default=3 * 3600, help="per item, seconds")
     p.add_argument("--no-latest", dest="no_latest", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--comfy-ref", metavar="REF", help="ComfyUI at a ref NEWER than the newest release (master, a branch, a newer tag, a full sha), for this install only")
     p.add_argument("--no-save-pins", dest="save_pins", action="store_false", help="do not write the printed pins back after a green run")

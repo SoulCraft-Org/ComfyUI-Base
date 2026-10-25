@@ -5,7 +5,7 @@
     uv run "base/comfyui-base/_build/pod/podctl.py" status <pod>        # facts; env NAMES and placeholder verdicts, never values
     uv run "base/comfyui-base/_build/pod/podctl.py" image <pod>         # the image's entrypoint/cmd and how ensure wraps them
     uv run "base/comfyui-base/_build/pod/podctl.py" ensure <pod>        # TCP 22 · PUBLIC_KEY · the base's boot as start command · Host runpod
-    uv run "base/comfyui-base/_build/pod/podctl.py" upload <file>...    # scp to /workspace/packages, size + sha256 checked both sides
+    uv run "base/comfyui-base/_build/pod/podctl.py" upload <file>...    # to /workspace/packages, size + sha256 checked both sides; a file already there is not sent
     uv run "base/comfyui-base/_build/pod/podctl.py" stop|start|restart <pod> [--wait]
 
 The API key comes from `RUNPOD_API_KEY`, else (3.19.0, on a Mac) the login Keychain item whose account is
@@ -27,8 +27,9 @@ Tests: `base/comfyui-base/suite/test_podctl.py` (unit tier) against a fake RunPo
 
     uv run "base/comfyui-base/_build/pod/podctl.py" install <pod> --base --pkg "<brand>/packages/<name>" [--pkg …] [--every 30] [--timeout 10800] [--comfy-ref <ref>] [--no-save-pins] [--no-suite] [--env KEY=VALUE …]
 
-For each item in order: `package.py --check` locally (a stale zip stops before anything is uploaded), the volume size
-recorded for the disk gate, upload, extract, `--check` on the pod (non-zero stops), the real run detached (3.0.0:
+First every zip: `package.py --check` locally (a stale zip stops before anything is uploaded), then the volume size
+recorded for the disk gate and ONE upload of every zip (3.24.0: a probe, one scp, one size + sha256 check; a zip already
+on the machine with the same size and sha256 is not sent again). Then for each item in order: extract, `--check` on the pod (non-zero stops), the real run detached (3.0.0:
 everything to its newest; `BASE_RESTART=1` for a package; `COMFY_REF=<ref>` with `--comfy-ref`, that install only), polled
 until `STEP RC=` (progress = the run's section headers), the pod's `state/logs` copied to
 `<item>/_build/podruns/<date>/pod-logs/`, the summary block printed. Green → the pack records it printed (each pack's HEAD)
@@ -101,6 +102,11 @@ and its summary prints what the read-back says (`ENCRYPTED pod volume`, `pod vol
 
 The one ssh session that forwards ports (keepalives on, a taken port fails loudly). Every other podctl ssh/scp call
 clears forwards, so a running tunnel never makes them print "bind: Address already in use".
+
+3.24.0: those other calls share ONE connection per machine (ControlMaster under `~/.cache/podctl/ssh/`, kept 120 s after
+the last command; `stop` and `restart` close it first). A handshake to a pod is about 11 round trips; a multiplexed
+command is 2. The master is opened with ClearAllForwardings, so it never binds the Host block's forwards; the tunnel
+never uses it. `PODCTL_SSH_MUX=0` turns it off.
 
 
 ## runner — the machine as a free GitHub self-hosted runner while it is up (3.16.0, opt-in)
