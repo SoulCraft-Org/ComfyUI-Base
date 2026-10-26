@@ -659,9 +659,13 @@ _base_fetch_queue(){ # <spec>... → every spec fetched and folded, at most BASE
     return 0
   fi
   logd="$(_base_mktemp_d)"
-  note "fetching $# file(s), $n at a time, largest first (BASE_FETCH_JOBS)"
-  # 3.11.0: started largest first, so the longest transfer is never the one that waits for a slot; reported in row order
-  for i in $(i=0; for spec in "$@"; do i=$((i + 1)); IFS='|' read -r _ _ _ b _ <<<"$spec"; echo "${b:-0} $i"; done | sort -k1,1nr -k2,2n | awk '{print $2}'); do
+  # 3.11.0: started largest first, so the longest transfer is never the one that waits for a slot; reported in row order.
+  # 3.28.0: fetch-later starts smallest first (_BASE_FETCH_SMALL_FIRST=1, base_fetch_later): behind a running server every
+  # small file that lands is a lane that reads ready sooner, and the large ones overlap the rest
+  local order="-k1,1nr" first="largest"
+  if [ "${_BASE_FETCH_SMALL_FIRST:-0}" = "1" ]; then order="-k1,1n"; first="smallest"; fi
+  note "fetching $# file(s), $n at a time, $first first (BASE_FETCH_JOBS)"
+  for i in $(i=0; for spec in "$@"; do i=$((i + 1)); IFS='|' read -r _ _ _ b _ <<<"$spec"; echo "${b:-0} $i"; done | sort "$order" -k2,2n | awk '{print $2}'); do
     spec="${!i}"                                   # the i-th argument: queue order is kept for the report below
     # 3.11.0: only this queue's own jobs fill a slot or are waited for; the run has other background work by now
     while [ "$(_base_alive ${pids[@]+"${pids[@]}"})" -ge "$n" ]; do sleep 1; done
@@ -713,9 +717,11 @@ base_fetch_later(){ # the verb: fetch every pending later file, pass after pass,
   base_tokens >/dev/null 2>&1 < /dev/null || true   # HF_TOKEN from state/tokens.env when the buyer gave one; never a prompt here
   : > "$BASE_STATE/later.failed"
   local -a specs DL_DESTS
+  local _BASE_FETCH_SMALL_FIRST=1                   # 3.28.0: smallest first, in the queue (_base_fetch_queue) and in this list
   while :; do
     pass=$((pass + 1))
     pending="$(_base_later_pending | grep -vxF -f "$BASE_STATE/later.failed" || true)"
+    pending="$(printf '%s\n' "$pending" | awk -F'|' 'NF { print $4 "\t" $0 }' | sort -s -t "$(printf '\t')" -k1,1n | cut -f2-)"
     [ -n "$pending" ] || break
     before="$(printf '%s\n' "$pending" | awk 'NF' | wc -l | tr -d ' ')"
     specs=(); need=0

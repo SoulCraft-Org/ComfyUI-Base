@@ -14,10 +14,11 @@ Prints one line of TAB-separated fields:  fit=ok|below|unknown  gpu=<name>  sm=<
 `unknown` means nvidia-smi gave no answer (no GPU here, or the stand-in); it is never a warning. Exit 0 always, except
 --check. Standalone: the standard library only, like gpu_facts.py beside it, so boot.sh can run it with any python3.
 
-The rule. A GPU fits when its architecture (sm) is one a preferred class has, or when it is at least as new as the
-oldest preferred class AND has at least 90 % of the smallest preferred class's memory (a newer chip with the memory,
-before this table names it). Everything else is below. A MIG slice is never its parent class: RunPod sells
-"NVIDIA B300 SXM6 AC MIG 1g.34gb", 34 GB of a B300.
+The rule. A GPU fits when its architecture (sm) is one a preferred class has AND it has at least 90 % of that class's
+memory, or when it is at least as new as the oldest preferred class AND has at least 90 % of the smallest preferred
+class's memory (a newer chip with the memory, before this table names it). Everything else is below. A MIG slice is never
+its parent class: RunPod sells "NVIDIA B300 SXM6 AC MIG 1g.34gb", 34 GB of a B300. 3.28.0: the sm alone no longer
+decides, since sm_120 is an RTX PRO 6000's (96 GB) and an RTX 5090's (32 GB) alike.
 
 Which test lane (3.21.0). LANES lists the GPUs a smoke can run on, cheapest first (Kaggle, HF ZeroGPU, Modal's
 credits, then RunPod, which is paid), and pick_lane(peak_gib, minutes, needs) returns the first whose card holds the
@@ -38,10 +39,18 @@ import sys
 
 # class → (compute capability, the memory the vendor states in GB, what to call it). First-party: NVIDIA's CUDA GPU
 # compute-capability table (B200 10.0, B300 10.3) and the HGX B200 / B300 datasheets (180 GB / 288 GB HBM3e).
+# 3.28.0: the same table gives the GB300 10.3 and the RTX PRO 6000 Blackwell Server Edition 12.0; NVIDIA's GB300 NVL72
+# page gives the GB300 288 GB of HBM3e (a Grace CPU host: aarch64), the RTX PRO 6000 Blackwell Server Edition's datasheet
+# 96 GB of GDDR7 (nvidia-smi reads 97887 MiB). A class names a GPU for GPU_PREFER and the warnings; it never blocks.
 CLASSES = {
     "B200": ("10.0", 180, "NVIDIA B200"),
     "B300": ("10.3", 288, "NVIDIA B300"),
+    "GB300": ("10.3", 288, "NVIDIA GB300 (Grace, aarch64)"),
+    "RTX-PRO-6000": ("12.0", 96, "NVIDIA RTX PRO 6000 Blackwell Server Edition"),
 }
+# a class whose GPU_PREFER word is not how the GPU names itself: the pattern its name is read by. "RTX PRO 6000" is
+# Blackwell's alone (the Ada card is "RTX 6000 Ada Generation"); the Workstation Edition is the same chip and memory.
+NAMES = {"RTX-PRO-6000": r"(?<![A-Za-z0-9])RTX\s+PRO\s+6000(?![0-9])"}
 MEMORY_SHARE = 0.9          # nvidia-smi reports MiB, after the driver's own reservation: 180 GB reads as 183359 MiB
 
 
@@ -71,7 +80,8 @@ def class_of_name(name: str) -> str | None:
     if not name or re.search(r"\bMIG\b", name, re.I):
         return None
     for key in CLASSES:
-        if re.search(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(key), name, re.I):
+        pattern = NAMES.get(key) or r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(key)   # GB300 is never B300
+        if re.search(pattern, name, re.I):
             return key
     return None
 
@@ -91,7 +101,7 @@ def fits(prefer: list[str], cc: str | None, mib: int | None, name: str = "") -> 
         if name:
             return "ok" if class_of_name(name) in known else "below"
         return "unknown"
-    if sm_of(cc) in {sm_of(CLASSES[p][0]) for p in known}:
+    if any(sm_of(cc) == sm_of(CLASSES[p][0]) and mib * 1024 * 1024 >= MEMORY_SHARE * CLASSES[p][1] * 1e9 for p in known):
         return "ok"
     oldest = min((CLASSES[p][0] for p in known), key=_cc_key)
     smallest_gb = min(CLASSES[p][1] for p in known)

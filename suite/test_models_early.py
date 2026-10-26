@@ -186,12 +186,48 @@ def test_unit_a_run_that_ends_before_the_join_takes_its_downloads_with_it(tmp_pa
 # ---------------------------------------------------------------- the pipeline's order
 
 def test_unit_the_early_start_follows_the_os_join_and_the_join_precedes_the_model_stage():
+    """3.28.0: two call sites. The first, before the ComfyUI fetch and the pack clones, only through _base_early_first (no
+    file of the first set inside a pack, uv's bootstrap not waiting on apt); the second, after the clones and the OS join,
+    as before, and a no-op when the first already started them."""
     src = (BASE / "lib" / "95-summary.sh").read_text()
     body = src[src.index("base_install(){"):src.index("_base_use_testbed(){")]
-    start = body.index("_base_models_early_start"); join = body.index("_base_models_early_join")
+    soon = body.index("_base_models_early_start"); start = body.index("_base_models_early_start", soon + 1)
+    join = body.index("_base_models_early_join")
+    assert body.index("base_tokens") < soon < body.index("base_update_comfyui") < body.index("base_packs git")
+    assert '_base_early_first "$sysbg"; then _base_models_early_start' in body               # the sooner start is gated
     assert body.index("_base_system_join") < start < body.index("base_venv_snapshot")      # uv's bootstrap needs python3-venv from apt
     assert body.index("_base_hook pkg_pre_models") < join < body.index("base_models ||")
     assert start > body.index("base_packs git")                                             # custom_nodes/<Pack> dests are inside the packs
+    early = (BASE / "lib" / "52-models-early.sh").read_text()
+    starter = early[early.index("_base_models_early_start(){"):early.index("_base_models_early_join(){")]
+    assert starter.index('[ -n "${_BASE_EARLY_PID:-}" ]') < starter.index("_base_ensure_uv")    # started once, never twice
+
+
+def test_unit_the_early_pass_starts_before_the_clones_only_without_a_packs_file_in_the_first_set(tmp_path):
+    """3.28.0: _base_early_first is 0 (start before the ComfyUI fetch and the pack clones) only when no row the early pass
+    may take is a custom_nodes/<Pack> file (its dest is inside the pack, which the clones bring), a MODELS_LATER row of a
+    staged run not counting; and only when uv's bootstrap need not wait for the OS stage (python3-venv from apt)."""
+    _pod(tmp_path)
+    pack = "custom_nodes/Pack|||weights.bin|https://huggingface.co/x/y/resolve/main/weights.bin|4096|in the pack|"
+    cases = [((ROW_A, ROW_B), "", "0", "SOON=0"),                            # nothing inside a pack, the OS stage done
+             ((ROW_A, pack), "", "0", "SOON=1"),                             # a pack's file: after the clones, as before
+             ((ROW_A, pack), "MODELS_LATER=(weights.bin); BASE_STAGED=1;", "0", "SOON=0"),   # later: not in the first set
+             ((ROW_A, ROW_LOCAL), "", "0", "SOON=0")]                        # a LOCAL row is never downloaded
+    for rows, extra, sysbg, want in cases:
+        r = _bash('%s; %s base_env_setup; base_discover quiet; _base_early_first %s; echo "SOON=$?"' % (_models(*rows), extra, sysbg),
+                  env=_fake(tmp_path))
+        assert want in r.stdout, (rows, extra, r.stdout + r.stderr)
+    # the OS stage still runs in the background: only when uv's bootstrap can be made without apt
+    nonet = {k: v for k, v in _fake(tmp_path).items() if k != "BASE_NO_NET"}
+    okpy = tmp_path / "ensurepip-ok"; okpy.write_text("#!/bin/sh\nexit 0\n"); okpy.chmod(0o755)   # a system python with ensurepip
+    for py, want in ((str(okpy), "SOON=0"), ("false", "SOON=1")):
+        r = _bash('%s; base_env_setup; base_discover quiet; SYS_PY=%s; BASE_HOME="%s/fresh"; _base_early_first 1; echo "SOON=$?"'
+                  % (_models(ROW_A), py, tmp_path), env=nonet)
+        assert want in r.stdout, (py, r.stdout + r.stderr)
+    # a second start is a no-op that says it runs: the sooner one already did
+    r = _bash('%s; base_env_setup; base_discover quiet; _base_models_early_start; a=$?; p1=$_BASE_EARLY_PID; _base_models_early_start; b=$?;'
+              ' [ "$p1" = "$_BASE_EARLY_PID" ] && echo "SAME=1"; echo "A=$a B=$b"; _base_models_early_join >/dev/null' % _models(ROW_A), env=_fake(tmp_path))
+    assert "A=0 B=0" in r.stdout and "SAME=1" in r.stdout, r.stdout + r.stderr
 
 
 def test_unit_the_exit_trap_stops_the_early_downloads():

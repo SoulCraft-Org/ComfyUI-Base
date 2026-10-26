@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.27.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.28.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -299,6 +299,9 @@ prints the sshd snippet to paste.
 `sm_103`, 288 GB). A package says so with `GPU_PREFER="B200 B300"` (§4), and `py/gpu_fit.py` is the one table and rule
 behind it: the pod's own run warns in its banner and SUMMARY, and `podctl install` warns before it uploads, when the
 GPU is below (another architecture with less memory: an H200 at 141 GB, an RTX PRO 6000 at 96 GB). Never a stop.
+3.28.0: the table also names `GB300` (10.3 = `sm_103`, 288 GB, on a Grace aarch64 host) and `RTX-PRO-6000` (the RTX PRO
+6000 Blackwell Server Edition, 12.0 = `sm_120`, 96 GB), so a package can prefer either; and a GPU of a preferred
+architecture fits only with 90 % of that class's memory too, since `sm_120` is an RTX 5090's (32 GB) as well.
 `podctl create` takes the same order when no `--gpu` is given, and a CUDA floor of 13.0. What holds on RunPod, read 2026-10-15/16 (stock moves; the
 create reads it live):
 
@@ -451,7 +454,12 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   PKG_COMMANDS PKG_IMPORT_CHECK PKG_NO_SUITE ZIP_EXTRA VENDORED_PACKS GPU_PREFER`. `GPU_PREFER="B200 B300"` (3.8.0) names
   the GPU classes the package is tuned for, best first, from `py/gpu_fit.py`'s table (an unknown class is an invalid
   declaration); a GPU below them is a warning in the run's banner and SUMMARY and in `podctl install`, never a stop
-  (§1.1). `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
+  (§1.1). `HYGIENE_ARGS+=( "--cache-ram 10 32" )` (3.28.0) puts `--cache-ram 10 32` in the args file: the headroom in GB
+  of ComfyUI's RAM-pressure cache, the active then the inactive cache's (`comfy/cli_args.py`, at most two values). It is
+  the one row that keeps two values (any other keeps one); with no such row the base writes nothing. It is never written
+  beside `--cache-classic`, `--cache-lru` or `--cache-none` (one argparse group), nor for a ComfyUI without the flag;
+  `HYGIENE_ARGS_REMOVE` takes it out with both values, and a row of anything but one or two numbers refuses the
+  declaration. `PKG_NO_SUITE=1` is how a package that ships no `suite.py`
   says so: the run's test stage notes it, and `verify.sh` passes the package as "no suite, declared". `LOADER_CATS`
   rows (`NodeType|library category`) extend the base's map of loader node types to library folders (`lib/60-sync.sh`
   covers ComfyUI's core loaders and the shared packs'); a package whose own pack loads models declares its loaders here.
@@ -481,12 +489,15 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   install's restart and every boot alike, reads the whole folder (`lib/85-launch.sh`, `_base_launch_env`). Allowed keys:
   `OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS
   TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING RENDER_SPEED_ATTENTION` (3.18.0: the
-  attention order a node pack reads at startup, `off`, `cudnn` or `fa4`) and CTranslate2's `CT2_*`;
+  attention order a node pack reads at startup, `off`, `cudnn` or `fa4`), `RENDER_SPEED_LANCZOS_THREADS` (3.28.0: the same
+  pack's thread count for every lanczos resize in the process, the same bytes) and CTranslate2's `CT2_*`;
   a value is one word of `[A-Za-z0-9_.,:+-]`. Anything else (a path, a library, a token, a variable the base owns such
   as `HF_HOME`) refuses the package's declarations before anything downloads, and a key set twice does too.
   Precedence: the machine's own environment (a variable set on the pod, in the unit) wins; then the packages' files in
   name order, the first naming a key winning and a different later value named in the launch's output; then the
-  base's one default, `OMP_NUM_THREADS` from the container's CPU quota. `BASE_DECLARE_ONLY=1` prints
+  base's defaults, `OMP_NUM_THREADS` from the container's CPU quota and (3.28.0) `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0`
+  while the venv's `nvidia-cudnn-cu*` wheel is cuDNN 9.22 to 9.24 (NVIDIA's workaround for the default kernel cache's
+  data corruption, fixed in 9.25.1; a package cannot set it). `BASE_DECLARE_ONLY=1` prints
   `LAUNCHENV KEY=value`. A base before 3.10.0 ignores the array, so a package that depends on it sets `BASE_MIN`.
 - The CPU quota (3.10.0): when nothing sets `OMP_NUM_THREADS`, the base sets it to the CPUs the container's cgroup
   quota allows (`cpu.max`, v2, or `cpu.cfs_quota_us` / `cpu.cfs_period_us`, v1; rounded up; never more than the CPUs
@@ -868,6 +879,42 @@ was installed; and `comfy tracking disable` writes the config file (`~/.config/c
 for any invocation that somehow arrives without the environment. The suite asserts the first two.
 
 ## 10. Record
+
+- 3.28.0: the 6.0 install and GPU items (2026-10-26). Exercised against the suite's stand-ins only (no pod, no GPU).
+  - **cuDNN's default kernel cache off while it is broken.** cuDNN 9.22 added a default per-process cache of
+    runtime-compiled kernels; NVIDIA's cuDNN 9.25.1 release notes (Fixed Issues) fix "a data corruption issue in this
+    cache that could cause a segmentation fault" and say "For cuDNN 9.22-9.24, a workaround was to set the environment
+    variable `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0`". torch 2.14.1 pins 9.24.0. The launch environment now carries it
+    while the venv's `nvidia_cudnn_cu*-<version>.dist-info` reads 9.22.x to 9.24.x (`lib/85-launch.sh`
+    `_base_cudnn_version`, `_base_cudnn_cache_bug`; a directory name, no torch import), at every start and boot. It turns
+    a compile cache off and changes no kernel's result. The machine's own value wins; a package cannot set the key.
+  - **Two more GPU classes, warnings only.** `py/gpu_fit.py` names `GB300` (NVIDIA's CUDA table: 10.3; 288 GB HBM3e; a
+    Grace aarch64 host) and `RTX-PRO-6000` (the RTX PRO 6000 Blackwell Server Edition: 12.0; 96 GB GDDR7, 97887 MiB
+    read). An architecture now fits only with 90 % of its class's memory, because `sm_120` is also an RTX 5090's: a 5090
+    is below `RTX-PRO-6000`, and a 34 GB MIG slice of a B300 is below `B300` by its numbers as it already was by its name.
+    A GB300's name never reads as a B300's.
+  - **The early downloads start before the clones.** When no row of the package's first set is a `custom_nodes/<Pack>`
+    file (whose dest is inside its pack) and uv's bootstrap need not wait for the OS stage's apt (that stage already
+    ran, the bootstrap venv exists, or the system Python has ensurepip), the downloads start right after the token
+    check, before the ComfyUI fetch, the version gate, the consolidation and the pack clones (`_base_early_first`);
+    otherwise after them, as before, and the second call finds them started. Expected: those stages' length, about
+    25 to 30 s, added to the overlap. A gate that then refuses the run stops the downloads with it; they resume.
+  - **podctl's install half: fewer round trips.** 3.24.0 already carries every ssh, scp and log fetch of a run on one
+    ControlMaster (the "46 s before the run" was measured before it, on 2026-10-17). Now the lease and
+    `state/host.env` go in one round trip (`lease_take_with`), the GPU gate and the `GPU_PREFER` note ask nvidia-smi
+    once (`gpu_probe(fit=True)`), and the master persists 600 s, not 120, so the Mac's own gate (minutes on a new zip)
+    no longer lets it lapse before the upload. The lines printed are the same. Expected: two round trips (about
+    0.3 s each to EU-RO-1) and, after a gate longer than two minutes, one handshake (about 1.8 s).
+  - **fetch-later starts small files first.** Behind a running server each file that lands can make a lane ready, so
+    `base.sh fetch-later` hands its queue over by size, smallest first, and the queue starts it that way
+    (`_BASE_FETCH_SMALL_FIRST`, set by fetch-later alone); the install's own queue still starts the largest first.
+  - **A package can set `--cache-ram 10 32`, off by default** (§4). A `HYGIENE_ARGS` row kept one value per flag, so
+    `--cache-ram 10 32` landed as `--cache-ram 10`; a `--cache-ram` row now keeps its one or two values
+    (`_base_args_package`, `_base_args_cache_ram`), checked at the declaration, never beside another cache mode, and
+    `HYGIENE_ARGS_REMOVE` takes both values out. Caching only: the same nodes run on the same inputs.
+  - **`LAUNCH_ENV` allows `RENDER_SPEED_LANCZOS_THREADS`**, the Render Speed pack's thread count for every lanczos resize
+    in the process (several frames at once, the same bytes; the package's CPU byte-compares), so a package can say
+    `LAUNCH_ENV=( "RENDER_SPEED_LANCZOS_THREADS=1" )`.
 
 - 3.27.2: the size cache is compared only on the text host that photographed it (2026-10-25). The same frontend
   measured 17 of the Video Creator's nodes at other sizes on a Blacksmith ARM runner (the CI router's overflow) than

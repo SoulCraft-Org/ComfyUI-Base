@@ -109,6 +109,21 @@ def test_unit_the_largest_download_starts_first_and_the_report_keeps_row_order(t
     assert out.index("small.safetensors downloaded") < out.index("big.safetensors downloaded") < out.index("mid.safetensors downloaded")
 
 
+def test_unit_the_download_queue_starts_smallest_first_only_when_fetch_later_asks(tmp_path):
+    """3.28.0: the install's queue still starts the LARGEST file first (the longest transfer never waits for a slot); the
+    fetch-later queue (_BASE_FETCH_SMALL_FIRST=1, set by base_fetch_later alone) starts the SMALLEST first, so behind a
+    running server each small file that lands makes a lane ready sooner. Two slots, three files: the one left out of the
+    first two waits for a slot."""
+    specs = '"FILE|big|u|8192|/x/big" "FILE|small|u|1024|/x/small" "FILE|mid|u|4096|/x/mid"'
+    for flag, last, word in (("", "small", "largest first"), ("local _BASE_FETCH_SMALL_FIRST=1;", "big", "smallest first")):
+        log = tmp_path / ("starts%s.log" % len(flag)); log.write_text("")
+        r = _bash('_base_fetch_one(){ local rel; IFS="|" read -r _ rel _ <<<"$1"; echo "$rel" >> "%s"; sleep 0.6; }; _base_fetch_fold(){ :; }; '
+                  'q(){ %s _base_fetch_queue %s; }; base_env_setup; BASE_FETCH_JOBS=2; q' % (log, flag, specs), env=_fake(tmp_path))
+        starts = log.read_text().split()
+        assert r.returncode == 0 and word in r.stdout, r.stdout + r.stderr
+        assert len(starts) == 3 and starts[2] == last and set(starts[:2]) == {"big", "small", "mid"} - {last}, (flag, starts)
+
+
 def test_unit_the_download_queue_waits_only_for_its_own_jobs():
     src = _code("lib/50-models.sh", "_base_fetch_queue(){", "\n}\n")
     assert "jobs -pr" not in src and re.search(r"\n\s*wait\s*\n", src) is None and 'wait ${pids[@]+"${pids[@]}"}' in src
@@ -186,7 +201,8 @@ def test_unit_the_boot_stage_joins_the_tools_venv_or_builds_it_itself():
 
 def test_unit_the_pipeline_starts_the_background_work_after_the_os_join_and_hooks_the_local_runtime():
     body = _code("lib/95-summary.sh", "base_install(){", "_base_use_testbed(){")
-    tools = body.index("_base_tools_start"); early = body.index("_base_models_early_start")
+    soon = body.index("_base_models_early_start")                   # 3.28.0: the gated start before the clones comes first
+    tools = body.index("_base_tools_start"); early = body.index("_base_models_early_start", soon + 1)
     assert body.index("_base_system_join") < early < tools < body.index("base_venv_snapshot")
     prewarm = body.index("_base_run_prewarm")
     assert body.index("base_venv_latest") < prewarm < body.index("_base_hook pkg_pre_models")

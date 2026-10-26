@@ -59,6 +59,57 @@ _base_args_remove_valued(){ # <--flag> [why]: the flag AND its value (a bare _ba
   sed -E "s#(^|[[:space:]])${name}[[:space:]]+[^[:space:]]+#\\1#g" "$ARGS_FILE" | awk 'NF || /^#/' | _base_replace_file "$ARGS_FILE"
   BASE_CHANGED+=("comfyui_args.txt: removed $name $cur"); ok "args: removed $name $cur${why:+ ($why)}"
 }
+# 3.28.0: HYGIENE_ARGS+=( "--cache-ram 10 32" ) in a package script puts `--cache-ram 10 32` in the args file: the headroom,
+# in GB, of ComfyUI's RAM-pressure cache, the active cache's first and the inactive cache's second (comfy/cli_args.py: at
+# most two values). The one row that carries two values (_base_args_ensure keeps one, so it would land as `--cache-ram 10`);
+# with no such row the base writes nothing. One or two values, each a number of GB. It is never written beside
+# --cache-classic, --cache-lru or --cache-none (one argparse group: ComfyUI would refuse to start), nor for a ComfyUI that
+# has no --cache-ram; HYGIENE_ARGS_REMOVE takes it out with both its values.
+_base_cache_ram_ok(){ [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?([[:space:]]+[0-9]+(\.[0-9]+)?)?$ ]]; }
+_base_args_cache_ram_value(){ # → the values --cache-ram has in the args file, space-separated, or nothing
+  [ -f "$ARGS_FILE" ] || return 0
+  sed -nE 's#(^|.*[[:space:]])--cache-ram(([[:space:]]+[0-9.]+){0,2}).*#\2#p' "$ARGS_FILE" | head -1 | awk '{$1=$1; print}'
+}
+_base_args_cache_ram_drop(){ # the args file without --cache-ram and its values, on stdout
+  sed -E -e 's#(^|[[:space:]])--cache-ram([[:space:]]+[0-9.]+){0,2}#\1#g' -e 's#[[:space:]]+$##' "$ARGS_FILE" | awk 'NF || /^#/'
+}
+_base_args_cache_ram(){ # <one or two numbers of GB>: --cache-ram with them, or made so; idempotent
+  local want cur other
+  want="$(printf '%s' "${1:-}" | awk '{$1=$1; print}')"
+  if ! _base_cache_ram_ok "$want"; then warn "args: '--cache-ram ${1:-}' is not one or two numbers of GB: left off"; return 0; fi
+  if ! grep -q -- '"--cache-ram"' "$COMFY/comfy/cli_args.py" 2>/dev/null; then note "args: --cache-ram $want left off: this ComfyUI has no --cache-ram"; return 0; fi
+  for other in --cache-classic --cache-lru --cache-none; do
+    if [ -f "$ARGS_FILE" ] && grep -qE -- "(^|[[:space:]])${other}([[:space:]]|$)" "$ARGS_FILE"; then
+      warn "args: --cache-ram $want left off: the args file sets $other, and ComfyUI takes one cache mode"; return 0
+    fi
+  done
+  cur="$(_base_args_cache_ram_value)"
+  if grep -qE -- '(^|[[:space:]])--cache-ram([[:space:]]|$)' "$ARGS_FILE" 2>/dev/null && [ "$cur" = "$want" ]; then ok "args: --cache-ram $want present"; return 0; fi
+  if [ "$BASE_DRY" = "1" ]; then would "set --cache-ram $want in comfyui_args.txt"; return 0; fi
+  if [ -f "$ARGS_FILE" ]; then _base_args_cache_ram_drop | _base_replace_file "$ARGS_FILE"; else mkdir -p "$(dirname "$ARGS_FILE")"; fi
+  printf '%s\n' "--cache-ram $want" >> "$ARGS_FILE"
+  BASE_CHANGED+=("comfyui_args.txt: --cache-ram ${cur:-(none)} -> $want"); ok "args: --cache-ram $want"
+}
+_base_args_cache_ram_remove(){ # [why]: --cache-ram AND its values (a bare _base_args_remove would leave them as stray words)
+  local why="${1:-}" cur
+  grep -qE -- '(^|[[:space:]])--cache-ram([[:space:]]|$)' "$ARGS_FILE" 2>/dev/null || return 0
+  cur="$(_base_args_cache_ram_value)"
+  if [ "$BASE_DRY" = "1" ]; then would "remove --cache-ram $cur from comfyui_args.txt${why:+ ($why)}"; return 0; fi
+  _base_args_cache_ram_drop | _base_replace_file "$ARGS_FILE"
+  BASE_CHANGED+=("comfyui_args.txt: removed --cache-ram $cur"); ok "args: removed --cache-ram $cur${why:+ ($why)}"
+}
+_base_args_package(){ # the package's own rows: HYGIENE_ARGS made so, then HYGIENE_ARGS_REMOVE taken out
+  local row name val
+  for row in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do
+    name="${row%% *}"; val=""; [ "$row" != "$name" ] && val="${row#* }"
+    case "$name" in --cache-ram) _base_args_cache_ram "$val"; continue ;; esac   # 3.28.0: its one or two values
+    _base_args_ensure "$name" $val
+  done
+  for name in ${HYGIENE_ARGS_REMOVE[@]+"${HYGIENE_ARGS_REMOVE[@]}"}; do
+    case "$name" in --cache-ram) _base_args_cache_ram_remove "removed by ${PKG_NAME:-the package}"; continue ;; esac
+    _base_args_remove "$name" "removed by ${PKG_NAME:-the package}"
+  done
+}
 _base_args_store_dirs(){ # 3.0.3: with no shared library, output/ and input/ are ComfyUI's own, inside the tree, on the store
   # MEASURED on a Verda machine on a shared store: the args file kept --output-directory and --input-directory from the
   # days its library was a second mount. 2.5.2 stopped using that library under a shared root but only ever ENSURED the
@@ -241,11 +292,7 @@ base_hygiene(){
     if [ "$BASE_DRY" != "1" ]; then mkdir -p "$BASE_LOCAL_STATE/user/default/workflows" "$BASE_LOCAL_STATE/temp" 2>/dev/null || true; fi
   fi
   _base_library_link
-  for row in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do
-    name="${row%% *}"; val=""; [ "$row" != "$name" ] && val="${row#* }"
-    _base_args_ensure "$name" $val
-  done
-  for name in ${HYGIENE_ARGS_REMOVE[@]+"${HYGIENE_ARGS_REMOVE[@]}"}; do _base_args_remove "$name" "removed by ${PKG_NAME:-the package}"; done
+  _base_args_package                   # HYGIENE_ARGS, then HYGIENE_ARGS_REMOVE (3.28.0: a --cache-ram row keeps both values)
   # the template ships --use-sage-attention; with no sageattention in the venv ComfyUI dies at start (and some
   # models render noise with it). Keep it only when a package's hook installed the module into this venv.
   # 3.7.5: and only when the last proof did not see sageattn() (the flag's own call) fail on this GPU: ComfyUI catches that

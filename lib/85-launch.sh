@@ -133,12 +133,16 @@ _base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHIN
 # A value is one word of [A-Za-z0-9_.,:+-]: a number, a flag, an allocator string, never a path or a shell expansion.
 # Precedence: a value the machine's own environment already has (the pod's env, the unit's) > the packages' files, in
 # name order, the first one naming a key winning (a different value later is named on stderr) > the base's default.
-# The base's one default is OMP_NUM_THREADS from the container's CPU QUOTA (_base_cpu_quota), never the host's count.
+# The base's defaults: OMP_NUM_THREADS from the container's CPU QUOTA (_base_cpu_quota), never the host's count; and 3.28.0,
+# CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 while the venv's cuDNN is 9.22 to 9.24 (_base_cudnn_cache_bug). A package cannot set it.
 BASE_LAUNCH_ENV_KEYS="OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS"
 BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING"
 # 3.18.0: and the attention order a node pack reads when it loads (Generate-AI's Render Speed: off, cudnn or fa4), a
 # one-word flag like the rest: which exact attention kernel runs first, never a path or a library to load
 BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS RENDER_SPEED_ATTENTION"
+# 3.28.0: and the same pack's thread count for every lanczos resize in the process (RENDER_SPEED_LANCZOS_THREADS=N, off when
+# unset): several frames resized at once, the same bytes, a number like the thread counts above
+BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS RENDER_SPEED_LANCZOS_THREADS"
 _base_launch_env_ok(){ # KEY=value → 0 when it is an entry the contract above allows
   local k v
   case "$1" in *=*) ;; *) return 1 ;; esac
@@ -183,6 +187,29 @@ _base_cpu_quota(){ # → the whole CPUs this container's cgroup quota allows (ro
   echo "$n"
 }
 _base_launch_env_dir(){ local s="${BASE_STATE:-${BASE_HOME:+$BASE_HOME/state}}"; [ -n "$s" ] && echo "$s/launch.d"; }
+_base_cudnn_version(){ # 3.28.0: → the cuDNN the venv's torch loads, from its nvidia-cudnn-cu* wheel's name (9.24.0.37); the newest when
+  # there are two; empty when the venv has none (a torch built against a system cuDNN). A directory name: no Python, no torch import.
+  local venv="${VENV:-}" d v all=""
+  if [ -z "$venv" ] && [ -n "${PY:-}" ]; then case "$PY" in */bin/*) venv="${PY%/bin/*}" ;; esac; fi
+  [ -n "$venv" ] || return 0
+  for d in "$venv"/lib/python*/site-packages/nvidia_cudnn_cu*-*.dist-info; do
+    [ -d "$d" ] || continue
+    v="${d##*/}"; v="${v%.dist-info}"; v="${v#*-}"
+    case "$v" in [0-9]*) all="$all$v"$'\n' ;; esac
+  done
+  if [ -n "$all" ]; then printf '%s' "$all" | sort -V | tail -1; fi
+  return 0
+}
+_base_cudnn_cache_bug(){ # 3.28.0: <version> → 0 for cuDNN 9.22.x to 9.24.x. NVIDIA, cuDNN 9.25.1 release notes (Fixed Issues): "A data
+  # corruption issue in this cache that could cause a segmentation fault has been fixed. For cuDNN 9.22-9.24, a workaround
+  # was to set the environment variable CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 to disable the cache." (the default per-process
+  # cache of runtime-compiled kernels, added in 9.22.0). torch 2.14.1 pins 9.24.0. Turning the cache off changes no result.
+  local maj min rest
+  IFS=. read -r maj min rest <<< "${1:-}"
+  case "$maj" in ''|*[!0-9]*) return 1 ;; esac
+  case "$min" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$maj" -eq 9 ] && [ "$min" -ge 22 ] && [ "$min" -le 24 ]
+}
 _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedence above); what was dropped, and why, on stderr
   local dir f kv k v seen="" n s first
   dir="$(_base_launch_env_dir)"
@@ -213,6 +240,8 @@ _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedenc
          else seen="$seen|OMP_NUM_THREADS=$n@the CPU quota"; fi
        fi ;;
   esac
+  v="$(_base_cudnn_version)"                                        # 3.28.0: no package may set it, so only the machine's env wins
+  if _base_cudnn_cache_bug "$v"; then seen="$seen|CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0@cuDNN $v (its default kernel cache; fixed in 9.25.1)"; fi
   printf '%s\n' "$seen" | tr '|' '\n' | while IFS= read -r kv; do         # KEY=value@source, one per line (the last one too)
     [ -n "$kv" ] || continue
     k="${kv%%=*}"; v="${kv#*=}"; v="${v%%@*}"

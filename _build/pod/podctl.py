@@ -241,13 +241,21 @@ def provider_for(name=None, base_dir=None, env=None):
     return cls()
 
 
+def host_env_write(prov):
+    """3.28.0: (the shell that writes state/host.env, the line podctl prints for it): write_host_env's command, so an
+    install can send it in the lease's own round trip (lease_take_with)."""
+    text = prov.host_env()
+    cmd = "mkdir -p %s && printf '%%s' %s > %s" % (_sq(VOLUME_ROOT + "/comfy-base/state"), _sq(text), _sq(VOLUME_ROOT + "/comfy-base/state/host.env"))
+    return cmd, "host    %s (state/host.env: %s)" % (prov.name, " ".join(text.split()))
+
+
 def write_host_env(prov, env=None):
     """state/host.env on the machine, so the base knows which host it runs on (BASE_HOST) and where its volume is (BASE_VOLUME)."""
-    text = prov.host_env()
-    r = ssh_run("mkdir -p %s && printf '%%s' %s > %s" % (_sq(VOLUME_ROOT + "/comfy-base/state"), _sq(text), _sq(VOLUME_ROOT + "/comfy-base/state/host.env")), env=env)
+    cmd, line = host_env_write(prov)
+    r = ssh_run(cmd, env=env)
     if r.returncode != 0:
         raise PodctlError("could not write state/host.env on the machine: %s" % (r.stderr or r.stdout).strip()[-300:])
-    return "host    %s (state/host.env: %s)" % (prov.name, " ".join(text.split()))
+    return line
 
 
 def write_ssh_config(path, host, port):
@@ -321,7 +329,11 @@ def _ssh_hostname():
 # tunnel is its own session (-F /dev/null) and is untouched. %C hashes host, port and user, so a new pod, or a new
 # mapping after a start, gets its own master. A unix socket path holds at most 103 bytes on macOS, so a home too deep
 # for <dir>/%C runs unmultiplexed, as before. PODCTL_SSH_MUX=0 turns it off.
-SSH_MUX_PERSIST = 120            # seconds a master outlives its last command: run.sh's phases are seconds apart
+# 3.28.0: 600, not 120. An install's master opens with the lease, then the Mac's own gate (the package's suite from its zip,
+# minutes on a zip it has not seen) leaves it idle; at 120 s it lapsed there and the upload after the gate paid a fresh
+# handshake (about 11 round trips, 1.8 s to EU-RO-1). A stopped machine's master still dies within a minute
+# (ServerAliveInterval x ServerAliveCountMax), and stop, start and restart close it first (mux_close).
+SSH_MUX_PERSIST = 600            # seconds a master outlives its last command
 SSH_MUX_STALE = re.compile(r"mux_client_request_session: (?:read from master failed|session request failed)|mux_client_hello_exchange")
 
 
@@ -757,12 +769,22 @@ def gpu_verdict_many(cards, apps):
     return tuple(sums) + ("NOT-OURS" if bad else "ours",)
 
 
-def gpu_probe(io):
+GPU_FIT_QUERY = "nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader,nounits 2>/dev/null"
+GPU_FIT_MARK = "---podctl-gpu-fit---"
+
+
+def gpu_probe(io, fit=False):
     """(line, verdict) from the pod: 'verdict=no-gpu' when nvidia-smi does not answer (a GPU-less pod, or the stand-in).
-    3.20.0: every card of a multi-GPU pod, each judged by its own processes (gpu_verdict_many)."""
+    3.20.0: every card of a multi-GPU pod, each judged by its own processes (gpu_verdict_many).
+    3.28.0 `fit`: gpu_fit_note's question (GPU_FIT_QUERY) rides in the same round trip; its answer is kept on `io` for it."""
     rc, out, err = io.remote("nvidia-smi --query-gpu=memory.total,memory.used,uuid --format=csv,noheader,nounits 2>/dev/null; echo ---; "
-                             "nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid --format=csv,noheader,nounits 2>/dev/null")
-    head, _, tail = (out or "").partition("---")
+                             "nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid --format=csv,noheader,nounits 2>/dev/null"
+                             + ("; echo %s; %s" % (GPU_FIT_MARK, GPU_FIT_QUERY) if fit else ""))
+    out = out or ""
+    if fit:
+        out, _, answer = out.partition(GPU_FIT_MARK)
+        io.gpu_fit_answer = answer.strip()
+    head, _, tail = out.partition("---")
     cards = []
     for line in head.strip().splitlines():
         nums = [x.strip() for x in line.split(",")]
@@ -780,9 +802,10 @@ def gpu_probe(io):
     return "total=%d used=%d ours=%d foreign=%d procs=%d%s verdict=%s" % (total, used, ours, foreign, len(apps), many, v), v
 
 
-def gpu_gate(io, say, uploading=True):
-    """Print the verdict; True when the run may proceed. `uploading`: the caller was about to upload (install)."""
-    line, v = gpu_probe(io)
+def gpu_gate(io, say, uploading=True, fit=False):
+    """Print the verdict; True when the run may proceed. `uploading`: the caller was about to upload (install). `fit`
+    (3.28.0): gpu_fit_note's question asked in the same round trip (gpu_probe)."""
+    line, v = gpu_probe(io, fit=fit)
     if v == "ours":
         say("gpu     %s — the GPU is ours" % line); return True
     if v == "no-gpu":
@@ -806,15 +829,25 @@ def gpu_prefer_of(script_path):
     return _gpu_fit.parse_prefer(m.group(1)) if m else []
 
 
+def gpu_wants(items):
+    """[(package name, its GPU_PREFER classes)] for every package that declares some."""
+    wants = [(it["name"], gpu_prefer_of(it["local_script"])) for it in items if it.get("kind") == "pkg" and it.get("local_script")]
+    return [(n, p) for n, p in wants if p]
+
+
 def gpu_fit_note(io, items, say):
     """Before the upload, the pod's GPU against every package's GPU_PREFER: a GPU below what a package is tuned for is a
     WARNING with what it lacks, never a stop (the run is the person's call). Asked over ssh, the same three numbers the
-    pod's own run reads (py/gpu_fit.py), so the Mac and the pod never disagree."""
-    wants = [(it["name"], gpu_prefer_of(it["local_script"])) for it in items if it.get("kind") == "pkg" and it.get("local_script")]
-    wants = [(n, p) for n, p in wants if p]
+    pod's own run reads (py/gpu_fit.py), so the Mac and the pod never disagree. 3.28.0: the answer gpu_probe already
+    brought back (gpu_gate(..., fit=True)) is used as it is, with no round trip of its own."""
+    wants = gpu_wants(items)
     if not wants:
         return
-    rc, out, _ = io.remote("nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader,nounits 2>/dev/null")
+    answer = getattr(io, "gpu_fit_answer", None)
+    if answer is not None:
+        rc, out = (0, answer) if answer else (1, "")
+    else:
+        rc, out, _ = io.remote(GPU_FIT_QUERY)
     parts = [x.strip() for x in (out or "").strip().splitlines()[0].split(",")] if rc == 0 and (out or "").strip() else []
     if len(parts) < 3 or not parts[2].isdigit():
         say("gpu fit no nvidia-smi answer on the pod: %s not verified" % "; ".join("%s wants %s" % (n, _gpu_fit.want_text(p)) for n, p in wants))
@@ -1139,7 +1172,7 @@ def install(pod_id, dirs, io, every=5, timeout=3 * 3600, latest=True, save_pins_
             return 1
         if not it["zip"].exists():
             io.say("STOP: %s has no zip (%s) — build it first" % (it["name"], it["zip"].name)); return 1
-    if not gpu_gate(io, io.say):
+    if not gpu_gate(io, io.say, fit=bool(gpu_wants(items))):     # 3.28.0: one round trip for both questions
         return 1
     gpu_fit_note(io, items, io.say)
     # 3.24.0: every zip is checked (and gated) first, then all of them go up in ONE upload: three round trips in all, not
@@ -1643,6 +1676,20 @@ def lease_take(holder, purpose, minutes, timeout=30):
     return lease_parse(line)
 
 
+def lease_take_with(holder, purpose, minutes, also, timeout=30):
+    """3.28.0: lease_take and one more write in the SAME round trip: (the lease, whether `also` exited 0). The lease is
+    judged exactly as lease_take judges it (its own exit status, a PodctlError when it could not be written); `also` runs
+    whatever the lease did, and a caller whose `also` failed runs it again on its own, where its own error is said."""
+    import shlex
+    line = lease_encode(holder, purpose, minutes)
+    lease = "mkdir -p %s && printf '%%s\\n' %s > %s" % (
+        shlex.quote(os.path.dirname(LEASE_PATH)), shlex.quote(line), shlex.quote(LEASE_PATH))
+    r = ssh_run("{ %s; }; lrc=$?; { %s; } >/dev/null 2>&1; echo \"podctl-also=$?\"; exit $lrc" % (lease, also), timeout=timeout)
+    if r.returncode != 0:
+        raise PodctlError("could not write the lease: %s" % (r.stderr or r.stdout).strip()[:200])
+    return lease_parse(line), "podctl-also=0" in (r.stdout or "")
+
+
 def lease_release(holder, timeout=30):
     """Drop the lease if it is ours (or already gone). Never removes someone else's.
     3.24.0: one round trip, not a read and then a remove: the machine removes the file when it is empty, holds no holder
@@ -1826,13 +1873,15 @@ def cmd_install(prov, args):
         return 3
     minutes = max(20, int(args.timeout / 60) * len(dirs) // 4 or 20)
     minutes = lease_minutes_keeping(cur, me, minutes)      # an install inside a longer chain keeps the chain's window
-    try:
-        got = lease_take(me, "install: " + ", ".join(d.name for d in dirs), minutes)
+    host_cmd, host_line = host_env_write(prov)
+    try:                                 # 3.28.0: the lease and state/host.env in one round trip (lease_take_with)
+        got, host_ok = lease_take_with(me, "install: " + ", ".join(d.name for d in dirs), minutes, host_cmd)
         print("lease   held by %s until %s" % (got["holder"], got["expires"]))
     except PodctlError as e:
         print("lease   could not be taken (%s) — continuing; it is advisory" % e)
+        host_ok = False
     try:
-        print(write_host_env(prov))
+        print(host_line if host_ok else write_host_env(prov))      # its own round trip only when the shared one did not write it
         if getattr(args, "comfy_ref", None):
             print("comfyui ref %s (from --comfy-ref; this install only: the next one without it returns the store to the newest release)" % args.comfy_ref)
         run_env = install_run_env(args, pod)
