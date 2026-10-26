@@ -20,8 +20,10 @@
 #                    GitHub file through curl: neither needs hf, so they go early even when the fetch venv cannot be built.
 #   stopping         an install that stops before the join (a failed venv, a restart required, an ERR) stops its early
 #                    downloads too; hf and curl resume from the staging folder on the next run.
-#   off              BASE_MODELS_FOREGROUND=1 (the 3.10 order), a dry run, a seed build (no models), a buyer's machine
-#                    (BASE_RUNTIME: no uv step may run there, and its venv is not built anyway).
+#   off              BASE_MODELS_FOREGROUND=1 (the 3.10 order), a dry run, a seed build (no models).
+#   3.29.4, runtime  a buyer's machine (BASE_RUNTIME) starts them at t0, beside the runtime's unpack when that is still running
+#                    (lib/48-runtime.sh): no uv step runs there, so the downloader is hf in a venv of the system Python
+#                    (_base_fetch_tool_pip), and a row inside a pack (custom_nodes/) waits for the unpack as before.
 #   3.28.0, sooner   before the ComfyUI fetch and the pack clones too, when no row of the first set is a custom_nodes/<Pack>
 #                    file and uv's bootstrap need not wait for the OS stage (_base_early_first); the later call then finds
 #                    them started. A package with a pack's file in its first set keeps the order above.
@@ -86,7 +88,7 @@ _base_models_early(){ # the background half: what goes early, then those downloa
   if [ "${#specs[@]}" -eq 0 ]; then note "nothing to download early: every row is in place, LOCAL, later, or a move away"; return 0; fi
   echo "  ${#specs[@]} item(s), $(_base_bytes_to_gb "$need") GB"
   if ! _base_disk_gate "$need"; then note "nothing downloaded early: the model stage judges the disk again and stops the run there"; return 0; fi
-  if [ "$BASE_NO_NET" != "1" ] && ! _base_fetch_tool; then
+  if [ "$BASE_NO_NET" != "1" ] && ! { if _base_runtime_on; then _base_fetch_tool_pip; else _base_fetch_tool; fi; }; then
     # 3.25.0: Civitai and GitHub come through curl and the system Python, never hf: those still go early
     local nohf=() _u
     for spec in "${specs[@]}"; do IFS='|' read -r _ _ _u _ <<< "$spec"; [ "$(_base_source "$_u")" = hf ] || nohf+=("$spec"); done
@@ -119,11 +121,11 @@ _base_early_first(){ # <OS stage in the background: 1|0> → 0 when the early do
 }
 _base_models_early_start(){ # → 0 when the downloads now run in the background; 1 when they are off or there is nothing to start
   if [ -n "${_BASE_EARLY_PID:-}" ]; then return 0; fi   # 3.28.0: started already, before the clones (_base_early_first)
-  if [ "${BASE_MODELS_FOREGROUND:-0}" = "1" ] || [ "$BASE_DRY" = "1" ] || [ "${BASE_SEED:-0}" = "1" ] || _base_runtime_on; then return 1; fi
+  if [ "${BASE_MODELS_FOREGROUND:-0}" = "1" ] || [ "$BASE_DRY" = "1" ] || [ "${BASE_SEED:-0}" = "1" ]; then return 1; fi
   [ "${#MODELS[@]}" -gt 0 ] || return 1
   # uv is refreshed once per run: here, in the foreground, so the venv step's own call finds it done instead of racing
   # this one into the same bootstrap venv
-  if [ "$BASE_NO_NET" != "1" ] && ! _base_ensure_uv; then return 1; fi
+  if ! _base_runtime_on && [ "$BASE_NO_NET" != "1" ] && ! _base_ensure_uv; then return 1; fi
   _base_tmp; _BASE_EARLY_DIR="$BASE_TMPD/models-early"; mkdir -p "$_BASE_EARLY_DIR"
   local dir="$_BASE_EARLY_DIR" nw="${#BASE_WARN[@]}" nf="${#BASE_FILE_SPANS[@]}"
   (

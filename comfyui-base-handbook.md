@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.29.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.29.4.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -723,6 +723,19 @@ named, and a re-run fetches again. `zstd` must be on the machine (the apply inst
 exists). The apply's wall seconds, bytes and GB/s are the RUNTIME row of the timing ledger
 (`state/logs/runtime-apply_<ts>.timings.tsv` and `.timeline.tsv`) and `state/runtime-apply.json`.
 
+**The models do not wait for the unpack** (3.29.4): `runtime-apply` holds `state/runtime.applying` (`<pid> <manifest sha256>`;
+a dead pid is no lock) while it runs and puts the manifest at `state/runtime.json` as soon as it has it, so a boot kit can
+start the apply in the background and the package's install (`BASE_RUNTIME=state/runtime.json`) beside it. An install whose
+manifest is not stamped yet but is being applied is "pending": it validates the package's tables, checks the driver floor,
+asks for its tokens, then starts the first set of model downloads at once (§5, the early pass) into `<tree>/models`, where
+the tree will be, and waits (`BASE_RUNTIME_WAIT`, 3600 s) for the stamp only where it first needs the tree, the venv or a
+pack: `RUNTIME · waiting for the unpack`. Pod to App ready is the longer of the unpack and the first models, plus the
+checks and one ComfyUI start. The downloader is `hf` in a venv of the system Python under `comfy-base/fetch` (no uv step
+and no runtime Python: both may be unpacking), and a row inside a pack (`custom_nodes/`), `BASE_LIBRARY` and a shared
+store keep the old order (they wait for the tree). An apply that ends without a stamp (or a dead lock) fails the install
+by name. The unpack's seconds, bytes and GB/s join the install's ledger as `RUNTIME (in the background, beside the
+models)` and its timeline span; a runtime applied earlier starts the models at t0 just the same, with no wait.
+
 **A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
 moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
 checked against `runtime.json` instead, the venv must import torch, SageAttention must be the runtime's own build,
@@ -899,6 +912,18 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.29.4: runtime mode starts the staged model downloads at t0 (2026-10-26). Exercised by the suite and by a hand run of
+  the stub package's install beside a slowed `runtime-apply` (5 parts at 1.5 s each, one connection) on macOS; not on a
+  live machine. Before, a buyer's install fetched models only at the model stage, after the tree, venv and pack checks
+  (no early pass: it needs uv). Now `runtime-apply` holds `state/runtime.applying` and writes `state/runtime.json` early;
+  an install that finds its manifest being applied is pending: tables, driver floor, tokens, then the early model
+  downloads (`_base_runtime_pretree` names where the tree will be; the downloader is `hf` in a pip venv of the system
+  Python, `_base_fetch_tool_pip`), then `RUNTIME · waiting for the unpack` (`BASE_RUNTIME_WAIT`) and the usual discovery,
+  library link and banner once the stamp is there. An install with the runtime already applied also starts them at t0.
+  A pack-file row, `BASE_LIBRARY` and a shared store start them after the tree, as before. The unpack's own seconds join
+  the install's ledger (a span may begin before the install's shell did; the timeline writer takes a negative start).
+  A dead or missing apply fails the install by name. Expected: Pod to App ready becomes max(unpack, first models) plus the
+  checks and one ComfyUI start; measure it on the first live round.
 - 3.29.3: the runtime's parts are independent zstd tars, fetched and unpacked in parallel (2026-10-26). Exercised by the
   suite and by a hand run of `runtime.py build`/`apply` and `base.sh runtime-apply` on a small tree on macOS (local folder
   and a loopback http server); not on a live machine, so the GB/s on a B200 is still unmeasured. The format of 3.1.0 (one

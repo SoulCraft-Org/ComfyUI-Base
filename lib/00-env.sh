@@ -66,6 +66,9 @@
 #                        whose versions live ONLY in that manifest: no OS or driver upgrade, no git, no pip, no uv
 #                        resolve, each skip noted. The driver gate still holds, at the manifest's floor. The one
 #                        exception to "everything newest": a newbie's first run never meets an untested upstream change.
+#                        3.29.3: BASE_RUNTIME_JOBS=<n> (default 8) parts fetched and unpacked at once by `runtime-apply`.
+#                        3.29.4: the package's first set of models starts at once, beside a runtime-apply that is still
+#                        unpacking (state/runtime.applying); BASE_RUNTIME_WAIT=<s> (default 3600) bounds the wait for it.
 # BASE_STAGED=1          3.1.0: act on the package's MODELS_LATER: those rows get 0-byte stand-ins, the server starts
 #                        on the first flow's files, and a detached `base.sh fetch-later` brings the rest
 #                        (state/later.queue, state/standins.list, state/progress.json). Every other run ignores it.
