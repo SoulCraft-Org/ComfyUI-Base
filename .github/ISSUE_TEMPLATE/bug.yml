@@ -1,6 +1,7 @@
 name: Bug
 description: Something the base did wrong on a machine you ran it on.
 labels: [bug]
+type: Bug
 body:
   - type: markdown
     attributes:
