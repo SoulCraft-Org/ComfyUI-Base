@@ -81,9 +81,11 @@ ensure_packages() {
   # ffmpeg: the image ships none, and VideoHelperSuite's bundled binary has no nvenc encoders, so a video
   # package's h264_nvenc format fails at the last node after the whole sample is paid for. Ubuntu's build has
   # h264_nvenc; lib/85-launch.sh finds it and sets VHS_FORCE_FFMPEG_PATH.
+  # libegl1, libgles2: libEGL.so.1 and libGLESv2.so.2, which MediaPipe's libmediapipe.so needs even on CPU (3.29.1; the
+  # base's own OS stage, lib/15-system.sh, installs them too).
   # 3.0.0: install OR UPGRADE, every time: `apt-get install` of a present package moves it to its newest. The whole
   # OS (and the NVIDIA driver) goes to its newest in the base's own first stage (lib/15-system.sh) at every install.
-  local need=(nfs-common python3-venv ffmpeg) out
+  local need=(nfs-common python3-venv ffmpeg libegl1 libgles2) out
   log "installing or upgrading ${need[*]}"
   export DEBIAN_FRONTEND=noninteractive
   # -o DPkg::Lock::Timeout: unattended-upgrades often holds the dpkg lock on a first boot

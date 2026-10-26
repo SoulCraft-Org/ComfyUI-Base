@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.29.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.29.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -882,6 +882,12 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.29.1: the OS stage installs `libegl1` and `libgles2` (2026-10-26). Exercised by the suite's text checks only (no pod,
+  no apt run). MediaPipe 1.1.1's `libmediapipe.so` links `libEGL.so.1` and `libGLESv2.so.2` even on CPU (found by the
+  Character Swap package's quality CI: `OSError: libEGL.so.1`), so a pod without them left that package's `head_pose`
+  and `expression` scores blank. Both are Ubuntu 24.04 (noble) `main` packages, 1.7.0-1build1 (libglvnd). The base's own
+  list in `lib/15-system.sh` (`python3-venv ffmpeg`, plus `nfs-common` and `openssh-server` where needed) gains them, and
+  so does the Verda startup's `ensure_packages`. A package that needs them must raise its `BASE_MIN` to 3.29.1.
 - 3.29.0: RunPod create's CUDA filter (2026-10-26), a blocker for the Video Swapper 6.0 B200 run. Exercised against the
   suite's fake RunPod only (no live create, no pod).
   - **No `allowedCudaVersions`.** RunPod matches that list exactly, REST v1's enum stops at 13.0, and every B200, B300

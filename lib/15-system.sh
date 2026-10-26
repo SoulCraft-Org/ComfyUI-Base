@@ -151,7 +151,9 @@ base_system(){ # the stage; sets BASE_REBOOT_REQUIRED and returns 10 when a rest
     miss "full-upgrade failed: $(printf '%s\n' "$out" | grep -E '^E:' | head -2 | tr '\n' ' ')"; BASE_FAILED+=("system: apt-get full-upgrade failed"); rc=1
   fi
   # the base's own packages: present, and newest (full-upgrade moved what was installed; this adds what was not)
-  local want=(python3-venv ffmpeg) p missing=()
+  # 3.29.1: libegl1 + libgles2 (Ubuntu 24.04 main) are libEGL.so.1 and libGLESv2.so.2, which MediaPipe's libmediapipe.so
+  # links even on CPU; a pod without them leaves a package's MediaPipe face scores blank (OSError: libEGL.so.1).
+  local want=(python3-venv ffmpeg libegl1 libgles2) p missing=()
   [ "$host" = verda ] || [ "${BASE_VOLUME_SHARED:-0}" = "1" ] && want+=(nfs-common)
   command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ] || want+=(openssh-server)
   for p in "${want[@]}"; do dpkg-query -W -f '${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || missing+=("$p"); done
