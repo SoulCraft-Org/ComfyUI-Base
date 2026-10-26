@@ -72,6 +72,11 @@ class FakeRunPod:
         self.secrets = []                                 # 3.19.0: the account's RunPod Secret NAMES (REST v2 GET /v2/account/secrets)
         self.secrets_fail = None                          # 3.19.0: an HTTP status the listing answers with instead
         self.secrets_auth = []                            # 3.19.0: the Authorization header of every listing
+        self.v2_cuda = ["13.2"]                           # 3.29.0: what GET /v2/pods/{id} answers as cudaVersion, read by read (the last repeats)
+        self.v2_pod_reads = []                            # 3.29.0: the pod ids GET /v2/pods/{id} was asked for
+        self.catalog = None                               # 3.29.0: GET /v2/catalog/gpus's answer; None derives it from the GraphQL stock
+        self.catalog_cuda = "13.2"                        # 3.29.0: the derived catalog's hosts report this CUDA (minCudaVersion above it: NONE)
+        self.catalog_queries = []                         # 3.29.0: the query of every catalog read, parsed
         srv = self
 
         class H(BaseHTTPRequestHandler):
@@ -101,6 +106,16 @@ class FakeRunPod:
                         return self._send(srv.secrets_fail, {"title": "refused", "status": srv.secrets_fail, "detail": "the fake refuses"})
                     return self._send(200, {"secrets": [{"id": "sec%04d" % i, "name": n, "description": None, "createdAt": "2026-10-16T00:00:00Z",
                                                          "valueLastUpdatedAt": None} for i, n in enumerate(srv.secrets)]})
+                if path.startswith("/v2/pods/"):            # 3.29.0: REST v2 getPod, the host's cudaVersion (null at first)
+                    pid = path.split("/")[3]
+                    srv.v2_pod_reads.append(pid)
+                    v = srv.v2_cuda.pop(0) if len(srv.v2_cuda) > 1 else (srv.v2_cuda or [None])[0]
+                    return self._send(200, {"id": pid, "desiredStatus": srv.pod.get("desiredStatus"), "cudaVersion": v})
+                if path == "/v2/catalog/gpus":              # 3.29.0: listGpus with include=AVAILABILITY and minCudaVersion
+                    import urllib.parse
+                    q = dict(urllib.parse.parse_qsl(self.path.partition("?")[2]))
+                    srv.catalog_queries.append(q)
+                    return self._send(200, srv.catalog_answer(q))
                 if srv.rest:
                     res = srv.rest("GET", path, None)
                     if res is not None:
@@ -189,6 +204,23 @@ class FakeRunPod:
 
     def mapping_when_running(self):
         return {"22": 15270} if "22/tcp" in self.pod.get("ports", []) else {}
+
+    def catalog_answer(self, q):
+        """3.29.0: the v2 catalog for query `q`: self.catalog when a test sets one (a dict, or a function of the query),
+        else the GraphQL stock view re-said in the catalog's shape, every data centre NONE when the query's
+        minCudaVersion is above catalog_cuda (RunPod's hosts below a floor are not counted)."""
+        if self.catalog is not None:
+            return self.catalog(q) if callable(self.catalog) else self.catalog
+        data = self.gql({"query": "query { dataCenters { id name location storageSupport gpuAvailability { gpuTypeId stockStatus available } } }",
+                         "variables": {}}) if callable(self.gql) else self.gql
+        key = lambda v: tuple(int(x) for x in v.split("."))
+        low = bool(q.get("minCudaVersion")) and key(q["minCudaVersion"]) > key(self.catalog_cuda)
+        gpus = {}
+        for dc in (data or {}).get("dataCenters") or []:
+            for g in dc.get("gpuAvailability") or []:
+                av = "NONE" if low or not g.get("available") else (g.get("stockStatus") or "Low").upper()
+                gpus.setdefault(g["gpuTypeId"], []).append({"id": dc["id"], "name": dc["id"], "availability": av})
+        return {"gpus": [{"id": k, "availability": "LOW", "dataCenters": v} for k, v in gpus.items()]}
 
     def close(self):
         self.httpd.shutdown(); self.httpd.server_close()
@@ -2011,7 +2043,7 @@ def test_unit_runpod_create_checks_stock_first_then_makes_the_volume_and_the_pod
     jl = [l for l in out.splitlines() if "Jupyter Terminal" in l and host(l).endswith(".proxy.runpod.net")]
     assert len(jl) == 1 and jl[0].split()[-1] == "https://newpod0000001-8888.proxy.runpod.net/lab" and "token=" not in out, out
     assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["gpuCount"] == 1
-    assert body["allowedCudaVersions"] == ["13.0"] and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
+    assert "allowedCudaVersions" not in body and body["containerDiskInGb"] == 100 and body["imageName"] == "runpod/comfyui:1.4.7-cuda13.0"
     assert "templateId" not in body and body["interruptible"] is False   # this fake has no templates
     # 3.14.0: a new pod starts on the base's boot guard and sshd, never its image's own start (error log row 71)
     assert body["dockerStartCmd"] == [] and body["dockerEntrypoint"][2].startswith(podctl.BOOT_GUARD)
@@ -2032,7 +2064,8 @@ def test_unit_runpod_create_reuses_a_volume_and_a_refusal_takes_only_its_own_vol
         _create(podctl, srv, pub, "--volume", "oldvol", "--min-cuda", "12.8")
         assert "/networkvolumes" not in srv.posts
         body = srv.bodies[-1][1]
-        assert body["networkVolumeId"] == "oldvol" and body["dataCenterIds"] == ["US-CA-2"] and body["allowedCudaVersions"] == ["13.0", "12.9", "12.8"]
+        assert body["networkVolumeId"] == "oldvol" and body["dataCenterIds"] == ["US-CA-2"] and "allowedCudaVersions" not in body
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "12.8"                      # 3.29.0: --min-cuda is the stock floor
         # a volume whose data centre has no stock: STOP, and say the volume is why
         assert _create(podctl, srv, pub, "--volume", "rovol") == 1
         assert "the volume pins the data centre" in capsys.readouterr().out
@@ -2075,6 +2108,105 @@ def test_unit_runpod_cuda_floor_comes_from_the_flag_or_the_image_tag():
         podctl.allowed_cuda("14.0")
 
 
+def test_unit_runpod_create_sends_no_cuda_list_and_holds_the_placed_pod_to_the_floor(tmp_path):
+    """3.29.0 (RunPod's docs, read 2026-10-26): allowedCudaVersions matches EXACTLY, REST v1's enum stops at 13.0, and
+    every B200, B300 and RTX PRO 6000 host with stock reports 13.2, so ["13.0"] could never place one. create sends no
+    list (any CUDA), then reads the pod's cudaVersion from REST v2 GET /pods/{id} (null for a few seconds, so asked
+    again for about 60 s) and holds it to the floor: 13.2 passes a 13.0 floor; 12.8, or no version at all, is a STOP
+    and the pod is STOPPED, never deleted, and a network volume the call made stays with it."""
+    podctl = _load()
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    api = podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql")
+    slept = []
+    def make(**kw):
+        said = []
+        try:
+            pid = podctl.create(api, "c1", "NVIDIA B200", "EU-RO-1", data_gb=50, image="runpod/comfyui:1.4.7-cuda13.0",
+                                pubkey="ssh-ed25519 K k", wait=False, sleep=slept.append, say=said.append, name_ports=False, **kw)
+        except podctl.PodctlError as e:
+            return None, said, str(e)
+        return pid, said, None
+    try:
+        pid, said, err = make()
+        body = [b for p, b in srv.bodies if p == "/pods"][-1]
+        assert err is None and pid == "newpod0000001" and "allowedCudaVersions" not in body, (err, body)
+        assert srv.v2_pod_reads == ["newpod0000001"] and slept == [], (srv.v2_pod_reads, slept)
+        assert any("cuda     13.2 on the host (floor 13.0)" in l for l in said), said
+        assert not any(p.endswith("/stop") for p in srv.posts) and srv.pod["desiredStatus"] == "RUNNING"
+        # null for the first reads, then 13.2: asked again, every 5 s, and passed
+        srv.v2_cuda = [None, None, "13.2"]; srv.v2_pod_reads.clear()
+        pid, said, err = make()
+        assert err is None and len(srv.v2_pod_reads) == 3 and slept == [5, 5], (err, srv.v2_pod_reads, slept)
+        # a 12.8 host under the 13.0 floor: STOPPED (never deleted), a STOP line with both versions, PodctlError
+        srv.v2_cuda = ["12.8"]; slept.clear()
+        pid, said, err = make()
+        assert err and "12.8" in err and "13.0" in err, err
+        stop = [l for l in said if l.startswith("STOP:")]
+        assert len(stop) == 1 and "newpod0000001 stopped" in stop[0] and "CUDA 12.8, below the floor 13.0" in stop[0], said
+        assert srv.posts[-1] == "/pods/newpod0000001/stop" and srv.pod["desiredStatus"] == "EXITED", srv.posts
+        assert srv.deletes == [], "a refused pod is stopped, never deleted, and the volume it is on stays"
+        # an explicit --min-cuda is the floor: 12.8 passes 12.8
+        srv.pod["desiredStatus"] = "RUNNING"
+        pid, said, err = make(min_cuda="12.8")
+        assert err is None and any("cuda     12.8 on the host (floor 12.8)" in l for l in said), (err, said)
+        # never named in about 60 s (12 reads, 5 s apart): refused the same way, and said why
+        srv.v2_cuda = [None]; srv.v2_pod_reads.clear(); slept.clear()
+        pid, said, err = make()
+        assert err and "no CUDA version" in err and len(srv.v2_pod_reads) == 12 and slept == [5] * 11, (err, slept)
+        assert srv.posts[-1] == "/pods/newpod0000001/stop" and srv.deletes == []
+        assert any(l.startswith("STOP:") and "could not be checked" in l for l in said), said
+        # --private takes the same check
+        srv.v2_cuda = ["12.8"]; srv.pod["desiredStatus"] = "RUNNING"
+        pid, said, err = make(private=True)
+        assert err and srv.posts[-1] == "/pods/newpod0000001/stop" and srv.deletes == [], (err, srv.posts)
+        assert "allowedCudaVersions" not in [b for p, b in srv.bodies if p == "/pods"][-1]
+        with pytest.raises(podctl.PodctlError):                      # a --min-cuda that is no version: refused first
+            podctl.create(api, "c2", "NVIDIA B200", "EU-RO-1", data_gb=50, image="x/y:cu130", pubkey="k", wait=False,
+                          min_cuda="thirteen", say=lambda *a: None)
+    finally:
+        srv.close()
+    assert podctl.cuda_at_least("13.2", "13.0") and podctl.cuda_at_least("13.0", "13.0") and podctl.cuda_at_least("12.11", "12.2")
+    assert not podctl.cuda_at_least("12.8", "13.0") and not podctl.cuda_at_least(None, "13.0") and podctl.cuda_at_least(None, None)
+    assert podctl.cuda_key("13.2") == (13, 2)
+
+
+def test_unit_runpod_create_stock_reads_the_v2_catalog_at_the_cuda_floor(tmp_path):
+    """3.29.0: GraphQL's stock view has no CUDA input, so it said "free" for a B200 whose only hosts could not take the
+    create. With create's floor (the image and --min-cuda), availability asks REST v2 GET /catalog/gpus with
+    include=AVAILABILITY, product=POD, cloud=SECURE and minCudaVersion, keeps the data centres whose availability is not
+    NONE, and still leaves out one POST /pods does not take and, for a network volume, one without storage support."""
+    podctl = _load()
+    srv = FakeRunPod(_pod(), gql=B200_STOCK)
+    prov = podctl.RunPodProvider(api=podctl.Api("k", base_url=srv.url, graphql_url=srv.url + "/graphql"))
+    try:
+        assert prov.availability("NVIDIA B200", image="runpod/comfyui:1.4.7-cuda13.0") == ["EU-RO-1", "US-CA-2"]
+        assert srv.catalog_queries[-1] == {"include": "AVAILABILITY", "product": "POD", "cloud": "SECURE", "minCudaVersion": "13.0"}
+        assert srv.posts == [], "no volume wanted: the catalog alone, no GraphQL"
+        # hosts below the floor only: GraphQL still says free, the catalog says NONE, so nowhere
+        srv.catalog_cuda = "12.8"
+        assert podctl.stock(prov.api, "NVIDIA B200") and prov.availability("NVIDIA B200", image="x/y:cu130") == []
+        assert prov.availability("NVIDIA B200", image="x/y:cu130", min_cuda="12.8") == ["EU-RO-1", "US-CA-2"]
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "12.8"
+        # the catalog's own order and words; NONE left out; a data centre create cannot take, and (volume) one with no
+        # network volumes, are named in skipped
+        srv.catalog = {"gpus": [{"id": "NVIDIA H200", "availability": "HIGH", "dataCenters": [{"id": "EU-RO-1", "name": "x", "availability": "HIGH"}]},
+                                {"id": "NVIDIA B200", "availability": "LOW", "dataCenters": [
+                                    {"id": "US-NC-2", "name": "NC 2", "availability": "LOW"},
+                                    {"id": "US-CA-2", "name": "CA 2", "availability": "MEDIUM"},
+                                    {"id": "EU-RO-1", "name": "RO 1", "availability": "NONE"},
+                                    {"id": "US-KS-2", "name": "KS 2", "availability": "LOW"}]}]}
+        srv.gql = {"dataCenters": [{"id": "US-KS-2", "storageSupport": False, "gpuAvailability": []}]}
+        skipped = []
+        assert podctl.stock(prov.api, "NVIDIA B200", floor="13.0", skipped=skipped) == [("US-CA-2", "Medium"), ("US-KS-2", "Low")]
+        assert skipped == [("US-NC-2", "RunPod's create API does not take this data centre")], skipped
+        skipped = []
+        assert podctl.stock(prov.api, "NVIDIA B200", volume=True, floor="13.0", skipped=skipped) == [("US-CA-2", "Medium")]
+        assert ("US-KS-2", "no network volumes here") in skipped and "/graphql" in srv.posts, skipped
+        assert podctl.catalog_stock(prov.api, "NVIDIA B300 SXM6 AC", "13.0") == []
+    finally:
+        srv.close()
+
+
 def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor(tmp_path, capsys):
     """3.8.0, Paul's decision of 2026-10-16: the video packages run on B200 first and B300 second, so `create` without
     --gpu asks for "NVIDIA B200", then "NVIDIA B300 SXM6 AC" (never the 34 GB MIG slice), and takes the first with stock
@@ -2097,7 +2229,8 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         out = capsys.readouterr().out
         body = srv.bodies[-1][1]
         assert body["gpuTypeIds"] == ["NVIDIA B200"] and body["dataCenterIds"] == ["EU-RO-1"], body
-        assert body["allowedCudaVersions"] == ["13.0"], "a cu128 image tag must not lower the floor below the base's cu130"
+        assert "allowedCudaVersions" not in body                                        # 3.29.0: no list; the floor is checked
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "13.0", "a cu128 image tag must not lower the floor below the base's cu130"
         assert "gpu     NVIDIA B200, in EU-RO-1 (no --gpu: the host's order is %s)" % ", ".join(podctl.RunPodProvider.default_gpus) in out, out
         # the volume pins EUR-IS-1, which has no B200: the B300 there
         assert create("--volume", "isvol") in (None, 0)
@@ -2113,7 +2246,8 @@ def test_unit_runpod_create_with_no_gpu_takes_b200_then_b300_and_a_cuda_13_floor
         assert [p for p, _ in srv.bodies[n:] if p != "/graphql"] == [], "a STOP creates no volume and no pod"
         # an explicit --gpu is the only one asked; an explicit --min-cuda still wins over the floor
         assert create("--data-gb", "100", "--gpu", "NVIDIA B300 SXM6 AC", "--min-cuda", "12.9") in (None, 0)
-        assert srv.bodies[-1][1]["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"] and srv.bodies[-1][1]["allowedCudaVersions"] == ["13.0", "12.9"]
+        assert srv.bodies[-1][1]["gpuTypeIds"] == ["NVIDIA B300 SXM6 AC"] and "allowedCudaVersions" not in srv.bodies[-1][1]
+        assert srv.catalog_queries[-1]["minCudaVersion"] == "12.9"
     finally:
         srv.close()
     assert podctl.create_floor("someone/comfy:latest") == "13.0" and podctl.create_floor("runpod/comfyui:1.4.7-cuda13.0") == "13.0"
@@ -2359,7 +2493,7 @@ def test_unit_runpod_create_private_is_an_unencrypted_pod_volume_behind_ssh_only
         assert "drop --private" in str(e.value) and srv.posts == [] and srv.gets == []
         assert _create(podctl, srv, pub, "--private", "--data-gb", "200") in (None, 0)
         out = capsys.readouterr().out
-        assert srv.posts == ["/graphql", "/graphql", "/pods"], srv.posts       # no network volume is made (3.20.0: the price read)
+        assert srv.posts == ["/graphql", "/pods"], srv.posts       # no network volume is made (3.20.0: the price read; 3.29.0: the stock is the v2 catalog, a GET)
         body = srv.bodies[-1][1]
         assert "networkVolumeId" not in body and body["volumeInGb"] == 200 and "volumeEncrypted" not in body, body
         assert set(body) <= POD_CREATE_INPUT, sorted(set(body) - POD_CREATE_INPUT)

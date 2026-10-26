@@ -15,6 +15,7 @@ import pathlib
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from comfyui_hosts import Address, PodctlError, Provider, keychain
@@ -50,6 +51,7 @@ def _sq(s):
 DEFAULT_API_URL = "https://rest.runpod.io/v1"
 DEFAULT_GRAPHQL_URL = "https://api.runpod.io/graphql"   # 3.7.3: stock per data centre lives only here (REST v1 has no stock call)
 DEFAULT_API_V2_URL = "https://api.runpod.io/v2"         # 3.19.0: the account's Secrets (names only) live only here
+# 3.29.0: and a pod's host CUDA (GET /pods/{id} cudaVersion) and stock with a CUDA floor (GET /catalog/gpus minCudaVersion)
 
 
 PLACEHOLDERS = {"token_here", "replace_with_ids", "changeme", ""}
@@ -828,6 +830,10 @@ def create_datacenters(api):
 CREATE_PORTS = ["8188/http", "8888/http", "22/tcp"]      # ComfyUI and JupyterLab through the proxy, sshd on a public port
 PRIVATE_PORTS = ["22/tcp"]                               # 3.7.4 --private: sshd only; ComfyUI is reached through `podctl tunnel`
 CUDA_VERSIONS = ("13.0", "12.9", "12.8", "12.7", "12.6", "12.5", "12.4", "12.3", "12.2", "12.1", "12.0", "11.8")  # the openapi's enum
+# 3.29.0: create no longer sends this list (allowedCudaVersions). RunPod matches it EXACTLY and the enum stops at 13.0,
+# while every B200, B300 and RTX PRO 6000 host with stock reported 13.2 on 2026-10-26, so ["13.0"] could never place one.
+# The floor is kept instead: stock asks the v2 catalog with minCudaVersion, and the pod's own cudaVersion is checked
+# once it is placed (check_pod_cuda).
 # 3.8.0: with no --gpu, `create` asks for these in order (the video packages' GPU_PREFER, py/gpu_fit.py): B200 first,
 # then B300. "NVIDIA B300 SXM6 AC MIG 1g.34gb" is a 34 GB slice of a B300 and is never on this list.
 # 3.18.0 (Paul, 2026-10-16: rendering speed first, his order): then Hopper and the RTX PRO 6000, so a sold-out B200 and
@@ -916,14 +922,62 @@ def pods_spend(api):
     return sum(pod_rate(api, p, prices) for p in pods if isinstance(p, dict) and p.get("desiredStatus") == "RUNNING")
 
 
-def stock(api, gpu, volume=False, skipped=None):
+def cuda_key(v):
+    """3.29.0: a CUDA version as a tuple of numbers, for comparing ("12.11" is above "12.2", as RunPod reads it)."""
+    try:
+        return tuple(int(x) for x in str(v).strip().split("."))
+    except ValueError:
+        raise PodctlError("not a CUDA version: %r (expected e.g. 13.0)" % (v,)) from None
+
+
+def cuda_at_least(version, floor):
+    """3.29.0: True when `version` is `floor` or newer. No floor passes anything; no version (None) never passes a floor."""
+    if not floor:
+        return True
+    return bool(version) and cuda_key(version) >= cuda_key(floor)
+
+
+def catalog_stock(api, gpu, floor):
+    """3.29.0: [(data centre id, availability)] where `gpu` is in stock on a Secure Cloud host whose CUDA is `floor` or
+    newer, in RunPod's order: REST v2 GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE&minCudaVersion=
+    <floor>, which answers {"gpus": [{"id", "availability", "dataCenters": [{"id", "name", "availability"}]}]}.
+    availability is LOW, MEDIUM or HIGH; NONE is left out. GraphQL's stock view has no CUDA input, so it says "free"
+    for a GPU whose only hosts are below the floor (or, before 3.29.0, not the one version create asked for)."""
+    query = urllib.parse.urlencode({"include": "AVAILABILITY", "product": "POD", "cloud": "SECURE", "minCudaVersion": floor})
+    out = api._call("GET", "/catalog/gpus", url=api.v2 + "/catalog/gpus?" + query)
+    gpus = out.get("gpus") if isinstance(out, dict) else None
+    if not isinstance(gpus, list):
+        raise PodctlError("GET /catalog/gpus answered without a gpus list")
+    for g in gpus:
+        if isinstance(g, dict) and g.get("id") == gpu:
+            return [(d["id"], str(d.get("availability"))) for d in g.get("dataCenters") or []
+                    if isinstance(d, dict) and d.get("id") and str(d.get("availability") or "NONE").upper() != "NONE"]
+    return []
+
+
+def stock(api, gpu, volume=False, skipped=None, floor=None):
     """[(data centre id, stock status)] where `gpu` can be rented NOW, in RunPod's order (GraphQL dataCenters; REST v1 has
     no stock call). `available` is the verdict; stockStatus (Low, Medium, High) is said beside it.
     3.10.1: only where a pod can be created: a data centre outside POST /pods' enum (create_datacenters) is left out, and
     with volume (a network volume is wanted) so is one whose storageSupport is false (POST /networkvolumes answers 500
     "does not support network volumes" there: US-NC-1, US-MO-2, EUR-IS-2 on 2026-10-16). Each one left out is appended to
-    `skipped` as (id, why)."""
+    `skipped` as (id, why).
+    3.29.0 floor (a CUDA version, create's): the verdict comes from the v2 catalog with that minCudaVersion instead
+    (catalog_stock), so a GPU whose hosts are all below the floor is not "free". The same two filters apply; with volume,
+    storageSupport is still read from GraphQL dataCenters (the catalog does not say it)."""
     rows, allowed = [], set(create_datacenters(api))
+    if floor:
+        storage = {dc.get("id"): dc.get("storageSupport") for dc in (api.graphql(STOCK_QUERY).get("dataCenters") or [])} if volume else {}
+        for dc, status in catalog_stock(api, gpu, floor):
+            if dc not in allowed:
+                why = "RunPod's create API does not take this data centre"
+            elif volume and storage.get(dc) is False:
+                why = "no network volumes here"
+            else:
+                rows.append((dc, status.title())); continue
+            if skipped is not None:
+                skipped.append((dc, why))
+        return rows
     for dc in (api.graphql(STOCK_QUERY).get("dataCenters") or []):
         for g in dc.get("gpuAvailability") or []:
             if g.get("gpuTypeId") == gpu and g.get("available"):
@@ -961,10 +1015,11 @@ def count_rows(api, gpu, n, dcs):
     return {dc: row[_dc_alias(dc)] for dc in dcs if isinstance(row.get(_dc_alias(dc)), dict) and row[_dc_alias(dc)].get("stockStatus")}
 
 
-def stock_count(api, gpu, n, volume=False, skipped=None):
+def stock_count(api, gpu, n, volume=False, skipped=None, floor=None):
     """stock() for a pod of `n` GPUs: the data centres stock() names (the type is free there, a pod and its volume can be
-    made there), kept only where lowestPrice says `n` of them are free. Each one dropped for the count joins `skipped`."""
-    rows = stock(api, gpu, volume=volume, skipped=skipped)
+    made there), kept only where lowestPrice says `n` of them are free. Each one dropped for the count joins `skipped`.
+    3.29.0 floor: passed to stock(); lowestPrice has no CUDA input, so the count is asked of the data centres it kept."""
+    rows = stock(api, gpu, volume=volume, skipped=skipped, floor=floor)
     if int(n) <= 1:
         return rows
     have = count_rows(api, gpu, n, [dc for dc, _ in rows])
@@ -1000,7 +1055,8 @@ def cuda_floor(image, min_cuda=None):
 
 
 def create_floor(image, min_cuda=None):
-    """The floor `create` sends: --min-cuda as given, else the image tag's floor raised to DEFAULT_MIN_CUDA (3.8.0)."""
+    """The floor `create` holds a pod to: --min-cuda as given, else the image tag's floor raised to DEFAULT_MIN_CUDA (3.8.0).
+    3.29.0: no longer sent as a list; stock asks the catalog with it and check_pod_cuda holds the placed pod to it."""
     if min_cuda:
         return str(min_cuda)
     key = lambda v: tuple(int(x) for x in v.split("."))
@@ -1009,12 +1065,64 @@ def create_floor(image, min_cuda=None):
 
 
 def allowed_cuda(floor):
+    """The REST v1 allowedCudaVersions list at or above `floor`. 3.29.0: create no longer sends it (see CUDA_VERSIONS);
+    kept for callers that read it."""
     if not floor:
         return None
     key = lambda v: tuple(int(x) for x in v.split("."))
     if floor not in CUDA_VERSIONS and not any(key(v) >= key(floor) for v in CUDA_VERSIONS):
         raise PodctlError("--min-cuda %s: RunPod offers %s" % (floor, ", ".join(CUDA_VERSIONS)))
     return [v for v in CUDA_VERSIONS if key(v) >= key(floor)]
+
+
+CUDA_READ_TRIES, CUDA_READ_EVERY = 12, 5   # 3.29.0: about 60 s; a new pod's cudaVersion is null for a few seconds
+
+
+def pod_cuda(api, pod_id):
+    """3.29.0: the CUDA version the pod's host reports, as a string ("13.2"), or None while RunPod names none (it is null
+    for a few seconds after a create). REST v2 GET /pods/{id}, top-level cudaVersion; REST v1's pod has no such field."""
+    out = api._call("GET", "/pods/%s" % pod_id, url=api.v2 + "/pods/%s" % pod_id)
+    v = out.get("cudaVersion") if isinstance(out, dict) else None
+    return (str(v).strip() or None) if v is not None else None
+
+
+def wait_pod_cuda(api, pod_id, sleep=None, tries=CUDA_READ_TRIES, every=CUDA_READ_EVERY):
+    """3.29.0: pod_cuda, asked again every `every` s until it names a version: (version, None), else (None, why) after
+    `tries` reads. A failed read counts as no answer yet."""
+    import time
+    sleep = sleep or time.sleep
+    why = "RunPod named no CUDA version for it in %d s" % (tries * every)
+    for i in range(tries):
+        try:
+            v = pod_cuda(api, pod_id)
+        except PodctlError as e:
+            v, why = None, "its CUDA version could not be read in %d s (%s)" % (tries * every, str(e)[:200])
+        if v:
+            return v, None
+        if i < tries - 1:
+            sleep(every)
+    return None, why
+
+
+def check_pod_cuda(api, pod_id, floor, say=print, sleep=None, tries=CUDA_READ_TRIES, every=CUDA_READ_EVERY):
+    """3.29.0: the check after a create, since create sends no CUDA list: the pod's host CUDA (wait_pod_cuda) against the
+    floor. At or above it: says it and returns the version. Below it, or never named: the pod is STOPPED (never deleted:
+    this account deletes no pod), a STOP line says the version and the floor, and PodctlError is raised (podctl exits 1)."""
+    v, why = wait_pod_cuda(api, pod_id, sleep=sleep, tries=tries, every=every)
+    if v and cuda_at_least(v, floor):
+        say("  cuda     %s on the host (floor %s)" % (v, floor))
+        return v
+    if v:
+        why = "its host reports CUDA %s, below the floor %s" % (v, floor)
+    else:
+        why = "%s, so the floor %s could not be checked" % (why, floor)
+    try:
+        stop(api, pod_id, wait=True, sleep=sleep)
+        done = "stopped"
+    except Exception as e:                       # the refusal is the news; a pod left running is named so it is stopped
+        done = "could NOT be stopped (%s): stop it in the console now" % str(e)[:200]
+    say("STOP: pod %s %s: %s. It was not deleted: terminate it in the console if it is not wanted" % (pod_id, done, why))
+    raise PodctlError("pod %s refused: %s" % (pod_id, why))
 
 
 PRIVATE_UNENCRYPTED = ("note    the pod volume will NOT be encrypted: RunPod's API cannot ask for that (only the console's "
@@ -1032,10 +1140,10 @@ def encryption_words(pod, gb=None):
     return "%s %d GB at %s%s" % (kind, gb, VOLUME_ROOT, tail)
 
 
-def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None, spot=False, private_gb=None, names=None,
+def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, spot=False, private_gb=None, names=None,
                 template_id=None, token=None, link=None, start=None, pod_gb=None, refs=None, gpu_count=1):
     """The POST /pods body for a pod on a network volume: Secure Cloud (network volumes exist only there), the volume's
-    data centre, the ports, PUBLIC_KEY, the CUDA floor. No start command: `ensure` installs the base's boot guard from the
+    data centre, the ports, PUBLIC_KEY. No start command: `ensure` installs the base's boot guard from the
     image's own entry, as for every other pod; and no templateId but the port-names one (3.9.0), which carries nothing else.
     3.7.4 private_gb: a POD VOLUME of that size instead, 22/tcp the only port (no proxied HTTP), and
     BASE_LISTEN=127.0.0.1 so ComfyUI binds loopback and is reached through `podctl tunnel` alone.
@@ -1051,7 +1159,9 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
     and no network volume is): the same ports, names, tokens and key as a network-volume pod.
     3.19.0 refs: {VAR: "{{ RUNPOD_SECRET_VAR }}"} from env_refs, joined to the env of every kind of pod: references
     by name, which RunPod resolves at the pod's start; never a value.
-    3.20.0 gpu_count: the GPUs on the pod (1 to 8); the base's boot runs one ComfyUI on each."""
+    3.20.0 gpu_count: the GPUs on the pod (1 to 8); the base's boot runs one ComfyUI on each.
+    3.29.0: never `allowedCudaVersions` (see CUDA_VERSIONS): RunPod's v1 says no list is any CUDA, and create checks
+    the placed pod's own version against the floor instead (check_pod_cuda)."""
     body = {"name": name, "imageName": image, "gpuTypeIds": [gpu], "gpuCount": int(gpu_count), "cloudType": "SECURE", "computeType": "GPU",
             "dataCenterIds": [dc], "networkVolumeId": volume_id, "volumeMountPath": VOLUME_ROOT, "containerDiskInGb": int(container_gb),
             "ports": list(CREATE_PORTS), "env": {"PUBLIC_KEY": pubkey.strip()}, "supportPublicIp": True, "interruptible": bool(spot)}
@@ -1072,8 +1182,6 @@ def create_body(name, gpu, dc, volume_id, image, container_gb, pubkey, cuda=None
                      "env": {"PUBLIC_KEY": pubkey.strip(), "BASE_LISTEN": "127.0.0.1"}})
     if refs:
         body["env"].update(refs)
-    if cuda:
-        body["allowedCudaVersions"] = list(cuda)
     if start:
         body.update(start)                                     # 3.14.0: create_start, the base's boot from the first start
     return body
@@ -1118,16 +1226,20 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     pod (sold out between the stock check and the create) takes a volume THIS call made with it, so nothing is left
     billing; an existing volume is never deleted. With wait: until sshd answers, then `Host runpod` -> the new pod.
     Returns the pod id. Prints names and counts, never the key.
-    3.18.0 pod_gb: no network volume at all: the pod gets a pod volume of that size (models download fresh)."""
+    3.18.0 pod_gb: no network volume at all: the pod gets a pod volume of that size (models download fresh).
+    3.29.0: no CUDA list is sent; once the pod exists its host CUDA is read and checked against the floor (create_floor:
+    --min-cuda, else the image tag's, never below DEFAULT_MIN_CUDA), with or without wait. Below it, the pod is stopped
+    and PodctlError raised (check_pod_cuda); a network volume this call made stays, with the stopped pod on it."""
     import time
     sleep = sleep or time.sleep
     if not image:
         raise PodctlError("--image is required on RunPod (the pod's container image, e.g. a ComfyUI image built for CUDA 13)")
     if not pubkey:
         raise PodctlError("no public key for PUBLIC_KEY: pass --pubkey <file.pub>")
-    cuda = allowed_cuda(create_floor(image, min_cuda))
+    floor = create_floor(image, min_cuda)
+    cuda_key(floor)                              # a --min-cuda that is not a version is refused before anything is made
     if private:
-        return _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep,
+        return _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, floor, spot, wait, sleep,
                                banner, ssh_config, say, names=names, gpu_count=gpu_count)
     made = None
     if pod_gb:
@@ -1153,7 +1265,7 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
         except PodctlError as e:                # the names are the console's, never a reason to have no pod
             say("  !! the port names could not be written (%s): the Connect tab will say \"HTTP Service\"" % e)
     refs = env_refs(api, say=say)
-    body = create_body(name, gpu, dc, vid, image, container_gb, pubkey, cuda=cuda, spot=spot, names=names, template_id=tid,
+    body = create_body(name, gpu, dc, vid, image, container_gb, pubkey, spot=spot, names=names, template_id=tid,
                        # 3.19.1: open links by default (one click on the Connect tab); --lock mints the terminal's token
                        # and the links' key, and sets BASE_LINK_LOCK=1, and only then do the printed links carry them
                        token=jupyter_token() if lock else None, link=link_token() if lock else None,
@@ -1174,10 +1286,11 @@ def create(api, name, gpu, dc, data_gb=None, volume=None, image=None, container_
     say("created %s (%s): %s · %s × %d · %s · %d GB container disk · %s at %s · ports %s · CUDA %s%s" % (
         pod_id, name, image, gpu, int(gpu_count), dc, int(container_gb), ("pod volume %d GB" % int(pod_gb)) if pod_gb else "network volume %s" % vid,
         VOLUME_ROOT, " ".join(body["ports"]),
-        (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
+        ">= %s (checked on the placed pod)" % floor, " · spot" if spot else ""))
     say("  names    %s%s" % (" · ".join("%d %s" % (int(p), n) for p, n in names),
                              (" (template %s)" % tid) if tid else " (not in the console: no template)"))
     say(refs_line(refs))
+    check_pod_cuda(api, pod_id, floor, say=say, sleep=sleep)     # 3.29.0: below the floor: stopped, STOP, PodctlError
     back = made_pod.get("ports")
     if back and sorted(back) != sorted(body["ports"]):
         say("  !! %s came back with ports %s, not %s" % (pod_id, " ".join(back), " ".join(body["ports"])))
@@ -1226,7 +1339,7 @@ def seed_jupyter_token(say=print):
     return tok if last[0] == "SEEDED" else (last[0] or None)
 
 
-def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, cuda, spot, wait, sleep, banner, ssh_config, say,
+def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pubkey, floor, spot, wait, sleep, banner, ssh_config, say,
                     names=None, gpu_count=1):
     """3.7.4 `create --private`: a pod volume, sshd only, ComfyUI on loopback.
     3.9.1: the volume is NOT encrypted, and that is said before the pod exists, never after: no create input RunPod
@@ -1239,7 +1352,7 @@ def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pu
         raise PodctlError("--private needs --data-gb N: the size of the pod volume at %s" % VOLUME_ROOT)
     say(PRIVATE_UNENCRYPTED)
     refs = env_refs(api, say=say)
-    body = create_body(name, gpu, dc, None, image, container_gb, pubkey, cuda=cuda, spot=spot, private_gb=data_gb,
+    body = create_body(name, gpu, dc, None, image, container_gb, pubkey, spot=spot, private_gb=data_gb,
                        start=create_start(sshd_bootstrap_text()), refs=refs, gpu_count=gpu_count)
     pod_id = api.post("/pods", body)["id"]
     back = api.get("/pods/%s%s" % (pod_id, POD_READ))
@@ -1248,8 +1361,9 @@ def _create_private(api, name, gpu, dc, data_gb, volume, image, container_gb, pu
         say("  !! %s came back with ports %s, not %s" % (pod_id, " ".join(ports), " ".join(PRIVATE_PORTS)))
     say("created %s (%s): %s · %s × %d · %s · %d GB container disk · %s · ports %s only · "
         "ComfyUI on loopback · CUDA %s%s" % (pod_id, name, image, gpu, int(gpu_count), dc, int(container_gb), encryption_words(back, data_gb),
-                                              " ".join(PRIVATE_PORTS), (">= %s" % cuda[-1] if cuda else "any"), " · spot" if spot else ""))
+                                              " ".join(PRIVATE_PORTS), ">= %s (checked on the placed pod)" % floor, " · spot" if spot else ""))
     say(refs_line(refs))
+    check_pod_cuda(api, pod_id, floor, say=say, sleep=sleep)     # 3.29.0
     say("  private: no proxy URL; ComfyUI is http://localhost:8188 through podctl tunnel %s, which also names the Jupyter "
         "Terminal (its token made by the boot, on this volume) and each app port. The volume is this machine's (kept across "
         "stop/start, deleted with the pod)." % pod_id)
@@ -1348,12 +1462,15 @@ class RunPodProvider(Provider):
         return record_volume(self.api, pod, env=env)
 
     # 3.7.3: `podctl create` (the verb Verda already had) and the stock check behind it
-    def availability(self, gpu, spot=False, volume=False, count=1):
+    def availability(self, gpu, spot=False, volume=False, count=1, image=None, min_cuda=None):
         """The data centres where `gpu` can be rented now AND a pod can be created (3.10.1: with volume, one that takes a
         network volume too), in RunPod's order (spot shares the on-demand stock view). The ones left out, and why, are
-        in self.skipped afterwards. 3.20.0 count: where that many are free (stock_count)."""
+        in self.skipped afterwards. 3.20.0 count: where that many are free (stock_count).
+        3.29.0 image, min_cuda (create passes them): only on hosts at create's CUDA floor or newer (create_floor, the v2
+        catalog); without either, the GraphQL view as before."""
         self.skipped = []
-        return [dc for dc, _ in stock_count(self.api, gpu, count, volume=volume, skipped=self.skipped)]
+        floor = create_floor(image, min_cuda) if (image or min_cuda) else None
+        return [dc for dc, _ in stock_count(self.api, gpu, count, volume=volume, skipped=self.skipped, floor=floor)]
 
     def price(self, gpu, count=1, location=None, spot=False):
         return price(self.api, gpu, count, location, spot=spot)
