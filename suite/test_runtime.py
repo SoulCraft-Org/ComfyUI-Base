@@ -60,11 +60,13 @@ def _green_tree(root):
     return c
 
 
-def _build(root, out, part_bytes=None):
+def _build(root, out, part_bytes=None, apt=None):
     args = ["python3", str(RT), "build", "--root", str(root), "--comfy", str(root / "ComfyUI"), "--out", str(out),
             "--torch-cuda", "13.0", "--base-version", "9.9.9", "--python", "3.99.0", "--sage-key", "sageattention-abc-cp399-torch2.99.0-sm_120"]
     if part_bytes:
         args += ["--part-bytes", str(part_bytes)]
+    if apt:
+        args += ["--apt", apt]
     r = subprocess.run(args, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     return json.loads((out / "runtime.json").read_text())
@@ -486,3 +488,101 @@ def test_unit_a_lock_whose_process_is_gone_is_no_lock_and_a_library_waits_for_th
     assert r.stdout.split() == ["FREE", "EARLY"], r.stdout + r.stderr
     r = subprocess.run(["bash", "-c", snippet + '_base_runtime_early_ok && echo EARLY || echo LATE'], capture_output=True, text=True, env=_env(dst, BASE_LIBRARY=str(tmp_path / "lib")))
     assert r.stdout.split() == ["FREE", "LATE"], r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------- 3.29.5: RunPod's stock image in runtime mode: apt, zstd, the tree
+
+def _fake_apt(tmp_path, installed):
+    """A stand-in apt-get and dpkg-query on PATH: dpkg-query answers from a file, apt-get logs and appends what it installs."""
+    d = tmp_path / "fakeapt"; d.mkdir(); log = tmp_path / "apt.log"; inst = tmp_path / "installed.txt"
+    inst.write_text("".join(x + "\n" for x in installed))
+    (d / "dpkg-query").write_text('#!/bin/bash\nfor last; do :; done\ngrep -qx "$last" "%s" && printf "ii " || printf "un "\nexit 0\n' % inst)
+    (d / "apt-get").write_text(
+        '#!/bin/bash\necho "apt-get $*" >> "%s"\ninst=0; skip=0\nfor a in "$@"; do\n  if [ $skip = 1 ]; then skip=0; continue; fi\n'
+        '  case "$a" in -o) skip=1;; -*) ;; install) inst=1;; update) ;; *) [ $inst = 1 ] && echo "$a" >> "%s";; esac\ndone\nexit 0\n' % (log, inst))
+    for f in d.iterdir():
+        f.chmod(0o755)
+    return d, log, inst
+
+
+def test_unit_capture_writes_the_apt_packages_its_machine_has(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); (src / "comfy-base" / "state" / "last-run").mkdir(parents=True)
+    (src / "comfy-base" / "state" / "last-run" / "pkg").write_text("green 20261026-000000 1.0.0\n")
+    d, log, inst = _fake_apt(tmp_path, ["zstd", "python3-venv", "ffmpeg", "libegl1", "libgles2", "openssh-server"])
+    r = _base(["runtime-capture", str(tmp_path / "cap")], src, PATH="%s:%s" % (d, os.environ["PATH"]))
+    assert r.returncode == 0, r.stdout + r.stderr
+    m = json.loads((tmp_path / "cap" / "runtime.json").read_text())
+    assert m["apt"] == ["zstd", "python3-venv", "ffmpeg", "libegl1", "libgles2", "openssh-server"]       # zstd first; nfs-common is not installed there
+    out = subprocess.run(["python3", str(RT), "apt", str(tmp_path / "cap" / "runtime.json")], capture_output=True, text=True).stdout.split()
+    assert out == m["apt"]
+
+
+def test_unit_apply_installs_only_the_missing_apt_packages_zstd_first_and_records_the_seconds(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"
+    _build(src, out, part_bytes=40000, apt="zstd,python3-venv,ffmpeg,libegl1,libgles2")
+    d, log, inst = _fake_apt(tmp_path, ["ffmpeg"])                                  # the image has ffmpeg, nothing else
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    r = _base(["runtime-apply", str(out / "runtime.json")], dst, PATH="%s:%s" % (d, os.environ["PATH"]), BASE_FAKE_APT=str(d))
+    assert r.returncode == 0, r.stdout + r.stderr
+    installs = [ln for ln in log.read_text().splitlines() if " install " in ln]
+    assert len(installs) == 2 and installs[0].endswith("install zstd python3-venv") and installs[1].endswith("install libegl1 libgles2"), installs
+    assert "ffmpeg" not in " ".join(installs)                                         # present: never reinstalled
+    assert (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    res = json.loads((dst / "comfy-base" / "state" / "runtime-apply.json").read_text())
+    assert res["apt_installed"] == ["zstd", "python3-venv", "libegl1", "libgles2"] and res["apt_failed"] == [] and res["apt_seconds"] >= 0
+    timings = "".join(f.read_text() for f in (dst / "comfy-base" / "state" / "logs").glob("runtime-apply_*.timings.tsv"))
+    assert "RUNTIME fetch and unpack" in timings and "apt " in timings and "libegl1" in timings
+    again = _base(["runtime-apply", str(out / "runtime.json")], dst, PATH="%s:%s" % (d, os.environ["PATH"]), BASE_FAKE_APT=str(d))
+    assert again.returncode == 0 and "already applied" in again.stdout
+    assert len([ln for ln in log.read_text().splitlines() if " install " in ln]) == 2        # nothing missing, nothing run
+
+
+def test_unit_a_machine_that_cannot_install_says_which_packages_and_still_unpacks(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"
+    _build(src, out, part_bytes=40000, apt="zstd,ffmpeg,libegl1")
+    d, log, inst = _fake_apt(tmp_path, [])
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    r = _base(["runtime-apply", str(out / "runtime.json")], dst, PATH="%s:%s" % (d, os.environ["PATH"]), BASE_FAKE_APT=str(d), BASE_FAKE_APT_NOROOT="1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "could not install" in r.stdout and "ffmpeg" in r.stdout and not log.exists()
+    res = json.loads((dst / "comfy-base" / "state" / "runtime-apply.json").read_text())
+    assert set(res["apt_failed"]) == {"zstd", "ffmpeg", "libegl1"}
+    # the install carries it into its own summary
+    r2 = subprocess.run(["bash", "-c", 'source "%s/base.sh"; base_env_setup; _base_runtime_apt_warn; printf "W %%s\\n" "${BASE_WARN[@]}"' % BASE],
+                        capture_output=True, text=True, env=_env(dst))
+    assert "could not install: zstd ffmpeg libegl1" in r2.stdout + r2.stderr
+
+
+def test_unit_the_unpack_waits_for_zstd_only_while_its_install_runs(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
+    bare = tmp_path / "bare"; bare.mkdir()                                               # a PATH with no zstd, no tar
+    gate = tmp_path / "zstd.failed"; gate.write_text("")                                 # the install of it has failed
+    t0 = time.time()
+    r = subprocess.run([__import__("sys").executable, str(RT), "apply", str(out / "runtime.json"), str(out / "runtime.json"), "--root", str(tmp_path / "d"),
+                        "--work", str(tmp_path / "w"), "--zstd-wait", "60", "--zstd-gate", str(gate)], capture_output=True, text=True, env={"PATH": str(bare)})
+    assert r.returncode == 1 and "zstd is not installed" in r.stderr and time.time() - t0 < 30      # the gate ends the wait at once
+
+
+def test_unit_runtime_mode_reads_the_runtimes_tree_not_another_one_on_the_volume(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    assert _base(["runtime-apply", str(out / "runtime.json")], dst).returncode == 0
+    other = dst / "runpod-slim" / "ComfyUI"; other.mkdir(parents=True); (other / "main.py").write_text("")       # RunPod's own tree, recorded by an earlier install
+    (dst / "comfy-base" / "state" / "boot.env").write_text("COMFY=%s\n" % other)
+    snippet = 'source "%s/base.sh"; base_env_setup; _base_runtime_pin_tree; base_discover quiet; echo "COMFY=$COMFY"' % BASE
+    r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, env=_env(dst, BASE_RUNTIME=str(dst / "comfy-base" / "state" / "runtime.json")))
+    assert "COMFY=%s" % (dst / "ComfyUI").resolve() in r.stdout, r.stdout + r.stderr
+
+
+def test_unit_runtime_mode_never_reaches_the_cublas_probe_uv_or_a_local_run_copy():
+    """3.29.5, RunPod's runpod/comfyui:1.4.7-cuda13.0 (nvcc and cudart only, no cuBLAS): cuBLAS is for source builds, which runtime mode
+    never starts; no uv step runs; the image's own ComfyUI is never a candidate; the local-run copy decides by the filesystem."""
+    summary = (BASE / "lib" / "95-summary.sh").read_text()
+    branch = summary[summary.index("  if _base_runtime_on; then\n    _base_hook pkg_pre_venv"):summary.index("  else\n  if [ \"$sysbg\" = 1 ]")]
+    for never in ("cuda_toolchain", "_base_ensure_uv", "base_venv", "base_packs pip", "base_mcp"):
+        assert never not in branch.replace("_base_runtime_venv", ""), never
+    packs = (BASE / "lib" / "40-packs.sh").read_text()
+    assert "_base_runtime_on || [ \"${BASE_CUDA_FOREGROUND:-0}\" = \"1\" ]" in packs                 # the background probe is off in runtime mode
+    assert "/opt/comfyui-baked" not in "".join((BASE / "lib" / f).read_text() for f in os.listdir(BASE / "lib") if f.endswith(".sh"))
+    run_local = (BASE / "py" / "run_local.py").read_text()
+    assert "not a network filesystem: it runs in place" in run_local                       # BASE_LOCAL_RUN=auto leaves a local /workspace alone

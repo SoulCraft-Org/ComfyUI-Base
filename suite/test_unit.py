@@ -79,8 +79,9 @@ def test_unit_the_os_stage_installs_the_gl_libraries_mediapipe_links():
     """3.29.1: MediaPipe's libmediapipe.so links libEGL.so.1 and libGLESv2.so.2 even on CPU (OSError: libEGL.so.1). On Ubuntu
     24.04 those are libegl1 and libgles2; the OS stage's own package list and the Verda startup's must both carry them."""
     sysh = (BASE / "lib" / "15-system.sh").read_text()
-    want = re.search(r"local want=\(([^)]*)\)", sysh)
+    want = re.search(r"_base_apt_core\(\)\{[^\n]*\n(?:[^\n]*\n)*?\s*echo \"([^\"]*)\"", sysh)      # 3.29.5: the one list the OS stage and runtime-capture read
     assert want and {"libegl1", "libgles2"} <= set(want.group(1).split()), want and want.group(1)
+    assert "read -r -a want <<< \"$(_base_apt_core)\"" in sysh
     startup = (BASE / "hosts" / "verda" / "startup.sh").read_text()
     need = re.search(r"local need=\(([^)]*)\)", startup)
     assert need and {"libegl1", "libgles2"} <= set(need.group(1).split()), need and need.group(1)

@@ -10,11 +10,14 @@ the parts fetch in any order, unpack in any order and unpack at once. runtime.js
 versions are written (the base's lib/ and py/ carry none) and lists every part's name, sha256 and bytes.
 
     runtime.py build --root /workspace --comfy /workspace/ComfyUI --out DIR --torch-cuda 13.0 [--part-bytes N]
-                     [--url-base PREFIX] [--jobs N] [--level N] [--base-version V] [--python V] [--sage-key K]
+                     [--url-base PREFIX] [--jobs N] [--level N] [--base-version V] [--python V] [--sage-key K] [--apt a,b,c]
     runtime.py apply MANIFEST LOCATION --root DIR --work DIR [--parts FILE] [--jobs 8] [--result FILE]
-                                                   fetch parts --jobs at a time, verify each sha256, unpack each as it lands
+                     [--zstd-wait S --zstd-gate FILE]   fetch parts --jobs at a time, verify each sha256, unpack each as it lands
+    runtime.py apt MANIFEST                        the apt packages the runtime needs, one per line (zstd first)
+    runtime.py result-add FILE KEY VALUE           add one field (VALUE as JSON when it parses) to an apply result
+    runtime.py ledger-line FILE [--label TEXT]     "<t0>\\t<t1>\\t<seconds>\\t<text>": the apply as one row of the timing ledger
     runtime.py verify-parts MANIFEST DIR           every part's size and sha256; rc 1 naming the first that differs
-    runtime.py sources MANIFEST LOCATION [--parts FILE]   "<name>\t<where to fetch it>\t<bytes>" per part
+    runtime.py sources MANIFEST LOCATION [--parts FILE]   "<name>\\t<where to fetch it>\\t<bytes>" per part
     runtime.py check-tree MANIFEST --comfy DIR     ComfyUI's and every pack's HEAD equal the manifest's; rc 1 per difference
     runtime.py covers MANIFEST URL...              rc 1 naming every pack URL the runtime does not carry
     runtime.py field MANIFEST dotted.key           one value, for bash
@@ -108,11 +111,20 @@ def _members(root, comfy_rel):
                 yield p, str(p.relative_to(root))
 
 
-def _zstd():
-    z = shutil.which("zstd")
-    if not z:
-        raise SystemExit("runtime: zstd is not installed (apt-get install zstd); the runtime's parts are zstd tars")
-    return z
+ZSTD_WAIT = (0, None)               # (seconds, gate file): an apt install of zstd may still be running beside the fetch
+
+
+def _zstd(wait=0, gate=None):
+    """The zstd binary. With `wait`, polls for it while an install of it runs, until the gate file (written when that install
+    failed) appears or the time is up."""
+    deadline = time.time() + wait
+    while True:
+        z = shutil.which("zstd")
+        if z:
+            return z
+        if time.time() >= deadline or (gate and os.path.exists(gate)):
+            raise SystemExit("runtime: zstd is not installed (apt-get install zstd); the runtime's parts are zstd tars")
+        time.sleep(0.2)
 
 
 def _sha_file(path):
@@ -207,7 +219,7 @@ def build(a):
         p["url"] = "%s/%s" % (url_base, p["name"]) if url_base else p["name"]
     manifest = {
         "format": FORMAT, "compression": "zstd", "created": _utc(), "base": a.base_version or "",
-        "cuda": a.torch_cuda, "driver_min": str(floor),
+        "cuda": a.torch_cuda, "driver_min": str(floor), "apt": [x for x in (a.apt or "").split(",") if x],
         "comfyui": {"dir": comfy_rel, "commit": _git(root / comfy_rel, "rev-parse", "HEAD"), "version": version},
         "python": a.python or "", "venv": "%s/.venv-cu130" % comfy_rel if (root / comfy_rel / ".venv-cu130").exists() else "",
         "packs": packs, "sageattention": {"key": a.sage_key or ""},
@@ -329,7 +341,11 @@ def _fetch(where, dest):
 
 def _unpack(part, root):
     """zstd -dc part | tar -x -C root, both exit codes judged."""
-    z = subprocess.Popen([_zstd(), "-dc", "-q", str(part)], stdout=subprocess.PIPE)
+    try:
+        zbin = _zstd(*ZSTD_WAIT)
+    except SystemExit as e:
+        raise RuntimeError(str(e))
+    z = subprocess.Popen([zbin, "-dc", "-q", str(part)], stdout=subprocess.PIPE)
     t = subprocess.run(["tar", "-xf", "-", "-C", str(root)], stdin=z.stdout, capture_output=True, text=True)
     z.stdout.close()
     zrc = z.wait()
@@ -369,7 +385,10 @@ def apply(a):
     rows = sorted(_resolve(m, a.location, a.parts), key=lambda r: -r.get("bytes", 0))
     root, work = pathlib.Path(a.root), pathlib.Path(a.work)
     work.mkdir(parents=True, exist_ok=True)
-    _zstd()
+    global ZSTD_WAIT
+    ZSTD_WAIT = (a.zstd_wait, a.zstd_gate)
+    if not a.zstd_wait:
+        _zstd()
     t0 = time.time()
     done, failed = [], None
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(a.jobs, len(rows) or 1)))
@@ -396,6 +415,34 @@ def apply(a):
         pathlib.Path(a.result).write_text(json.dumps(res) + "\n", encoding="utf-8")
     print("runtime: %d part(s), %.2f GB packed (%.2f GB unpacked) in %.1f s = %.2f GB/s, %d at once (busy: fetch %.0f s, verify %.0f s, unpack %.0f s)" % (
         len(rows), packed / 1e9, raw / 1e9, wall, res["gbps"], a.jobs, res["fetch_seconds"], res["verify_seconds"], res["unpack_seconds"]))
+    return 0
+
+
+def apt(a):
+    for name in _load(a.manifest).get("apt", []):
+        print(name)
+    return 0
+
+
+def result_add(a):
+    f = pathlib.Path(a.file)
+    r = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    try:
+        r[a.key] = json.loads(a.value)
+    except ValueError:
+        r[a.key] = a.value
+    f.write_text(json.dumps(r) + "\n", encoding="utf-8")
+    return 0
+
+
+def ledger_line(a):
+    r = json.loads(pathlib.Path(a.file).read_text(encoding="utf-8"))
+    extra = ""
+    if "apt_seconds" in r:
+        extra = "; apt %ss%s" % (r["apt_seconds"], (": " + " ".join(r["apt_installed"])) if r.get("apt_installed") else ", nothing missing")
+    print("%s\t%s\t%s\t%s: %d parts, %.2f GB packed (%.2f GB unpacked), %.2f GB/s, %d at once (busy: fetch %ss, verify %ss, unpack %ss%s)" % (
+        r["t0"], r["t1"], round(r["seconds"]), a.label, r["parts"], r["bytes"] / 1e9, r["raw"] / 1e9, r["gbps"], r["jobs"],
+        r["fetch_seconds"], r["verify_seconds"], r["unpack_seconds"], extra))
     return 0
 
 
@@ -449,6 +496,7 @@ def main(argv=None):
     b.add_argument("--level", type=int, default=ZSTD_LEVEL)
     b.add_argument("--url-base", default="")
     b.add_argument("--torch-cuda", required=True)
+    b.add_argument("--apt", default="", help="comma-separated apt packages the runtime needs on a machine that skips the OS stage")
     b.add_argument("--base-version", default="")
     b.add_argument("--python", default="")
     b.add_argument("--sage-key", default="")
@@ -467,6 +515,17 @@ def main(argv=None):
     ap_.add_argument("--parts")
     ap_.add_argument("--jobs", type=int, default=JOBS)
     ap_.add_argument("--result")
+    ap_.add_argument("--zstd-wait", type=int, default=0)
+    ap_.add_argument("--zstd-gate")
+    t_ = sub.add_parser("apt")
+    t_.add_argument("manifest")
+    r_ = sub.add_parser("result-add")
+    r_.add_argument("file")
+    r_.add_argument("key")
+    r_.add_argument("value")
+    l_ = sub.add_parser("ledger-line")
+    l_.add_argument("file")
+    l_.add_argument("--label", default="RUNTIME fetch and unpack")
     c = sub.add_parser("check-tree")
     c.add_argument("manifest")
     c.add_argument("--comfy", required=True)
@@ -477,7 +536,7 @@ def main(argv=None):
     f.add_argument("manifest")
     f.add_argument("key")
     a = ap.parse_args(argv)
-    return {"build": build, "verify-parts": verify_parts, "sources": sources, "apply": apply, "check-tree": check_tree,
+    return {"build": build, "verify-parts": verify_parts, "sources": sources, "apply": apply, "apt": apt, "result-add": result_add, "ledger-line": ledger_line, "check-tree": check_tree,
             "covers": covers, "field": field}[a.cmd](a)
 
 
