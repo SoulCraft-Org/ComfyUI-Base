@@ -249,9 +249,9 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _signed(parts_file, manifest_parts):
-    """{name: url} from a list of per-part links given beside a local manifest: a JSON list (or {"parts": [...]}) of
-    {name, url[, sha256, bytes]}. A sha256 or size it states must be the manifest's: the links never override what the
-    manifest says the bytes are."""
+    """{name: url} from the per-part links given beside a local manifest: the site's entitlement `runtime` object as it
+    comes ({id, manifest: {url, sha256, bytes}, parts: [{name, url, sha256, bytes}]}) or a bare list of parts. A sha256 or
+    size the links state is only a cross-check: it must be the manifest's, and the manifest's values judge the bytes."""
     data = json.loads(pathlib.Path(parts_file).read_text(encoding="utf-8"))
     rows = data.get("parts", []) if isinstance(data, dict) else data
     by_name = {p["name"]: p for p in manifest_parts}
@@ -270,6 +270,19 @@ def _signed(parts_file, manifest_parts):
     if missing:
         raise SystemExit("runtime: the link list has no link for %d part(s), first %s" % (len(missing), missing[0]))
     return out
+
+
+def _check_links_manifest(manifest, parts_file):
+    """The entitlement names the manifest's own sha256 and size: the file in hand must be that one."""
+    data = json.loads(pathlib.Path(parts_file).read_text(encoding="utf-8"))
+    ref = data.get("manifest") if isinstance(data, dict) else None
+    if not isinstance(ref, dict):
+        return
+    raw = pathlib.Path(manifest).read_bytes()
+    if ref.get("sha256") and ref["sha256"] != hashlib.sha256(raw).hexdigest():
+        raise SystemExit("runtime: the manifest is not the one the link list names (sha256 differs)")
+    if ref.get("bytes") and ref["bytes"] != len(raw):
+        raise SystemExit("runtime: the manifest is not the one the link list names (%d bytes, it names %s)" % (len(raw), ref["bytes"]))
 
 
 def _resolve(m, loc, parts_file=None):
@@ -309,7 +322,9 @@ def _fetch(where, dest):
     r = subprocess.run(["curl", "-fsSL", "--retry", "5", "--retry-delay", "2", "--retry-all-errors", "-C", "-", "--max-time", "1800",
                         "-o", str(dest), where], capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError("curl exit %d: %s" % (r.returncode, _scrub((r.stderr or "").strip().splitlines()[-1] if r.stderr.strip() else "")))
+        why = _scrub((r.stderr or "").strip().splitlines()[-1] if r.stderr.strip() else "")
+        hint = " (a signed link lasts about ten minutes: it may have expired)" if r.returncode == 22 and ("403" in why or "401" in why) else ""
+        raise RuntimeError("curl exit %d: %s%s" % (r.returncode, why, hint))
 
 
 def _unpack(part, root):
@@ -347,6 +362,8 @@ def apply(a):
     """Every part, `jobs` at a time: fetched, verified and unpacked as it lands, the largest first. Nothing is stamped
     here: the caller does that on a zero exit. A failed part stops the rest and is named (never its link)."""
     m = _load(a.manifest)
+    if a.parts:
+        _check_links_manifest(a.manifest, a.parts)
     if m.get("format") != FORMAT or m.get("compression") != "zstd":
         raise SystemExit("runtime: %s is runtime format %s, this base reads format %d (zstd parts): capture it again" % (a.manifest, m.get("format"), FORMAT))
     rows = sorted(_resolve(m, a.location, a.parts), key=lambda r: -r.get("bytes", 0))

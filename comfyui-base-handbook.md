@@ -712,8 +712,11 @@ zstd-compressed tar (`runtime.NNN.tar.zst`, about 512 MB of file content each, `
 its own files so it unpacks alone; compression runs one part per CPU. `runtime.json` lists each part's `name`, `sha256`,
 `bytes` (packed) and `raw` (unpacked), with `format: 2`, `compression: zstd`. `runtime-apply <manifest> [--parts <links.json>]
 [--jobs N]` fetches N parts at once (8; `BASE_RUNTIME_JOBS`), largest first, from the manifest's https URL (parts beside it,
-or each part's own `url`), from a list of per-part links given beside a local manifest (`links.json`: `[{name, url, sha256,
-bytes}]`, a sha256 or size that disagrees with the manifest is refused, a link is a credential and is never printed), or
+or each part's own `url`), from the per-part links given beside a local manifest (`--parts links.json`: the site's entitlement `runtime` object as it
+comes, `{id, manifest: {url, sha256, bytes}, parts: [{name, url, sha256, bytes}]}`, or a bare list of parts; the manifest's
+own sha256 and bytes judge every part, the links' values are only a cross-check and a disagreement is refused, as is a
+manifest that is not the one the links name; a link is a credential, never printed, lasts about ten minutes and a
+failed one fails its part by name, retried only a few times), or
 from a local folder; each part's size and sha256 are checked and the part is unpacked (`zstd -dc | tar -x`) the moment it
 lands, in parallel with the rest, then deleted. Nothing is stamped until every part is in; a failed part stops the apply,
 named, and a re-run fetches again. `zstd` must be on the machine (the apply installs the package where it is root and apt

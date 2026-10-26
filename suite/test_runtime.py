@@ -213,11 +213,19 @@ def test_unit_signed_links_beside_a_local_manifest_are_used_and_never_printed(tm
     dst = tmp_path / "dst"; dst.mkdir()
     with _Server(out, need="sig=s3cret") as srv:
         links = [{"name": p["name"], "url": "%s/%s?sig=s3cret" % (srv.url, p["name"]), "sha256": p["sha256"], "bytes": p["bytes"]} for p in man["parts"]]
-        (held / "links.json").write_text(json.dumps(links))
+        mraw = (held / "runtime.json").read_bytes()               # the site's entitlement `runtime` object, as it comes
+        ent = {"id": "rt-1", "manifest": {"url": srv.url + "/runtime.json", "sha256": __import__("hashlib").sha256(mraw).hexdigest(), "bytes": len(mraw)}, "parts": links}
+        (held / "links.json").write_text(json.dumps(ent))
         r = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
                             "--root", str(dst), "--work", str(tmp_path / "w")], capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr
         assert "s3cret" not in r.stdout + r.stderr
+        ent["manifest"]["sha256"] = "0" * 64                       # links that name another manifest are refused before any fetch
+        (held / "links.json").write_text(json.dumps(ent))
+        other = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
+                                "--root", str(tmp_path / "dx"), "--work", str(tmp_path / "wx")], capture_output=True, text=True)
+        assert other.returncode != 0 and "not the one the link list names" in other.stderr and not (tmp_path / "dx").exists()
+        (held / "links.json").write_text(json.dumps(links))        # and a bare list of parts is accepted too
         links[1]["url"] = "%s/%s?sig=wrong" % (srv.url, man["parts"][1]["name"])              # a link the server refuses
         (held / "links.json").write_text(json.dumps(links))
         dst2 = tmp_path / "dst2"; dst2.mkdir()
