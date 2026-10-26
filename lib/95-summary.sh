@@ -51,11 +51,11 @@ _base_hook(){ # run a package hook if the package defines it; a failing hook fai
 base_init(){
   base_env_setup
   _base_logging
-  ! _base_runtime_on || _base_runtime_pin_tree     # 3.29.5: the runtime's tree, never another one on the volume
+  ! _base_runtime_on || _base_runtime_pin_tree     # 3.30.2: the runtime's tree, never another one on the volume
   local drc=0; base_discover quiet || drc=$?
   if [ "$drc" = 3 ]; then base_discover || true; exit 3; fi             # no network volume: the refusal, printed
   BASE_RUNTIME_PENDING=0
-  if _base_runtime_on && _base_runtime_pending_check; then               # 3.29.4: the runtime is still unpacking; the tree is read after it
+  if _base_runtime_on && _base_runtime_pending_check; then               # 3.30.1: the runtime is still unpacking; the tree is read after it
     if ! _base_validate_tables; then err "the package's declarations are invalid (see above)"; exit 2; fi
     _base_runtime_init; _base_runtime_pretree; _base_tmp
     return 0
@@ -111,7 +111,7 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
   # inside a pack and uv can be had now (lib/52-models-early.sh _base_early_first); else after them, below, as before
   if ! _base_runtime_on && _base_early_first "$sysbg"; then _base_models_early_start || true; fi
   if _base_runtime_on; then            # 3.1.0: the tree, the packs and the venv are the runtime's, checked, never moved
-    # 3.29.4: the first set of models starts now, beside the unpack when it is still running; only the tree waits for it
+    # 3.30.1: the first set of models starts now, beside the unpack when it is still running; only the tree waits for it
     if _base_runtime_early_ok && _base_early_first 0; then _base_models_early_start || true; fi
     if [ "${BASE_RUNTIME_PENDING:-0}" = 1 ]; then if ! _base_runtime_wait_apply; then base_summary; fi; fi
     if ! _base_runtime_comfy; then base_summary; fi

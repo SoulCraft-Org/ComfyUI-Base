@@ -91,7 +91,7 @@ _base_machine_record(){ # the store's per-machine record: which driver and CUDA 
   { echo "host=$h"; echo "driver=${BASE_DRIVER_AFTER:-$(_base_running_driver)}"; echo "cuda=${cuda:-}"; echo "kernel=$(uname -r 2>/dev/null)"; echo "ts=$(_base_ts)"; } > "$d/$h.env" 2>/dev/null || true
 }
 
-_base_apt_core(){ # the base's own apt packages on every host (3.29.5: one list, read by the OS stage and by runtime-capture, which
+_base_apt_core(){ # the base's own apt packages on every host (3.30.2: one list, read by the OS stage and by runtime-capture, which
   # writes the ones installed on its machine into runtime.json for a machine that skips the OS stage)
   echo "python3-venv ffmpeg libegl1 libgles2"
 }

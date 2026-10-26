@@ -21,7 +21,7 @@
 #   stopping         an install that stops before the join (a failed venv, a restart required, an ERR) stops its early
 #                    downloads too; hf and curl resume from the staging folder on the next run.
 #   off              BASE_MODELS_FOREGROUND=1 (the 3.10 order), a dry run, a seed build (no models).
-#   3.29.4, runtime  a buyer's machine (BASE_RUNTIME) starts them at t0, beside the runtime's unpack when that is still running
+#   3.30.1, runtime  a buyer's machine (BASE_RUNTIME) starts them at t0, beside the runtime's unpack when that is still running
 #                    (lib/48-runtime.sh): no uv step runs there, so the downloader is hf in a venv of the system Python
 #                    (_base_fetch_tool_pip), and a row inside a pack (custom_nodes/) waits for the unpack as before.
 #   3.28.0, sooner   before the ComfyUI fetch and the pack clones too, when no row of the first set is a custom_nodes/<Pack>

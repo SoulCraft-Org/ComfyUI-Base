@@ -13,7 +13,7 @@
 #
 # The versions live ONLY in runtime.json. This file and py/runtime.py read them; neither writes one down.
 #
-# 3.29.4: the models do not wait for the unpack. While `runtime-apply` runs it holds $BASE_STATE/runtime.applying
+# 3.30.1: the models do not wait for the unpack. While `runtime-apply` runs it holds $BASE_STATE/runtime.applying
 # ("<pid> <manifest sha256>"; a dead pid is no lock) and has already put the manifest at state/runtime.json; an install
 # with BASE_RUNTIME set then finds its manifest "pending", starts the package's model downloads at once where the tree
 # will be, and waits for the stamp only where it first needs the tree, the venv or a pack. Pod to App ready becomes
@@ -200,7 +200,7 @@ _base_runtime_ledger(){ # <result json> → the RUNTIME row of the run's timing 
   PKG_ID="runtime-apply" _base_timings_write
 }
 
-base_runtime_apply(){ # the apply, holding state/runtime.applying while it runs (3.29.4): an install may start beside it
+base_runtime_apply(){ # the apply, holding state/runtime.applying while it runs (3.30.1): an install may start beside it
   local rc=0
   _base_runtime_apply_run "$@" || rc=$?
   [ -z "${BASE_STATE:-}" ] || rm -f "$BASE_STATE/runtime.applying" 2>/dev/null || true
@@ -244,7 +244,7 @@ _base_runtime_apply_run(){ # <manifest path or https URL> [--parts <links.json>]
   fi
   # 3.29.3: every part fetched, verified and unpacked on its own, $jobs at a time (py/runtime.py apply); the result file
   # carries the seconds, bytes and GB/s for the ledger
-  # 3.29.5: and the apt packages the runtime needs (runtime mode skips the OS stage), beside it: zstd and python3-venv first, the rest
+  # 3.30.2: and the apt packages the runtime needs (runtime mode skips the OS stage), beside it: zstd and python3-venv first, the rest
   # after, only what dpkg reports missing. The unpack waits for zstd where it is not installed yet; the stamp waits for all of it.
   local res="$work/apply-result.json" aptdir="$work/apt" apt_pid="" zwait=0 pkgs=()
   mkdir -p "$aptdir"; rm -f "$aptdir"/*

@@ -400,7 +400,7 @@ def test_unit_the_stub_installs_from_the_runtime_with_no_git_pip_or_uv_fetch(tmp
         else:
             assert tool == "uv" and rest.strip() == "--version", ln
     assert "runtime mode" in r.stdout and "runtime " in r.stdout
-    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()      # 3.29.4: fetched by the early pass
+    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()      # 3.30.1: fetched by the early pass
     tl = "".join(f.read_text() for f in (dst / "comfy-base" / "state" / "logs").glob("stub_*.timeline.tsv"))
     assert "MODELS (in the background" in tl and "RUNTIME (in the background" not in tl      # the runtime was applied before this run: no wait
 
@@ -415,7 +415,7 @@ def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
     assert "else base_system || src=$?; fi" in run and "else base_update_comfyui || true; fi" in run
 
 
-# ---------------------------------------------------------------- 3.29.4: the models start while the runtime is still unpacking
+# ---------------------------------------------------------------- 3.30.1: the models start while the runtime is still unpacking
 
 def _install_beside_an_apply(dst, tmp_path, extra=None):
     from basetest import run_script
@@ -490,7 +490,7 @@ def test_unit_a_lock_whose_process_is_gone_is_no_lock_and_a_library_waits_for_th
     assert r.stdout.split() == ["FREE", "LATE"], r.stdout + r.stderr
 
 
-# ---------------------------------------------------------------- 3.29.5: RunPod's stock image in runtime mode: apt, zstd, the tree
+# ---------------------------------------------------------------- 3.30.2: RunPod's stock image in runtime mode: apt, zstd, the tree
 
 def _fake_apt(tmp_path, installed):
     """A stand-in apt-get and dpkg-query on PATH: dpkg-query answers from a file, apt-get logs and appends what it installs."""
@@ -575,7 +575,7 @@ def test_unit_runtime_mode_reads_the_runtimes_tree_not_another_one_on_the_volume
 
 
 def test_unit_runtime_mode_never_reaches_the_cublas_probe_uv_or_a_local_run_copy():
-    """3.29.5, RunPod's runpod/comfyui:1.4.7-cuda13.0 (nvcc and cudart only, no cuBLAS): cuBLAS is for source builds, which runtime mode
+    """3.30.2, RunPod's runpod/comfyui:1.4.7-cuda13.0 (nvcc and cudart only, no cuBLAS): cuBLAS is for source builds, which runtime mode
     never starts; no uv step runs; the image's own ComfyUI is never a candidate; the local-run copy decides by the filesystem."""
     summary = (BASE / "lib" / "95-summary.sh").read_text()
     branch = summary[summary.index("  if _base_runtime_on; then\n    _base_hook pkg_pre_venv"):summary.index("  else\n  if [ \"$sysbg\" = 1 ]")]
