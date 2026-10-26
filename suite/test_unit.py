@@ -3127,16 +3127,18 @@ def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path, monkeypatch)
     assert "python env OMP=2 CT2=1" in log.read_text()
 
 
-def test_unit_the_cudnn_kernel_cache_is_off_while_the_venv_carries_cudnn_9_22_to_9_24(tmp_path, monkeypatch):
+def test_unit_the_cudnn_kernel_cache_is_off_while_the_venv_carries_cudnn_9_22_0_up_to_9_25_1(tmp_path, monkeypatch):
     """3.28.0: cuDNN 9.22 added a default per-process cache of runtime-compiled kernels, and NVIDIA's cuDNN 9.25.1 release
     notes (Fixed Issues) say a data corruption in it could cause a segmentation fault: "For cuDNN 9.22-9.24, a workaround
     was to set the environment variable CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0". torch 2.14.1 pins 9.24.0. So ComfyUI starts
-    with it while the venv's nvidia-cudnn-cu* wheel is 9.22.x to 9.24.x, read from the wheel's dist-info name (no torch
-    import); never for another version, never from a package (the key is not a LAUNCH_ENV key), and the machine's own
+    with it while the venv's nvidia-cudnn-cu* wheel is 9.22.0 up to 9.25.1 (9.25.0's notes are silent, so it still has the
+    fault), read from the wheel's dist-info name (no torch import); never for another version, never from a package (the key is not a LAUNCH_ENV key), and the machine's own
     value still wins. Turning the cache off changes no kernel's result."""
     _no_launch_env(monkeypatch); monkeypatch.delenv("CUDNN_ENABLE_DEFAULT_KERNEL_CACHE", raising=False)
     for v, want in (("9.21.0.82", "NO"), ("9.22.0", "YES"), ("9.22.0.30", "YES"), ("9.24.0.37", "YES"), ("9.24.1.3", "YES"),
-                    ("9.25.0.12", "NO"), ("9.25.1.4", "NO"), ("10.0.0", "NO"), ("8.24.0", "NO"), ("", "NO"), ("9", "NO"), ("x.y", "NO")):
+                    ("9.25.0.12", "YES"), ("9.25.0", "YES"), ("9.25", "YES"), ("9.25.1.4", "NO"), ("9.25.1", "NO"), ("9.25.2.1", "NO"),
+                    ("9.26.0", "NO"), ("10.0.0", "NO"), ("10.22.0", "NO"), ("8.24.0", "NO"), ("", "NO"), ("9", "NO"), ("x.y", "NO"),
+                    ("9.25.x", "NO")):
         r = _bash('_base_cudnn_cache_bug "$V" && echo YES || echo NO', env={"V": v})
         assert r.stdout.strip() == want, (v, r.stdout, r.stderr)
 
@@ -3148,6 +3150,7 @@ def test_unit_the_cudnn_kernel_cache_is_off_while_the_venv_carries_cudnn_9_22_to
         return tmp_path / name
     pinned = venv("pinned", "nvidia_cudnn_cu13-9.24.0.37")
     fixed = venv("fixed", "nvidia_cudnn_cu13-9.25.1.4")
+    silent = venv("silent", "nvidia_cudnn_cu13-9.25.0.12")                                  # 9.25.0: no fix in its notes
     both = venv("both", "nvidia_cudnn_cu12-9.10.2.21", "nvidia_cudnn_cu13-9.24.0.37")      # the newest is what is read
     none = venv("none")
     for v_, want in ((pinned, "9.24.0.37"), (fixed, "9.25.1.4"), (both, "9.24.0.37"), (none, "")):
@@ -3156,8 +3159,9 @@ def test_unit_the_cudnn_kernel_cache_is_off_while_the_venv_carries_cudnn_9_22_to
     state = tmp_path / "state"; (state / "launch.d").mkdir(parents=True)
     le = 'BASE_STATE="%s"; VENV="%%s"; _base_launch_env' % state
     env = {"BASE_CGROUP_ROOT": str(tmp_path / "nocgroup")}                    # no quota: the cuDNN line is the only default
-    r = _bash(le % pinned, env=env)
-    assert r.stdout == "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0\n" and r.stderr == "", r.stdout + r.stderr
+    for v_ in (pinned, silent):
+        r = _bash(le % v_, env=env)
+        assert r.stdout == "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0\n" and r.stderr == "", (v_, r.stdout + r.stderr)
     for v_ in (fixed, none):
         assert _bash(le % v_, env=env).stdout == "", v_
     r = _bash(le % pinned, env=dict(env, CUDNN_ENABLE_DEFAULT_KERNEL_CACHE="1"))

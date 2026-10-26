@@ -134,7 +134,7 @@ _base_local_dirs(){ # 2.5.6: every directory the launch line names on the MACHIN
 # Precedence: a value the machine's own environment already has (the pod's env, the unit's) > the packages' files, in
 # name order, the first one naming a key winning (a different value later is named on stderr) > the base's default.
 # The base's defaults: OMP_NUM_THREADS from the container's CPU QUOTA (_base_cpu_quota), never the host's count; and 3.28.0,
-# CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 while the venv's cuDNN is 9.22 to 9.24 (_base_cudnn_cache_bug). A package cannot set it.
+# CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 while the venv's cuDNN is 9.22.0 up to 9.25.1 (_base_cudnn_cache_bug). A package cannot set it.
 BASE_LAUNCH_ENV_KEYS="OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMEXPR_NUM_THREADS VECLIB_MAXIMUM_THREADS"
 BASE_LAUNCH_ENV_KEYS="$BASE_LAUNCH_ENV_KEYS TOKENIZERS_PARALLELISM PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF CUDA_MODULE_LOADING"
 # 3.18.0: and the attention order a node pack reads when it loads (Generate-AI's Render Speed: off, cudnn or fa4), a
@@ -200,15 +200,18 @@ _base_cudnn_version(){ # 3.28.0: → the cuDNN the venv's torch loads, from its 
   if [ -n "$all" ]; then printf '%s' "$all" | sort -V | tail -1; fi
   return 0
 }
-_base_cudnn_cache_bug(){ # 3.28.0: <version> → 0 for cuDNN 9.22.x to 9.24.x. NVIDIA, cuDNN 9.25.1 release notes (Fixed Issues): "A data
-  # corruption issue in this cache that could cause a segmentation fault has been fixed. For cuDNN 9.22-9.24, a workaround
-  # was to set the environment variable CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 to disable the cache." (the default per-process
-  # cache of runtime-compiled kernels, added in 9.22.0). torch 2.14.1 pins 9.24.0. Turning the cache off changes no result.
-  local maj min rest
-  IFS=. read -r maj min rest <<< "${1:-}"
+_base_cudnn_cache_bug(){ # 3.28.0: <version> → 0 for cuDNN 9.22.0 up to 9.25.1. NVIDIA, cuDNN 9.25.1 release notes (Fixed Issues): "A
+  # data corruption issue in this cache that could cause a segmentation fault has been fixed. For cuDNN 9.22-9.24, a
+  # workaround was to set the environment variable CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 to disable the cache." (the default
+  # per-process cache of runtime-compiled kernels, added in 9.22.0). 9.25.0's notes are silent, so nothing fixed it there:
+  # it is covered too. torch 2.14.1 pins 9.24.0. Turning the cache off changes no result.
+  local maj min pat rest
+  IFS=. read -r maj min pat rest <<< "${1:-}"
   case "$maj" in ''|*[!0-9]*) return 1 ;; esac
   case "$min" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$maj" -eq 9 ] && [ "$min" -ge 22 ] && [ "$min" -le 24 ]
+  case "$pat" in '') pat=0 ;; *[!0-9]*) return 1 ;; esac
+  [ "$maj" -eq 9 ] && [ "$min" -ge 22 ] || return 1
+  [ "$min" -le 24 ] || { [ "$min" -eq 25 ] && [ "$pat" -lt 1 ]; }
 }
 _base_launch_env(){ # → the KEY=value lines ComfyUI is started with (precedence above); what was dropped, and why, on stderr
   local dir f kv k v seen="" n s first

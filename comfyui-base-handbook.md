@@ -496,8 +496,8 @@ A thin `<name>-script.sh` (60–200 lines) declares, then sources the base and c
   Precedence: the machine's own environment (a variable set on the pod, in the unit) wins; then the packages' files in
   name order, the first naming a key winning and a different later value named in the launch's output; then the
   base's defaults, `OMP_NUM_THREADS` from the container's CPU quota and (3.28.0) `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0`
-  while the venv's `nvidia-cudnn-cu*` wheel is cuDNN 9.22 to 9.24 (NVIDIA's workaround for the default kernel cache's
-  data corruption, fixed in 9.25.1; a package cannot set it). `BASE_DECLARE_ONLY=1` prints
+  while the venv's `nvidia-cudnn-cu*` wheel is cuDNN 9.22.0 up to 9.25.1 (NVIDIA's workaround for the default kernel
+  cache's data corruption, fixed in 9.25.1; a package cannot set it). `BASE_DECLARE_ONLY=1` prints
   `LAUNCHENV KEY=value`. A base before 3.10.0 ignores the array, so a package that depends on it sets `BASE_MIN`.
 - The CPU quota (3.10.0): when nothing sets `OMP_NUM_THREADS`, the base sets it to the CPUs the container's cgroup
   quota allows (`cpu.max`, v2, or `cpu.cfs_quota_us` / `cpu.cfs_period_us`, v1; rounded up; never more than the CPUs
@@ -885,9 +885,10 @@ for any invocation that somehow arrives without the environment. The suite asser
     runtime-compiled kernels; NVIDIA's cuDNN 9.25.1 release notes (Fixed Issues) fix "a data corruption issue in this
     cache that could cause a segmentation fault" and say "For cuDNN 9.22-9.24, a workaround was to set the environment
     variable `CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0`". torch 2.14.1 pins 9.24.0. The launch environment now carries it
-    while the venv's `nvidia_cudnn_cu*-<version>.dist-info` reads 9.22.x to 9.24.x (`lib/85-launch.sh`
-    `_base_cudnn_version`, `_base_cudnn_cache_bug`; a directory name, no torch import), at every start and boot. It turns
-    a compile cache off and changes no kernel's result. The machine's own value wins; a package cannot set the key.
+    while the venv's `nvidia_cudnn_cu*-<version>.dist-info` reads 9.22.0 up to 9.25.1, 9.25.0 included since its notes
+    fix nothing there (`lib/85-launch.sh` `_base_cudnn_version`, `_base_cudnn_cache_bug`; a directory name, no torch
+    import), at every start and boot. It turns a compile cache off and changes no kernel's result. The machine's own
+    value wins; a package cannot set the key.
   - **Two more GPU classes, warnings only.** `py/gpu_fit.py` names `GB300` (NVIDIA's CUDA table: 10.3; 288 GB HBM3e; a
     Grace aarch64 host) and `RTX-PRO-6000` (the RTX PRO 6000 Blackwell Server Edition: 12.0; 96 GB GDDR7, 97887 MiB
     read). An architecture now fits only with 90 % of its class's memory, because `sm_120` is also an RTX 5090's: a 5090
