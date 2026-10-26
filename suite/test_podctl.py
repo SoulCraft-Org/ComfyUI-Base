@@ -1801,8 +1801,8 @@ def _buyer_zips(tmp_path):
         z.writestr("comfyui-base/base.sh", BASE_SH_STUB % (STUB_SCRIPT % ("..", "base")))
     with zipfile.ZipFile(d / "my-pkg-verda.zip", "w") as z:
         z.writestr("my-pkg-script.sh", STUB_SCRIPT % ("../..", "my-pkg"))
-    rt = tmp_path / "rt"; rt.mkdir(); part = rt / "runtime.tar.gz.000"; part.write_bytes(b"part")
-    (rt / "runtime.json").write_text(json.dumps({"format": 1, "parts": [{"name": part.name, "url": part.name, "bytes": 4,
+    rt = tmp_path / "rt"; rt.mkdir(); part = rt / "runtime.000.tar.zst"; part.write_bytes(b"part")
+    (rt / "runtime.json").write_text(json.dumps({"format": 2, "parts": [{"name": part.name, "url": part.name, "bytes": 4,
                                                                          "sha256": hashlib.sha256(b"part").hexdigest()}]}))
     return d, rt / "runtime.json"
 
@@ -1840,7 +1840,7 @@ def test_unit_buyer_install_applies_the_runtime_then_installs_staged_with_no_gat
     for r in runs:
         assert "BASE_RUNTIME=" in r and "BASE_STAGED=" in r and re.search(r"BASE_FETCH_JOBS=\W{0,12}3\W", r), r   # the whole line is quoted once more
     uploaded = [pathlib.Path(f).name for u in io.uploads for f in u[0]]
-    assert "runtime.json" in uploaded and "runtime.tar.gz.000" in uploaded
+    assert "runtime.json" in uploaded and "runtime.000.tar.zst" in uploaded
     assert io.rebuilt == [] and "pins" not in out                       # nothing is written back on a buyer's machine
     assert (tmp_path / "logs").is_dir()
 
