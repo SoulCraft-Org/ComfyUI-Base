@@ -4,9 +4,11 @@
 # Every other run stays "everything newest" (lib/47-latest.sh); nothing here runs unless BASE_RUNTIME is set or one
 # of the two verbs is called.
 #
-#   runtime-capture <outdir> [--url-base <prefix>] [--part-bytes <n>]   on a machine after a green run: the parts and
-#                                                                       runtime.json (py/runtime.py build)
-#   runtime-apply <manifest path or https URL>                          on a buyer's machine: fetch, verify, unpack
+#   runtime-capture <outdir> [--url-base <prefix>] [--part-bytes <n>]   on a machine after a green run: independent zstd
+#                                                                       parts and runtime.json (py/runtime.py build)
+#   runtime-apply <manifest path or https URL> [--parts <links.json>] [--jobs <n>]
+#                                                                       on a buyer's machine: fetch <n> parts at once (8),
+#                                                                       verify each, unpack each as it lands
 #   BASE_RUNTIME=<state/runtime.json> <package script>                  install from it: no OS, git, pip or uv step
 #
 # The versions live ONLY in runtime.json. This file and py/runtime.py read them; neither writes one down.
@@ -59,9 +61,43 @@ _base_runtime_venv(){ # in place of base_venv: the runtime's venv must import to
   return 0
 }
 
-base_runtime_apply(){ # <manifest path or https URL> → the runtime unpacked beside comfy-base, stamped; idempotent
-  local src="${1:-}" root work man sum have name from rc=0 old="" ts
-  if [ -z "$src" ]; then err "runtime-apply needs a manifest: runtime-apply <path or https URL of runtime.json>"; return 2; fi
+_base_runtime_zstd(){ # the parts are zstd tars: the tool must be here (a stock image has it; else one small apt package)
+  command -v zstd >/dev/null 2>&1 && return 0
+  if [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null 2>&1; then
+    note "zstd is missing: installing the package (the runtime's parts are zstd tars)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd >/dev/null 2>&1 || true
+  fi
+  command -v zstd >/dev/null 2>&1 || { err "zstd is not installed and could not be (apt-get install zstd): the runtime's parts are zstd tars"; return 1; }
+}
+_base_runtime_ledger(){ # <result json> → the RUNTIME row of the run's timing ledger: wall seconds, bytes, GB/s (3.29.3)
+  local res="$1" t0 t1 secs line
+  [ -s "$res" ] || return 0
+  line="$("$SYS_PY" - "$res" <<'PYEOF' 2>/dev/null || true
+import json, sys
+r = json.load(open(sys.argv[1]))
+print("%s\t%s\t%s\tRUNTIME fetch and unpack: %d parts, %.2f GB packed (%.2f GB unpacked), %.2f GB/s, %d at once (busy: fetch %ss, verify %ss, unpack %ss)" % (
+    r["t0"], r["t1"], r["seconds"], r["parts"], r["bytes"] / 1e9, r["raw"] / 1e9, r["gbps"], r["jobs"], r["fetch_seconds"], r["verify_seconds"], r["unpack_seconds"]))
+PYEOF
+)"
+  [ -n "$line" ] || return 0
+  IFS=$'\t' read -r t0 t1 secs line <<< "$line"
+  BASE_STAGE_NAME=""                                 # the header's open stage is replaced by the measured one
+  BASE_STAGE_TIMES+=("$(printf '%.0f' "$secs")|$line"); _base_span "$(( t0 - BASE_EPOCH0 ))" "$(( t1 - BASE_EPOCH0 ))" "$line"
+  PKG_ID="runtime-apply" _base_timings_write
+}
+
+base_runtime_apply(){ # <manifest path or https URL> [--parts <links.json>] [--jobs <n>] → the runtime unpacked beside comfy-base, stamped; idempotent
+  local src="" parts_file="" jobs="${BASE_RUNTIME_JOBS:-8}" root work man sum have name from rc=0 old="" ts
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --parts) parts_file="${2:-}"; shift 2 ;;
+      --jobs) jobs="${2:-}"; shift 2 ;;
+      *) src="$1"; shift ;;
+    esac
+  done
+  if [ -z "$src" ]; then err "runtime-apply needs a manifest: runtime-apply <path or https URL of runtime.json> [--parts <links.json>] [--jobs <n>]"; return 2; fi
+  if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then err "runtime-apply: --jobs takes a number of parts to fetch at once (got '$jobs')"; return 2; fi
+  if [ -n "$parts_file" ] && [ ! -f "$parts_file" ]; then err "runtime-apply: no link list at $parts_file"; return 2; fi
   base_env_setup
   local drc=0; base_discover quiet || drc=$?
   if [ "$drc" = 3 ]; then base_discover || true; return 3; fi
@@ -69,7 +105,7 @@ base_runtime_apply(){ # <manifest path or https URL> → the runtime unpacked be
   hdr "RUNTIME · $src"
   root="$(_base_runtime_root)"; work="$root/.comfy-base-runtime"; mkdir -p "$work"; man="$work/runtime.json"
   case "$src" in
-    https://*) if ! _base_curl_dl "$man" "$src"; then err "could not fetch the manifest $src"; return 1; fi ;;
+    https://*|http://127.0.0.1:*|http://localhost:*) if ! _base_curl_dl "$man" "$src"; then err "could not fetch the manifest"; return 1; fi ;;
     *) if ! cp "$src" "$man"; then err "no manifest at $src"; return 1; fi ;;
   esac
   sum="$(_base_sha256 "$man" | awk '{print $1}')"; have="$(cat "$BASE_STATE/runtime.stamp" 2>/dev/null || true)"
@@ -77,34 +113,29 @@ base_runtime_apply(){ # <manifest path or https URL> → the runtime unpacked be
     cp "$man" "$BASE_STATE/runtime.json"; rm -rf "$work"
     ok "this runtime is already applied: install with BASE_RUNTIME=$BASE_STATE/runtime.json"; return 0
   fi
-  local want_b
-  while IFS=$'\t' read -r name from want_b; do
-    [ -n "$name" ] || continue
-    if [ -f "$work/$name" ] && [ "$(_base_fsize "$work/$name")" = "$want_b" ]; then continue; fi   # a part fetched before: verified below with the rest
-    echo "  → $name"
-    case "$from" in
-      https://*) local attempt; for attempt in 1 2 3; do _base_curl_dl "$work/$name" "$from" && break; note "attempt $attempt failed (the transfer resumes)"; sleep 5; done ;;
-      *) cp "$from" "$work/$name" || true ;;
-    esac
-  done < <("$SYS_PY" "$BASE_DIR/py/runtime.py" sources "$man" "$src")
-  if ! "$SYS_PY" "$BASE_DIR/py/runtime.py" verify-parts "$man" "$work"; then err "the runtime's parts do not match its manifest: nothing was unpacked (re-run to resume)"; return 1; fi
+  _base_runtime_zstd || return 1
   # an Update replaces the code wholesale: the old venv and packs go aside first, and come back if the unpack fails
   local cdir; cdir="$root/$("$SYS_PY" "$BASE_DIR/py/runtime.py" field "$man" comfyui.dir)"; ts="$(_base_ts)"
   if [ -n "$have" ] && [ -d "$cdir" ]; then
     old="$root/.comfy-base-runtime-old.$ts"; mkdir -p "$old"
     local d; for d in "$cdir"/.venv* "$cdir/custom_nodes"; do [ -e "$d" ] && mv "$d" "$old/" || true; done
   fi
-  local parts=() total=0; while IFS=$'\t' read -r name from want_b; do if [ -n "$name" ]; then parts+=("$work/$name"); total=$((total + want_b)); fi; done < <("$SYS_PY" "$BASE_DIR/py/runtime.py" sources "$man" "$src")
-  cat "${parts[@]}" | tar -xzf - -C "$root" || rc=$?
+  # 3.29.3: every part fetched, verified and unpacked on its own, $jobs at a time (py/runtime.py apply); the result file
+  # carries the seconds, bytes and GB/s for the ledger
+  local res="$work/apply-result.json"
+  "$SYS_PY" "$BASE_DIR/py/runtime.py" apply "$man" "$src" --root "$root" --work "$work/parts" --jobs "$jobs" --result "$res" \
+    ${parts_file:+--parts "$parts_file"} || rc=$?
   if [ "$rc" != 0 ]; then
-    err "unpacking the runtime failed (tar exit $rc)"
+    err "the runtime did not unpack (rc $rc): nothing is stamped, so no install will run from it; re-run runtime-apply (a verified part is simply fetched again)"
     if [ -n "$old" ]; then local d; for d in "$old"/.venv* "$old/custom_nodes"; do [ -e "$d" ] && { rm -rf "$cdir/$(basename "$d")"; mv "$d" "$cdir/"; } || true; done; note "the previous runtime's venv and packs are back"; fi
     return 1
   fi
   [ -n "$old" ] && rm -rf "$old"
   cp "$man" "$BASE_STATE/runtime.json"; echo "$sum" > "$BASE_STATE/runtime.stamp"
+  cp "$res" "$BASE_STATE/runtime-apply.json" 2>/dev/null || true
+  _base_runtime_ledger "$res" || true
   rm -rf "$work"
-  ok "runtime unpacked into $root ($(_base_bytes_to_gb "$total") GB packed); install with BASE_RUNTIME=$BASE_STATE/runtime.json"
+  ok "runtime unpacked into $root; install with BASE_RUNTIME=$BASE_STATE/runtime.json"
   return 0
 }
 
@@ -120,6 +151,7 @@ base_runtime_capture(){ # <outdir> [--url-base <prefix>] [--part-bytes <n>] → 
   if [ -z "$out" ]; then err "runtime-capture needs an output directory"; return 2; fi
   base_env_setup
   if ! base_discover quiet; then err "runtime-capture: no ComfyUI tree to capture"; return 3; fi
+  _base_runtime_zstd || return 1
   hdr "RUNTIME CAPTURE · $COMFY"
   # only a machine whose every package's last run was green is a proven runtime
   if ! ls "$BASE_STATE"/last-run/* >/dev/null 2>&1; then err "no install has run here: nothing is proven yet"; return 1; fi
