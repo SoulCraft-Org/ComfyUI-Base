@@ -398,7 +398,7 @@ def test_unit_the_stub_installs_from_the_runtime_with_no_git_pip_or_uv_fetch(tmp
         else:
             assert tool == "uv" and rest.strip() == "--version", ln
     assert "runtime mode" in r.stdout and "runtime " in r.stdout
-    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()      # 3.29.4: fetched by the early pass
+    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()      # 3.30.1: fetched by the early pass
     tl = "".join(f.read_text() for f in (dst / "comfy-base" / "state" / "logs").glob("stub_*.timeline.tsv"))
     assert "MODELS (in the background" in tl and "RUNTIME (in the background" not in tl      # the runtime was applied before this run: no wait
 
@@ -413,7 +413,7 @@ def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
     assert "else base_system || src=$?; fi" in run and "else base_update_comfyui || true; fi" in run
 
 
-# ---------------------------------------------------------------- 3.29.4: the models start while the runtime is still unpacking
+# ---------------------------------------------------------------- 3.30.1: the models start while the runtime is still unpacking
 
 def _install_beside_an_apply(dst, tmp_path, extra=None):
     from basetest import run_script

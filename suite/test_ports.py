@@ -562,7 +562,7 @@ def test_unit_app_proxy_key_rules_pure():
     assert all(not m.loopback(a) for a in m.front_addrs())
 
 
-def _start_gated(tmp_path, args, key=KEY):
+def _start_gated(tmp_path, args, key=KEY, extra_env=None):
     """The forwarder as a pod runs it, but with every peer counted as outside (the suite can only connect from loopback)."""
     w = tmp_path / "outside.py"
     w.write_text("import importlib.util, sys\nspec = importlib.util.spec_from_file_location('ap', %r)\nm = importlib.util.module_from_spec(spec)\n"
@@ -570,6 +570,7 @@ def _start_gated(tmp_path, args, key=KEY):
     env = {k: v for k, v in os.environ.items() if k != "BASE_LINK_TOKEN"}
     if key:
         env["BASE_LINK_TOKEN"] = key
+    env.update(extra_env or {})
     p = subprocess.Popen([sys.executable, str(w), *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     return p
 
@@ -619,6 +620,150 @@ def test_unit_app_proxy_key_locks_the_app_and_comfyuis_front_and_trades_the_link
     finally:
         p.terminate(); out = p.communicate(timeout=10)[0]; up.close()
     assert KEY not in out and "every link needs the key" in out and ("ComfyUI on 127.0.0.1:%d" % front) in out, out
+
+
+# ---------------------------------------------------------------- 3.30.0: the key the customer already has
+
+OWN_KEY = "my own key é & 1=1;"          # a customer's key is not ours to shape: spaces, ';', '&', '=' and non-ASCII all work
+
+
+def _form_post(port, fields, extra=b""):
+    from urllib.parse import urlencode
+    body = urlencode(fields).encode()
+    return _raw(port, b"POST /__base_unlock HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+                      b"Content-Length: %d\r\n" % len(body) + extra + b"\r\n" + body)
+
+
+def test_unit_app_proxy_key_from_environment_pure():
+    """BASE_LINK_TOKEN_FROM names the variable that holds the key; the cookie is derived from it (never the key); a miss
+    waits longer each time after five free ones, per address (an IPv6 /64 counts as one); `next` can only be a local path."""
+    m = _proxy_mod()
+    assert m.link_key({"BASE_LINK_TOKEN_FROM": "SC_KEY", "SC_KEY": "  abc \n", "BASE_LINK_TOKEN": "gen"}) == ("abc", True)
+    assert m.link_key({"BASE_LINK_TOKEN_FROM": "SC_KEY", "SC_KEY": "", "BASE_LINK_TOKEN": "gen"}) == ("gen", False)      # empty: the usual key
+    assert m.link_key({"BASE_LINK_TOKEN_FROM": "SC KEY;x", "SC_KEY": "abc"}) == (None, False)                          # not a variable name
+    assert m.link_key({"BASE_LINK_TOKEN": "gen"}) == ("gen", False) and m.link_key({}) == (None, False)
+    c = m.cookie_value(OWN_KEY)
+    assert re.fullmatch(r"[0-9a-f]{64}", c) and c == m.cookie_value(OWN_KEY) and c != m.cookie_value(OWN_KEY + "x") and OWN_KEY not in c
+    assert m.authorize(OWN_KEY, "GET", "/", ["Cookie: base_link=%s" % c], "1.2.3.4", c) == ("open", "/")
+    assert m.authorize(OWN_KEY, "GET", "/", ["Cookie: base_link=%s" % OWN_KEY], "1.2.3.4", c) == ("deny", None)      # the key is not a cookie here
+    assert m.authorize(OWN_KEY, "GET", "/?token=%s" % "my%20own%20key%20%C3%A9%20%26%201%3D1%3B", [], "1.2.3.4", c) == ("set", "/")
+    for bad in ("//evil.example", "/\\evil", "https://evil.example/", "x", "/a\r\nSet-Cookie: x=1", "/__base_unlock?x=1"):
+        assert m.safe_next(bad) == "/", bad
+    assert m.safe_next("/apps/vr/?a=1&b=2") == "/apps/vr/?a=1&b=2" and m.safe_next(None) == "/"
+    page = m.lock_form('/"><script>alert(1)</script>', 'a <b> note')
+    assert "<script>" not in page and "&lt;b&gt; note" in page and 'type=password name=key' in page and 'action="/__base_unlock"' in page
+    assert page.count("<input") == 2 and page.count("<button") == 1 and "runpod" not in page.lower() and "soulcraft" not in page.lower()
+    now = [100.0]; b = m.Backoff(lambda: now[0])
+    for _ in range(m.FREE_MISSES):
+        b.miss("1.2.3.4"); assert b.wait("1.2.3.4") == 0
+    b.miss("1.2.3.4"); assert b.wait("1.2.3.4") == m.WAIT_BASE and b.wait("1.2.3.5") == 0       # the sixth costs 2 s, a neighbour nothing
+    now[0] += 3; assert b.wait("1.2.3.4") == 0
+    b.miss("1.2.3.4"); assert b.wait("1.2.3.4") == 2 * m.WAIT_BASE                                # then it doubles
+    for _ in range(40):
+        now[0] += 1; b.miss("1.2.3.4")
+    assert b.wait("1.2.3.4") == m.WAIT_CAP
+    b.clear("1.2.3.4"); assert b.wait("1.2.3.4") == 0
+    for _ in range(m.FREE_MISSES + 1):
+        b.miss("2001:db8:1:2::1")
+    assert b.wait("2001:db8:1:2:ffff::9") > 0 and b.wait("2001:db8:1:3::1") == 0 and b.wait("::ffff:9.9.9.9") == 0
+    b.miss("5.5.5.5"); now[0] += m.FORGET_AFTER + 1; b.miss("5.5.5.5"); assert b.seen["5.5.5.5"][0] == 1     # forgotten
+    for i in range(m.TABLE_MAX + 10):
+        b.miss("10.%d.%d.1" % (i // 250, i % 250))
+    assert len(b.seen) <= m.TABLE_MAX
+
+
+def test_unit_app_proxy_the_lock_page_takes_the_key_the_customer_has(tmp_path):
+    """BASE_LINK_TOKEN_FROM=SC_KEY: the 401 page is a form; a right key trades for the cookie and a redirect to the page asked
+    for; a wrong one shows the form again; ?token= still works; the key is never in the log, the cookie, or what ComfyUI is
+    sent; after five free misses a try is refused (with the right key too) until the wait is over."""
+    up = Upstream(); app, front = _free_port(), _free_port()
+    p = _start_gated(tmp_path, ["--map", "%d=vr" % app, "--upstream", "127.0.0.1:%d" % up.port, "--listen", "0.0.0.0",
+                                "--front", str(front), "--front-listen", "127.0.0.1"], key=None,
+                     extra_env={"BASE_LINK_TOKEN_FROM": "SC_KEY", "SC_KEY": OWN_KEY})
+    try:
+        _wait_listen(app, p); _wait_listen(front, p)
+        for port in (app, front):
+            r = _raw(port, b"GET /deep/page?a=1&token=wrong HTTP/1.1\r\nHost: x\r\n\r\n")
+            assert r.startswith(b"HTTP/1.1 401") and b"This link needs its key" in r and b"no-store" in r, r
+            assert b'type=password name=key' in r and b'action="/__base_unlock"' in r and b'name=next value="/deep/page?a=1"' in r, r
+            assert b"form-action 'self'" in r and b"Referrer-Policy: no-referrer" in r
+        assert up.seen == []
+        # a miss: the form again, one plain sentence, no cookie, nothing forwarded
+        r = _form_post(app, {"key": "nope", "next": "/deep/page"})
+        assert r.startswith(b"HTTP/1.1 401") and b"That key did not match. Check it and try again." in r and b"Set-Cookie" not in r, r
+        assert b'name=next value="/deep/page"' in r and up.seen == []
+        # a match (typed with stray spaces, as pasted): cookie + redirect to the page asked for; the cookie is not the key
+        r = _form_post(app, {"key": "  %s \n" % OWN_KEY, "next": "/deep/page?a=1"})
+        head = r.split(b"\r\n\r\n")[0].decode()
+        assert head.startswith("HTTP/1.1 303") and "\r\nLocation: /deep/page?a=1\r\n" in head, head
+        cookie = re.search(r"(?m)^Set-Cookie: (.*)$", head).group(1).strip()
+        m = _proxy_mod()
+        assert cookie == "base_link=%s; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax" % m.cookie_value(OWN_KEY), cookie
+        assert "Domain" not in head and "Referrer-Policy: no-referrer" in head and "no-store" in head and up.seen == []
+        assert "my own key" not in head and "%C3%A9" not in head
+        # an off-site `next` is just "/"
+        head = _form_post(app, {"key": OWN_KEY, "next": "//evil.example/x"}).split(b"\r\n\r\n")[0].decode()
+        assert "\r\nLocation: /\r\n" in head, head
+        # the cookie opens both ports and ComfyUI never sees the key or the cookie
+        ck = ("Cookie: theme=dark; " + cookie.split(";")[0] + "\r\n").encode()
+        assert _raw(app, b"GET /app.js HTTP/1.1\r\nHost: x\r\n" + ck + b"\r\n").endswith(b"saw /apps/vr/app.js 0")
+        assert _raw(front, b"GET /system_stats HTTP/1.1\r\nHost: x\r\n" + ck + b"\r\n").endswith(b"saw /system_stats 0")
+        assert all("Cookie: theme=dark" in h and "base_link" not in h and cookie.split("=")[1].split(";")[0] not in h for h, _ in up.seen)
+        # the cookie is derived: the raw key as a cookie does not open
+        assert _raw(app, b"GET / HTTP/1.1\r\nHost: x\r\nCookie: base_link=nope\r\n\r\n").startswith(b"HTTP/1.1 401")
+        # ?token= keeps working: the key in the link trades for the same cookie
+        from urllib.parse import quote
+        r = _raw(app, b"GET /x?token=%s HTTP/1.1\r\nHost: x\r\n\r\n" % quote(OWN_KEY).encode())
+        assert r.startswith(b"HTTP/1.1 303") and cookie.split(";")[0].encode() in r and b"Location: /x\r\n" in r, r
+        # a body that is too big or has no length is refused unread; GET shows the form
+        assert _raw(app, b"POST /__base_unlock HTTP/1.1\r\nHost: x\r\nContent-Length: 999999\r\n\r\n").startswith(b"HTTP/1.1 400")
+        assert _raw(app, b"POST /__base_unlock HTTP/1.1\r\nHost: x\r\n\r\n").startswith(b"HTTP/1.1 400")
+        assert b"type=password" in _raw(app, b"GET /__base_unlock?next=/y HTTP/1.1\r\nHost: x\r\n\r\n")
+        # the backoff: the successes above cleared the address; five misses are free, the sixth makes the next try wait
+        for _ in range(5):
+            assert _form_post(app, {"key": "guess"}).startswith(b"HTTP/1.1 401")
+        assert _form_post(app, {"key": "guess"}).startswith(b"HTTP/1.1 401")
+        r = _form_post(front, {"key": OWN_KEY})                                  # even the right key, on the other port: same address
+        assert r.startswith(b"HTTP/1.1 429") and b"Retry-After: " in r and b"Too many tries" in r and b"Set-Cookie" not in r, r
+        assert _raw(app, b"GET /app.js HTTP/1.1\r\nHost: x\r\n" + ck + b"\r\n").endswith(b"saw /apps/vr/app.js 0")   # a cookie still passes
+        assert all(OWN_KEY not in h and OWN_KEY.encode() not in b for h, b in up.seen)
+    finally:
+        p.terminate(); out = p.communicate(timeout=10)[0]; up.close()
+    assert "my own key" not in out and "SC_KEY; the lock page asks for it" in out and m.cookie_value(OWN_KEY) not in out, out
+
+
+def test_unit_boot_takes_the_key_from_the_named_variable_and_prints_no_token(tmp_path):
+    """BASE_LINK_TOKEN_FROM=MY_KEY: boot_link_token makes and saves nothing, hands the forwarder MY_KEY's value (the pod's env,
+    else PID 1's), and the console says once that the lock page asks for the key without printing it; an empty MY_KEY, or a
+    name that is not a variable name, falls back to the usual key."""
+    home = _boot_home(tmp_path); (home / "state").mkdir(exist_ok=True)
+    sh = 'source "%s/lib/boot.sh"; BOOT_HOME=%s; BASE_LISTEN=0.0.0.0; BASE_HOST=runpod; RUNPOD_POD_ID=pod1; ' % (BASE, _sh(home))
+    env = {k: v for k, v in os.environ.items() if k not in ("BASE_LINK_TOKEN", "BASE_LINK_TOKEN_FROM", "MY_KEY")}
+    env["BOOT_ROOT"] = ""
+    probe = 'boot_link_token; echo "$BOOT_LINK_FROM $BOOT_LINK_MADE $BASE_LINK_TOKEN_FROM [$BASE_LINK_TOKEN] $(bash -c \'echo $MY_KEY\')"'
+    r = subprocess.run(["bash", "-c", sh + "BASE_LINK_TOKEN_FROM=MY_KEY; MY_KEY=customerkey; export MY_KEY BASE_LINK_TOKEN_FROM; " + probe],
+                       capture_output=True, text=True, env=env, timeout=30)
+    assert r.stdout.split() == ["1", "0", "MY_KEY", "[]", "customerkey"], r.stdout + r.stderr
+    assert not (home / "state" / "tokens.env").exists()                                   # never written to disk
+    # the pod's env is PID 1's, which this shell did not inherit
+    pid1 = tmp_path / "environ"; pid1.write_bytes(b"A=1\0BASE_LINK_TOKEN_FROM=MY_KEY\0MY_KEY=frompid1\0")
+    r = subprocess.run(["bash", "-c", sh + probe], capture_output=True, text=True, env={**env, "BOOT_PID1_ENVIRON": str(pid1)}, timeout=30)
+    assert r.stdout.split() == ["1", "0", "MY_KEY", "[]", "frompid1"], r.stdout + r.stderr
+    # the console: one line on fd 3, no key; the boot log (stdout) never holds the value
+    r = subprocess.run(["bash", "-c", sh + "BOOT_LINK_FROM=1; BASE_LINK_TOKEN_FROM=MY_KEY; MY_KEY=customerkey; "
+                        "boot_console_links 8188 '8189|a|App' 3>console.txt; cat console.txt"],
+                       capture_output=True, text=True, env=env, cwd=str(tmp_path), timeout=30)
+    assert r.stdout.strip() == "The links ask for your key (MY_KEY): open ComfyUI from the Connect tab and type it once.", r.stdout
+    assert "customerkey" not in r.stdout + r.stderr and "?token=" not in r.stdout
+    # the key the boot MADE still prints its links, and the named-variable branch does not
+    r = subprocess.run(["bash", "-c", sh + "BOOT_LINK_MADE=1; BASE_LINK_TOKEN=made; boot_console_links 8188 '' 3>&1"], capture_output=True, text=True, env=env, timeout=30)
+    assert "ComfyUI: https://pod1-8188.proxy.runpod.net/?token=made" in r.stdout and "ask for your key" not in r.stdout, r.stdout
+    # empty MY_KEY or a bad name: the usual rules (here: a key is generated and saved)
+    for frm in ("MY_KEY", "not a name"):
+        r = subprocess.run(["bash", "-c", sh + 'BASE_LINK_TOKEN_FROM=%s; MY_KEY=; boot_link_token; echo "$BOOT_LINK_FROM $BOOT_LINK_MADE"' % _sh(frm)],
+                           capture_output=True, text=True, env=env, timeout=30)
+        assert r.stdout.split()[-2:] == ["0", "1"], (frm, r.stdout, r.stderr)
+        (home / "state" / "tokens.env").unlink()
 
 
 def test_unit_app_proxy_with_no_key_refuses_every_outside_request(tmp_path):

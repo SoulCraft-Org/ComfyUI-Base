@@ -13,7 +13,7 @@
 #
 # The versions live ONLY in runtime.json. This file and py/runtime.py read them; neither writes one down.
 #
-# 3.29.4: the models do not wait for the unpack. While `runtime-apply` runs it holds $BASE_STATE/runtime.applying
+# 3.30.1: the models do not wait for the unpack. While `runtime-apply` runs it holds $BASE_STATE/runtime.applying
 # ("<pid> <manifest sha256>"; a dead pid is no lock) and has already put the manifest at state/runtime.json; an install
 # with BASE_RUNTIME set then finds its manifest "pending", starts the package's model downloads at once where the tree
 # will be, and waits for the stamp only where it first needs the tree, the venv or a pack. Pod to App ready becomes
@@ -180,7 +180,7 @@ PYEOF
   PKG_ID="runtime-apply" _base_timings_write
 }
 
-base_runtime_apply(){ # the apply, holding state/runtime.applying while it runs (3.29.4): an install may start beside it
+base_runtime_apply(){ # the apply, holding state/runtime.applying while it runs (3.30.1): an install may start beside it
   local rc=0
   _base_runtime_apply_run "$@" || rc=$?
   [ -z "${BASE_STATE:-}" ] || rm -f "$BASE_STATE/runtime.applying" 2>/dev/null || true
