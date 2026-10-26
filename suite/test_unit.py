@@ -75,6 +75,17 @@ def test_unit_version_file_is_semver_and_base_prints_it():
     assert "\n- %s:" % v in hb, "the handbook's Record section has no '- %s:' entry" % v
 
 
+def test_unit_the_os_stage_installs_the_gl_libraries_mediapipe_links():
+    """3.29.1: MediaPipe's libmediapipe.so links libEGL.so.1 and libGLESv2.so.2 even on CPU (OSError: libEGL.so.1). On Ubuntu
+    24.04 those are libegl1 and libgles2; the OS stage's own package list and the Verda startup's must both carry them."""
+    sysh = (BASE / "lib" / "15-system.sh").read_text()
+    want = re.search(r"local want=\(([^)]*)\)", sysh)
+    assert want and {"libegl1", "libgles2"} <= set(want.group(1).split()), want and want.group(1)
+    startup = (BASE / "hosts" / "verda" / "startup.sh").read_text()
+    need = re.search(r"local need=\(([^)]*)\)", startup)
+    assert need and {"libegl1", "libgles2"} <= set(need.group(1).split()), need and need.group(1)
+
+
 def test_unit_sourcing_defines_the_contract_helpers():
     probe = ('for f in ok miss err note hdr would todo warn base_mkdir base_run _base_confirm _base_confirm_yes '
              '_base_on_err _base_on_exit _base_install_traps base_env_setup _base_vge _base_fs_is_pool _base_sha256 '
