@@ -28,13 +28,26 @@ is never printed and never reaches ComfyUI (the cookie is taken out of the Cooki
 connection from the machine itself (an ssh tunnel, the install's own checks) is already inside and passes unasked.
 JupyterLab is not behind it: it keeps its own token.
 
+The key the customer already has (3.30.0): with BASE_LINK_TOKEN_FROM=<NAME> the key is the value of the environment
+variable called NAME (the pod's own, which boot.sh re-exports from PID 1 when its shell did not inherit it), not a
+generated or saved token, so nothing has to be fetched from a Logs tab. The 401 page then carries one password field and
+one button that POST the key to the reserved path /__base_unlock on the same host; a constant-time match answers with the
+same cookie and a 303 to the page the visitor asked for, a miss shows the form again with one plain sentence. The cookie
+holds a value DERIVED from the key (an HMAC of a fixed label), not the key itself, so the browser never stores the
+customer's own credential and a restarted forwarder still honours it. Guessing is slowed per address (Backoff): the first
+few misses are free, then the wait doubles up to five minutes, and a refused try is not compared at all. The address is the
+TCP peer, never X-Forwarded-For (a header the sender writes cannot be trusted to rate-limit the sender); behind a shared
+proxy that peer is the proxy, which is why the `?token=` link keeps working while the form waits. `?token=` still works
+as before. The key is never logged, never forwarded, never written to disk. NAME empty or unset falls back to
+BASE_LINK_TOKEN.
+
 ComfyUI's own port is covered the same way. On a public bind ComfyUI listens on 127.0.0.1 only (85-launch.sh), and
 `--front PORT` serves PORT on each of the machine's OTHER addresses (the container's eth0 is where a host's proxy
 arrives), unlocked by the same key and forwarded unchanged. Loopback keeps ComfyUI itself, so the tunnel, the smoke
 and every install check reach it exactly as before. A port that cannot be bound yet (an older ComfyUI still holding
 0.0.0.0 until the install restarts it) is tried again every few seconds."""
-import argparse, asyncio, glob, hmac, ipaddress, os, re, signal, socket, struct, sys
-from urllib.parse import unquote
+import argparse, asyncio, glob, hashlib, hmac, html, ipaddress, os, re, signal, socket, struct, sys, time
+from urllib.parse import parse_qs, unquote, quote
 
 CORE = ("ws", "upload", "view", "history", "queue", "interrupt")   # the ComfyUI routes an app calls at the server's root
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -45,6 +58,11 @@ HOP = {"connection", "keep-alive", "proxy-connection"}
 COOKIE = "base_link"                            # the key's cookie: host-only, so each port's link carries the key once
 COOKIE_AGE = 30 * 24 * 3600
 RETRY = 5                                       # seconds between tries at a port that could not be bound
+UNLOCK = "/__base_unlock"                       # 3.30.0: the reserved path the lock page's form POSTs to (on every port)
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+FORM_MAX = 4096                                 # the most a key form may send
+FREE_MISSES, WAIT_BASE, WAIT_CAP = 5, 2, 300    # misses with no wait; then 2 s, doubling, up to 5 minutes
+FORGET_AFTER, TABLE_MAX = 900, 4096             # an address is forgotten after 15 quiet minutes; at most this many are kept
 LOCKED = ("<!doctype html><meta charset=utf-8><title>Locked</title>"
           "<body style=\"font:16px system-ui;margin:3em\"><p>This link needs its key.</p>"
           "<p style=\"color:#666\">Open the full link: <code>podctl status</code> prints it, and on RunPod so does the pod's Logs tab.</p>")
@@ -151,15 +169,115 @@ def loopback(peer):
     return a.is_loopback
 
 
+def link_key(environ):
+    """(the link key, True when it came from BASE_LINK_TOKEN_FROM) from an environment mapping. NAME unset, not a variable
+    name, or empty in the environment falls back to BASE_LINK_TOKEN."""
+    name = environ.get("BASE_LINK_TOKEN_FROM", "").strip()
+    if name and ENV_NAME.match(name):
+        val = environ.get(name, "").strip()
+        if val:
+            return val, True
+    return (environ.get("BASE_LINK_TOKEN", "").strip() or None), False
+
+
+def cookie_value(secret):
+    """The cookie a key form hands out: an HMAC of a fixed label under the key. The customer's own key is never stored
+    in their browser, and the value is the same after a restart (the install restarts this forwarder)."""
+    return hmac.new(secret.encode("utf-8"), b"base_link cookie v1", hashlib.sha256).hexdigest()
+
+
+def peer_key(peer):
+    """The address Backoff counts: an IPv4 as is (IPv4-mapped unwrapped), an IPv6 as its /64 so rotating the low bits buys nothing."""
+    try:
+        a = ipaddress.ip_address((peer or "").split("%", 1)[0])
+    except ValueError:
+        return peer or ""
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return str(ipaddress.ip_network("%s/64" % a, strict=False).network_address) if a.version == 6 else str(a)
+
+
+class Backoff:
+    """A simple per-address brake on guessing the key. The first FREE_MISSES misses cost nothing; each further one makes the
+    address wait WAIT_BASE seconds, doubling, up to WAIT_CAP. A match clears the address. While it waits a try is refused
+    without being compared. An address quiet for FORGET_AFTER seconds is forgotten, and the table never holds more than
+    TABLE_MAX addresses (the oldest go first)."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.seen = clock, {}              # address → [misses, last miss, wait until]
+
+    def wait(self, peer):
+        """Seconds this address must still wait (0 when it may try)."""
+        e = self.seen.get(peer_key(peer))
+        return max(0.0, e[2] - self.clock()) if e else 0.0
+
+    def miss(self, peer):
+        now, k = self.clock(), peer_key(peer)
+        e = self.seen.get(k)
+        if e is None or now - e[1] > FORGET_AFTER:
+            e = [0, now, 0.0]
+        e[0] += 1; e[1] = now
+        if e[0] > FREE_MISSES:
+            e[2] = now + min(WAIT_CAP, WAIT_BASE * 2 ** (e[0] - FREE_MISSES - 1))
+        self.seen[k] = e
+        if len(self.seen) > TABLE_MAX:
+            for old, _ in sorted(self.seen.items(), key=lambda kv: kv[1][1])[:len(self.seen) - TABLE_MAX + TABLE_MAX // 4]:
+                del self.seen[old]
+
+    def clear(self, peer):
+        self.seen.pop(peer_key(peer), None)
+
+
+class Form:
+    """What a key-from-the-environment forwarder adds: the cookie it hands out and the Backoff behind the form."""
+
+    def __init__(self, secret, clock=time.monotonic):
+        self.cookie, self.backoff = cookie_value(secret), Backoff(clock)
+
+
+def safe_next(value):
+    """Where the form sends the visitor after a match: a path on this host, or "/". Never an absolute URL, never `//host`."""
+    v = value or ""
+    if (not v.startswith("/") or v.startswith("//") or "\\" in v or any(ord(c) < 32 or ord(c) == 127 for c in v)
+            or v.split("?", 1)[0] == UNLOCK):
+        return "/"
+    return v
+
+
+def lock_form(next_path, note=""):
+    """The 401 page of a key-from-the-environment forwarder: one password field, one button, plain words, no brand."""
+    return ("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Enter your key</title>"
+            "<body style=\"font:16px system-ui;margin:3em;max-width:32em\"><p>This link needs its key.</p>"
+            "<p style=\"color:#666\">Type or paste the key you were given, then press Open.</p>%s"
+            "<form method=post action=\"%s\"><p><input type=password name=key autocomplete=current-password autofocus required "
+            "style=\"font:inherit;width:100%%;box-sizing:border-box\"></p>"
+            "<input type=hidden name=next value=\"%s\"><p><button style=\"font:inherit\">Open</button></p></form>"
+            % ("<p><b>%s</b></p>" % html.escape(note) if note else "", UNLOCK, html.escape(safe_next(next_path), quote=True)))
+
+
+FORM_HEADERS = ("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+                "Referrer-Policy: no-referrer", "X-Frame-Options: DENY")
+
+
+def header_value(headers, name):
+    """The first value of the request header `name` (case-insensitive), or None."""
+    for l in headers:
+        k, _, v = l.partition(":")
+        if k.strip().lower() == name:
+            return v.strip()
+    return None
+
+
 OPEN = object()   # 3.19.1: the secret that opens every link (--open: the pod did not opt into BASE_LINK_LOCK=1)
 
 
-def authorize(secret, method, path, headers, peer):
+def authorize(secret, method, path, headers, peer, cookie=None):
     """The key's verdict on one request → ("open", target) | ("set", location) | ("deny", None).
 
     open: forward it, to `target` (the key taken out of the query when it rode there). set: a GET or HEAD that carried
     the key: answer with the cookie and a redirect to `location`, the same URL without it. deny: the 401 page. With no
-    secret at all every request from outside is denied: a public bind is never open for want of a key."""
+    secret at all every request from outside is denied: a public bind is never open for want of a key. `cookie` is the
+    value the cookie must hold (default: the key itself; a key-from-the-environment forwarder passes a derived one)."""
     if secret is OPEN or loopback(peer):
         return "open", path
     if not secret:
@@ -167,7 +285,7 @@ def authorize(secret, method, path, headers, peer):
     tok, clean = split_token(path)
     if tok is not None and same(secret, tok):
         return ("set", clean) if method in ("GET", "HEAD") else ("open", clean)
-    if any(same(secret, c) for c in cookies(headers)):
+    if any(same(cookie or secret, c) for c in cookies(headers)):
         return "open", path                            # an app's own ?token= (not the key) passes untouched
     return "deny", None
 
@@ -225,7 +343,7 @@ def _simple(writer, status, body, ctype="text/plain; charset=utf-8", extra=(), c
                   % (status, ctype, len(data), cache, more)).encode("latin-1") + data)
 
 
-def _unlock(writer, secret, location):
+def _unlock(writer, secret, location):  # `secret` is the cookie's value (the key itself, or Form.cookie)
     """The cookie, and a redirect to the URL without the key. The cookie lives on this host only (no Domain), so no
     other pod behind the same proxy domain ever receives it. The key appears in this response's header and nowhere else."""
     _simple(writer, "303 See Other", "", extra=(
@@ -234,8 +352,39 @@ def _unlock(writer, secret, location):
         "Referrer-Policy: no-referrer"), cache="no-store")
 
 
-def handler(slug, upstream, secret=None):
-    """One port's connection handler. slug None is the front (ComfyUI's own port): the path goes through unchanged."""
+async def _key_form(creader, cwriter, method, path, headers, secret, form, peer):
+    """3.30.0: the reserved path. GET shows the form; POST checks the key it carries (constant time, behind the address's
+    Backoff) and, on a match, answers with the cookie and a 303 to `next`. Nothing here is ever logged."""
+    if method != "POST":
+        _simple(cwriter, "200 OK", lock_form(parse_qs(path.partition("?")[2]).get("next", ["/"])[0]), "text/html; charset=utf-8",
+                extra=FORM_HEADERS, cache="no-store"); return
+    try:
+        n = int(header_value(headers, "content-length") or "")
+    except ValueError:
+        n = -1
+    if not 0 <= n <= FORM_MAX or header_value(headers, "transfer-encoding"):
+        _simple(cwriter, "400 Bad Request", "bad request\n"); return
+    try:
+        body = await asyncio.wait_for(creader.readexactly(n), 10)
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+        return
+    fields = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+    nxt = safe_next(fields.get("next", ["/"])[0])
+    wait = form.backoff.wait(peer)
+    if wait > 0:
+        _simple(cwriter, "429 Too Many Requests", lock_form(nxt, "Too many tries. Wait %d seconds, then try again." % (wait + 0.999)),
+                "text/html; charset=utf-8", extra=("Retry-After: %d" % (wait + 0.999),) + FORM_HEADERS, cache="no-store"); return
+    if same(secret, fields.get("key", [""])[0].strip()):
+        form.backoff.clear(peer)
+        _unlock(cwriter, form.cookie, nxt); return
+    form.backoff.miss(peer)
+    _simple(cwriter, "401 Unauthorized", lock_form(nxt, "That key did not match. Check it and try again."),
+            "text/html; charset=utf-8", extra=FORM_HEADERS, cache="no-store")
+
+
+def handler(slug, upstream, secret=None, form=None):
+    """One port's connection handler. slug None is the front (ComfyUI's own port): the path goes through unchanged.
+    `form` (3.30.0) is a Form when the key comes from the environment: the 401 page then carries the key form."""
     host, port = upstream
 
     async def handle(creader, cwriter):
@@ -249,11 +398,20 @@ def handler(slug, upstream, secret=None):
                 _simple(cwriter, "400 Bad Request", "bad request line\n"); return
             method, path, ver = m.groups()
             peer = (cwriter.get_extra_info("peername") or ("",))[0]
-            verdict, path = authorize(secret, method, path, head.decode("latin-1").split("\r\n")[1:], peer)
+            headers = head.decode("latin-1").split("\r\n")[1:]
+            if form is not None and secret and secret is not OPEN and path.partition("?")[0] == UNLOCK:
+                await _key_form(creader, cwriter, method, path, headers, secret, form, peer); return
+            asked = path
+            verdict, path = authorize(secret, method, asked, headers, peer, form.cookie if form else None)
             if verdict == "deny":
-                _simple(cwriter, "401 Unauthorized", LOCKED, "text/html; charset=utf-8", cache="no-store"); return
+                if form is None:
+                    _simple(cwriter, "401 Unauthorized", LOCKED, "text/html; charset=utf-8", cache="no-store")
+                else:
+                    _simple(cwriter, "401 Unauthorized", lock_form(split_token(asked)[1] if method in ("GET", "HEAD") else "/"),
+                            "text/html; charset=utf-8", extra=FORM_HEADERS, cache="no-store")
+                return
             if verdict == "set":
-                _unlock(cwriter, secret, path); return
+                _unlock(cwriter, form.cookie if form else secret, path); return
             to = target(path, slug) if slug else path
             new, upgrade = rewrite_head(head, lambda _l: "%s %s %s" % (method, to, ver))
             try:
@@ -324,16 +482,17 @@ def public(listen):
     return listen not in ("", "localhost") and not loopback(listen)
 
 
-async def serve(rows, listen, upstream, say=print, secret=None, front=None, front_listen=None, retry=RETRY):
+async def serve(rows, listen, upstream, say=print, secret=None, front=None, front_listen=None, retry=RETRY, form=None):
     """Bind every row (and the front on each non-loopback address); a port that cannot be bound yet is said once and
-    tried again every `retry` seconds. Returns the servers bound now; later ones join the same list."""
+    tried again every `retry` seconds. Returns the servers bound now; later ones join the same list. `form` (3.30.0): a Form
+    shared by every port, so an address's misses count across them."""
     servers, jobs = [], []
     for port, slug, name in rows:
-        jobs.append((listen, port, handler(slug, upstream, secret),
+        jobs.append((listen, port, handler(slug, upstream, secret, form),
                      "%s on %s:%d -> %s:%d/apps/%s/" % (name, listen, port, upstream[0], upstream[1], slug), "%s (%s)" % (name, slug)))
     if front:
         for addr in (front_listen if front_listen is not None else front_addrs()):
-            jobs.append((addr, front, handler(None, upstream, secret),
+            jobs.append((addr, front, handler(None, upstream, secret, form),
                          "ComfyUI on %s:%d -> %s:%d (the key's front)" % (addr, front, upstream[0], upstream[1]), "ComfyUI"))
 
     async def bind(job, quiet):
@@ -384,9 +543,11 @@ def main(argv=None):
     if not rows and not front:
         print("app_proxy: no app ports declared: nothing to serve")
         return 0
-    secret = OPEN if a.open else (os.environ.get("BASE_LINK_TOKEN", "").strip() or None)
+    secret, from_env = (OPEN, False) if a.open else link_key(os.environ)
+    form = Form(secret) if from_env else None
     if public(a.listen):
         print("app_proxy: %s" % ("every link opens on one click (--open; BASE_LINK_LOCK=1 locks them)" if secret is OPEN else
+                                 "every link needs the key (%s; the lock page asks for it)" % os.environ.get("BASE_LINK_TOKEN_FROM", "").strip() if from_env else
                                  "every link needs the key (BASE_LINK_TOKEN)" if secret else
                                  "no BASE_LINK_TOKEN: every request from outside this machine is refused"), flush=True)
     h, _, p = a.upstream.rpartition(":")
@@ -394,7 +555,7 @@ def main(argv=None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(serve(rows, a.listen, upstream, say=lambda s: print(s, flush=True), secret=secret,
-                                  front=front, front_listen=a.front_listen))
+                                  front=front, front_listen=a.front_listen, form=form))
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, loop.stop)

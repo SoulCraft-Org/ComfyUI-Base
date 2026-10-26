@@ -236,8 +236,19 @@ boot_link_token(){ # 3.14.0: the key that locks ComfyUI and every app link on a 
   # PID 1 when this shell did not inherit it; else the one saved in state/tokens.env; else, on a public bind, one is
   # GENERATED and saved (0600), exactly as JupyterLab's is. Exported for the forwarder alone; never echoed here (this log is
   # a file on the volume). BOOT_LINK_MADE=1 when this call made it: boot_apps then names the links once on the CONTAINER log.
-  local tf="$BOOT_HOME/state/tokens.env" tok="${BASE_LINK_TOKEN:-}"
-  BOOT_LINK_MADE=0
+  # 3.30.0: BASE_LINK_TOKEN_FROM=<NAME> (the pod's env, else PID 1's) makes the key the value of the variable NAME, which the
+  # customer already has (the template's own key): nothing is generated, saved or printed, and the forwarder's lock page asks
+  # for it (BOOT_LINK_FROM=1). NAME is exported beside it so the forwarder inherits the value; NAME missing, malformed or
+  # empty falls through to the rules below.
+  local tf="$BOOT_HOME/state/tokens.env" tok="${BASE_LINK_TOKEN:-}" from="${BASE_LINK_TOKEN_FROM:-}" fv=""
+  BOOT_LINK_MADE=0; BOOT_LINK_FROM=0
+  [ -n "$from" ] || from="$(boot_pid1_env BASE_LINK_TOKEN_FROM)"
+  case "$from" in ''|[0-9]*|*[!A-Za-z0-9_]*) from="" ;; esac
+  if [ -n "$from" ]; then
+    fv="${!from:-}"; [ -n "$fv" ] || fv="$(boot_pid1_env "$from")"
+    if [ -n "$fv" ]; then export BASE_LINK_TOKEN_FROM="$from"; export "$from=$fv"; BOOT_LINK_FROM=1; return 0; fi
+    echo "boot: BASE_LINK_TOKEN_FROM=$from, but $from is empty: the key is made the usual way"
+  fi
   [ -n "$tok" ] || tok="$(boot_pid1_env BASE_LINK_TOKEN)"
   if [ -z "$tok" ] && [ -f "$tf" ]; then tok="$(sed -n 's/^BASE_LINK_TOKEN=//p' "$tf" | tail -1)"; fi
   if [ -z "$tok" ] && boot_public; then
@@ -251,6 +262,10 @@ boot_link_token(){ # 3.14.0: the key that locks ComfyUI and every app link on a 
   return 0
 }
 boot_console_links(){ # <comfy port> <rows> → one line per locked link on the CONTAINER log (RunPod's Logs tab), only for a key the boot made
+  # 3.30.0: a key from the environment (BOOT_LINK_FROM=1) is the customer's own and is never printed: one line says where it goes
+  if [ "${BOOT_LINK_FROM:-0}" = 1 ] && [ "${BASE_HOST:-}" = runpod ] && { true >&3; } 2>/dev/null; then
+    echo "The links ask for your key (${BASE_LINK_TOKEN_FROM}): open ComfyUI from the Connect tab and type it once." >&3
+  fi
   [ "${BOOT_LINK_MADE:-0}" = 1 ] && [ "${BASE_HOST:-}" = runpod ] && [ -n "${RUNPOD_POD_ID:-}" ] && [ -n "${BASE_LINK_TOKEN:-}" ] || return 0
   { true >&3; } 2>/dev/null || return 0
   local p s nm
@@ -303,7 +318,7 @@ boot_apps(){ # 3.9.0: each customer app at the root of its own port (state/apps.
   mkdir -p "$BOOT_HOME/state/logs"
   nohup "$py" "$proxy" --state "$BOOT_HOME/state" --upstream "127.0.0.1:$port" --listen "${BASE_LISTEN:-127.0.0.1}" ${front[@]+"${front[@]}"} ${opn[@]+"${opn[@]}"} >> "$BOOT_HOME/state/logs/app_proxy.log" 2>&1 &
   if [ "${#front[@]}" -gt 0 ]; then
-    echo "boot: ComfyUI's port $port: $(boot_link_locked && echo "the key's front" || echo "the front, open (BASE_LINK_LOCK=1 locks it)") on this machine's addresses (ComfyUI itself on 127.0.0.1)$( [ "${BOOT_LINK_MADE:-0}" = 1 ] && echo ' · key generated, saved to state/tokens.env')"
+    echo "boot: ComfyUI's port $port: $(boot_link_locked && echo "the key's front" || echo "the front, open (BASE_LINK_LOCK=1 locks it)") on this machine's addresses (ComfyUI itself on 127.0.0.1)$( [ "${BOOT_LINK_MADE:-0}" = 1 ] && echo ' · key generated, saved to state/tokens.env')$( [ "${BOOT_LINK_FROM:-0}" = 1 ] && echo " · the key is \$${BASE_LINK_TOKEN_FROM}'s value, asked for on the lock page")"
   fi
   if [ "${n:-0}" = 0 ]; then echo "boot: app ports: none declared (no package ships a customer app)"; fi
   printf '%s\n' "$rows" | while IFS='|' read -r p s nm; do
