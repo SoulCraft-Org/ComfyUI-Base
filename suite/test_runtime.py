@@ -4,8 +4,8 @@ A buyer's machine installs what its maintainer's own sweep proved: ComfyUI, the 
 venv and the wheel cache, as parts with a manifest that is the ONLY place their versions are written. These tests build
 a runtime from a fake green tree, apply it to a fresh one, and install the stub package from it with every fetching tool
 stubbed to fail loudly if it is ever called to fetch."""
-import json, os, pathlib, shutil, subprocess, tarfile, pytest
-pytestmark = pytest.mark.unit
+import functools, http.server, json, os, pathlib, shutil, subprocess, tarfile, threading, time, pytest
+pytestmark = [pytest.mark.unit, pytest.mark.skipif(not shutil.which("zstd"), reason="the runtime's parts are zstd tars: the machine needs zstd (CI has it)")]
 BASE = pathlib.Path(__file__).resolve().parents[1]
 RT = BASE / "py" / "runtime.py"
 
@@ -70,13 +70,18 @@ def _build(root, out, part_bytes=None):
     return json.loads((out / "runtime.json").read_text())
 
 
-def _names(out, man):
-    data = b"".join((out / p["name"]).read_bytes() for p in man["parts"])
-    tmp = out / "joined.tar.gz"; tmp.write_bytes(data)
+def _part_names(path):
+    z = subprocess.run(["zstd", "-dc", "-q", str(path)], capture_output=True, check=True)
+    tmp = path.with_suffix(".tar")
+    tmp.write_bytes(z.stdout)
     with tarfile.open(tmp) as t:
         names = t.getnames()
     tmp.unlink()
     return names
+
+
+def _names(out, man):
+    return [n for p in man["parts"] for n in _part_names(out / p["name"])]
 
 
 # ---------------------------------------------------------------- py/runtime.py
@@ -84,7 +89,8 @@ def _names(out, man):
 def test_unit_a_runtime_carries_code_never_data_or_secrets(tmp_path):
     src = tmp_path / "src"; _green_tree(src)
     out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
-    assert len(man["parts"]) > 1 and all(p["bytes"] <= 700 for p in man["parts"])
+    assert len(man["parts"]) > 1 and man["format"] == 2 and man["compression"] == "zstd"
+    assert all(p["name"].endswith(".tar.zst") and len(p["sha256"]) == 64 and p["bytes"] > 0 for p in man["parts"])
     names = _names(out, man)
     assert "ComfyUI/main.py" in names and "ComfyUI/custom_nodes/PackA/README" in names and "ComfyUI/.venv-cu130/bin/python" in names
     assert "comfy-base/tools" in names and "comfy-base/tools.3.99.1/bin/jupyter-lab" in names and "comfy-base/state/wheels/sageattention-abc/s.whl" in names
@@ -128,6 +134,137 @@ def test_unit_the_driver_floor_table_and_a_build_with_no_cuda(tmp_path):
     r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o"), "--torch-cuda", ""],
                        capture_output=True, text=True)
     assert r.returncode != 0 and "driver floor" in r.stderr
+
+
+def test_unit_every_part_unpacks_alone_and_in_any_order(tmp_path):
+    """3.29.3: independent parts. Each one unpacks into an empty folder by itself (the directories above its files ride in it),
+    and the parts applied at once, largest first, make exactly the tree the parts applied one at a time make."""
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    assert len(man["parts"]) > 3
+    for i, p in enumerate(man["parts"]):
+        alone = tmp_path / ("alone%d" % i); alone.mkdir()
+        z = subprocess.Popen(["zstd", "-dc", "-q", str(out / p["name"])], stdout=subprocess.PIPE)
+        r = subprocess.run(["tar", "-xf", "-", "-C", str(alone)], stdin=z.stdout, capture_output=True, text=True)
+        z.stdout.close(); assert z.wait() == 0 and r.returncode == 0, r.stderr
+    trees = {}
+    for jobs in (1, 6):
+        dst = tmp_path / ("dst%d" % jobs); dst.mkdir()
+        r = subprocess.run(["python3", str(RT), "apply", str(out / "runtime.json"), str(out / "runtime.json"), "--root", str(dst),
+                            "--work", str(tmp_path / ("w%d" % jobs)), "--jobs", str(jobs)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        trees[jobs] = sorted(str(p.relative_to(dst)) + ("->" + os.readlink(p) if p.is_symlink() else "") + ("" if p.is_symlink() or p.is_dir() else ":" + str(p.stat().st_size))
+                             for p in dst.rglob("*"))
+    assert trees[1] == trees[6] and "ComfyUI/main.py:0" in trees[1] and "comfy-base/tools->tools.3.99.1" in trees[1]
+    assert not any("/output" in t or "tokens.env" in t for t in trees[1])
+
+
+class _Server:
+    """A loopback http server for the parts: counts the requests in flight at once, can demand a signature in the query."""
+
+    def __init__(self, directory, need="", delay=0.0):
+        self.live = self.peak = 0
+        self.lock = threading.Lock()
+        outer = self
+
+        class H(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if outer.need and outer.need not in self.path:
+                    self.send_error(403); return
+                with outer.lock:
+                    outer.live += 1; outer.peak = max(outer.peak, outer.live)
+                try:
+                    time.sleep(outer.delay)
+                    super().do_GET()
+                finally:
+                    with outer.lock:
+                        outer.live -= 1
+        self.need, self.delay = need, delay
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(H, directory=str(directory)))
+        self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start(); return self
+
+    def __exit__(self, *a):
+        self.srv.shutdown(); self.srv.server_close(); self.thread.join()
+
+
+def test_unit_apply_fetches_several_parts_at_once_from_a_manifest_url(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    dst = tmp_path / "dst"; dst.mkdir()
+    with _Server(out, delay=0.15) as srv:
+        (tmp_path / "m").mkdir(); (tmp_path / "m" / "runtime.json").write_bytes((out / "runtime.json").read_bytes())
+        r = subprocess.run(["python3", str(RT), "apply", str(tmp_path / "m" / "runtime.json"), srv.url + "/runtime.json", "--root", str(dst),
+                            "--work", str(tmp_path / "w"), "--jobs", "4", "--result", str(tmp_path / "res.json")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert 2 <= srv.peak <= 4, srv.peak                                      # several at once, never more than --jobs
+    assert (dst / "ComfyUI" / "custom_nodes" / "PackA" / "README").exists() and not (tmp_path / "w" / "runtime.000.tar.zst").exists()
+    res = json.loads((tmp_path / "res.json").read_text())
+    assert res["parts"] == len(man["parts"]) and res["bytes"] == sum(p["bytes"] for p in man["parts"]) and res["jobs"] == 4 and res["gbps"] >= 0
+
+
+def test_unit_signed_links_beside_a_local_manifest_are_used_and_never_printed(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    held = tmp_path / "held"; held.mkdir(); (held / "runtime.json").write_bytes((out / "runtime.json").read_bytes())      # no parts beside it
+    dst = tmp_path / "dst"; dst.mkdir()
+    with _Server(out, need="sig=s3cret") as srv:
+        links = [{"name": p["name"], "url": "%s/%s?sig=s3cret" % (srv.url, p["name"]), "sha256": p["sha256"], "bytes": p["bytes"]} for p in man["parts"]]
+        mraw = (held / "runtime.json").read_bytes()               # the site's entitlement `runtime` object, as it comes
+        ent = {"id": "rt-1", "manifest": {"url": srv.url + "/runtime.json", "sha256": __import__("hashlib").sha256(mraw).hexdigest(), "bytes": len(mraw)}, "parts": links}
+        (held / "links.json").write_text(json.dumps(ent))
+        r = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
+                            "--root", str(dst), "--work", str(tmp_path / "w")], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "s3cret" not in r.stdout + r.stderr
+        ent["manifest"]["sha256"] = "0" * 64                       # links that name another manifest are refused before any fetch
+        (held / "links.json").write_text(json.dumps(ent))
+        other = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
+                                "--root", str(tmp_path / "dx"), "--work", str(tmp_path / "wx")], capture_output=True, text=True)
+        assert other.returncode != 0 and "not the one the link list names" in other.stderr and not (tmp_path / "dx").exists()
+        (held / "links.json").write_text(json.dumps(links))        # and a bare list of parts is accepted too
+        links[1]["url"] = "%s/%s?sig=wrong" % (srv.url, man["parts"][1]["name"])              # a link the server refuses
+        (held / "links.json").write_text(json.dumps(links))
+        dst2 = tmp_path / "dst2"; dst2.mkdir()
+        bad = subprocess.run(["python3", str(RT), "apply", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json"),
+                              "--root", str(dst2), "--work", str(tmp_path / "w2")], capture_output=True, text=True)
+    assert bad.returncode == 1 and man["parts"][1]["name"] in bad.stderr and "wrong" not in bad.stdout + bad.stderr
+    links[0]["bytes"] += 1; (held / "links.json").write_text(json.dumps(links))
+    odd = subprocess.run(["python3", str(RT), "sources", str(held / "runtime.json"), str(held / "runtime.json"), "--parts", str(held / "links.json")], capture_output=True, text=True)
+    assert odd.returncode != 0 and "manifest says" in odd.stderr
+
+
+def test_unit_a_runtime_of_the_old_format_is_refused_by_name(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out)
+    m = json.loads((out / "runtime.json").read_text()); m["format"] = 1; (out / "runtime.json").write_text(json.dumps(m))
+    r = subprocess.run(["python3", str(RT), "apply", str(out / "runtime.json"), str(out / "runtime.json"), "--root", str(tmp_path / "d"), "--work", str(tmp_path / "w")],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "capture it again" in r.stderr
+
+
+def test_unit_runtime_apply_records_a_runtime_row_in_the_timing_ledger(tmp_path):
+    src, out, dst = _applied(tmp_path)
+    logs = dst / "comfy-base" / "state" / "logs"
+    timings = "".join(f.read_text() for f in logs.glob("runtime-apply_*.timings.tsv"))
+    timeline = "".join(f.read_text() for f in logs.glob("runtime-apply_*.timeline.tsv"))
+    assert "RUNTIME fetch and unpack" in timings and "GB/s" in timings and "parts" in timings
+    row = [ln for ln in timeline.splitlines() if "RUNTIME fetch and unpack" in ln]
+    assert len(row) == 1 and row[0].split("\t")[0].isdigit()
+    res = json.loads((dst / "comfy-base" / "state" / "runtime-apply.json").read_text())
+    assert res["bytes"] > 0 and res["raw"] > 0 and res["parts"] > 1 and "gbps" in res
+
+
+def test_unit_runtime_apply_takes_jobs_and_a_manifest_url(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=700)
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    with _Server(out, delay=0.1) as srv:
+        r = _base(["runtime-apply", srv.url + "/runtime.json", "--jobs", "3"], dst)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert 2 <= srv.peak <= 3 and (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    assert _base(["runtime-apply", "x.json", "--jobs", "0"], dst).returncode == 2
 
 
 def test_unit_verify_parts_names_the_first_part_that_differs(tmp_path):
@@ -192,13 +329,13 @@ def test_unit_runtime_apply_unpacks_stamps_and_is_idempotent(tmp_path):
     assert again.returncode == 0 and "already applied" in again.stdout
 
 
-def test_unit_a_corrupt_part_stops_before_anything_is_unpacked(tmp_path):
+def test_unit_a_corrupt_part_fails_the_apply_by_name_and_stamps_nothing(tmp_path):
     src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
     p = out / man["parts"][0]["name"]; b = bytearray(p.read_bytes()); b[-1] ^= 1; p.write_bytes(bytes(b))
     dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
     r = _base(["runtime-apply", str(out / "runtime.json")], dst)
-    assert r.returncode != 0 and "do not match" in r.stdout + r.stderr
-    assert not (dst / "ComfyUI").exists() and not (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    assert r.returncode != 0 and man["parts"][0]["name"] in r.stdout + r.stderr and "sha256" in r.stdout + r.stderr
+    assert not (dst / "comfy-base" / "state" / "runtime.stamp").exists()           # parts unpack as they land: the stamp is what a run trusts
 
 
 def test_unit_runtime_apply_refuses_a_shared_store(tmp_path):

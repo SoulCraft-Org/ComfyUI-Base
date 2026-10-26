@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.29.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.29.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -151,7 +151,7 @@ run once per machine as **step one**; then each workflow package is **step two**
     its newest, which §0.3 forbids. The base ships neither the generator nor the extension.
     **A proven runtime is not a freeze** (3.1.0): `runtime-capture` packs a green machine's code (the tree minus its
     data, the uv Python, the venv, the git-checkout packs, JupyterLab, the wheel cache; never a package's vendored
-    packs, which its zip brings) into parts under 2 GiB with `runtime.json`,
+    packs, which its zip brings) into independent zstd parts (3.29.3: each its own tar, any order, all at once) with `runtime.json`,
     the only place its versions are written; `runtime-apply <manifest>` unpacks it on a buyer's machine, and
     `BASE_RUNTIME=<state/runtime.json>` installs from it with no OS, git, pip or uv step, each skip noted, the driver
     gate held at the manifest's floor (3.29.2: the floor of the runtime's own torch CUDA build, 580 for cu130, never the
@@ -707,6 +707,22 @@ onto a volume that has none of that minor before `uv python upgrade`, which stil
 not a second install: CONSOLIDATE neither reports nor sizes its tree and venv, and moves a pack of ours out of it into
 `custom_nodes`, where the pack pass fetches it instead of cloning it.
 
+**The runtime's parts and how they land** (3.29.3): `runtime-capture` cuts the runtime into independent parts, each its own
+zstd-compressed tar (`runtime.NNN.tar.zst`, about 512 MB of file content each, `--part-bytes`), carrying the directories above
+its own files so it unpacks alone; compression runs one part per CPU. `runtime.json` lists each part's `name`, `sha256`,
+`bytes` (packed) and `raw` (unpacked), with `format: 2`, `compression: zstd`. `runtime-apply <manifest> [--parts <links.json>]
+[--jobs N]` fetches N parts at once (8; `BASE_RUNTIME_JOBS`), largest first, from the manifest's https URL (parts beside it,
+or each part's own `url`), from the per-part links given beside a local manifest (`--parts links.json`: the site's entitlement `runtime` object as it
+comes, `{id, manifest: {url, sha256, bytes}, parts: [{name, url, sha256, bytes}]}`, or a bare list of parts; the manifest's
+own sha256 and bytes judge every part, the links' values are only a cross-check and a disagreement is refused, as is a
+manifest that is not the one the links name; a link is a credential, never printed, lasts about ten minutes and a
+failed one fails its part by name, retried only a few times), or
+from a local folder; each part's size and sha256 are checked and the part is unpacked (`zstd -dc | tar -x`) the moment it
+lands, in parallel with the rest, then deleted. Nothing is stamped until every part is in; a failed part stops the apply,
+named, and a re-run fetches again. `zstd` must be on the machine (the apply installs the package where it is root and apt
+exists). The apply's wall seconds, bytes and GB/s are the RUNTIME row of the timing ledger
+(`state/logs/runtime-apply_<ts>.timings.tsv` and `.timeline.tsv`) and `state/runtime-apply.json`.
+
 **A buyer's machine** (`BASE_RUNTIME`, 3.1.0): the same pipeline with the system step, the ComfyUI update, the pack
 moves, the venv build, packs pip, Comfy MCP and the newest pass each replaced by a note; the tree and every pack are
 checked against `runtime.json` instead, the venv must import torch, SageAttention must be the runtime's own build,
@@ -883,6 +899,19 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.29.3: the runtime's parts are independent zstd tars, fetched and unpacked in parallel (2026-10-26). Exercised by the
+  suite and by a hand run of `runtime.py build`/`apply` and `base.sh runtime-apply` on a small tree on macOS (local folder
+  and a loopback http server); not on a live machine, so the GB/s on a B200 is still unmeasured. The format of 3.1.0 (one
+  gzip stream cut into slices, fetched one at a time with curl) is gone: no runtime was ever published, and an old
+  manifest (`format` 1) is refused by name ("capture it again"). `runtime-capture` writes `runtime.NNN.tar.zst`, each with
+  the directories above its files so any part unpacks alone and in any order (a hard link only points inside its own
+  part). `runtime-apply` takes `--jobs` (default 8) and `--parts <links.json>`, runs `py/runtime.py apply` (fetch with curl,
+  size and sha256, `zstd -dc | tar -x`, one worker per part, largest first), and records one RUNTIME row in the timing
+  ledger: wall seconds, packed and unpacked GB, GB/s, with the busy seconds of fetch, verify and unpack in its text. Only
+  https is fetched (and a loopback http for tests). An Update that fails midway puts the old venv and packs back. A
+  corrupt part no longer stops the apply before anything unpacks (parts unpack as they land); it fails the apply, named,
+  and no stamp is written, so no install runs from a half-applied runtime. Needs `zstd` (a one-package apt install where
+  the machine lacks it).
 - 3.29.2: `runtime.json`'s `driver_min` is the floor the runtime's wheels need (2026-10-26, Fixes
   SoulCraft-Org/ComfyUI-Base#2). Exercised by the suite only (no pod, no live capture). `runtime-capture` wrote the
   capture machine's own driver major, so a runtime captured on a 615 machine was refused by the driver gate on every
@@ -1630,7 +1659,7 @@ for any invocation that somehow arrives without the environment. The suite asser
   Update (a newer `runtime-apply`) is followed by the packages' installs.
 
 - 3.1.0: a buyer's machine, opt-in end to end, with every plain run unchanged. A proven runtime: `runtime-capture` on
-  a green machine (parts under GitHub's 2 GiB and `runtime.json`, `py/runtime.py`), `runtime-apply` on a buyer's, and
+  a green machine (gzip slices of one stream under GitHub's 2 GiB, and `runtime.json`, `py/runtime.py`; re-cut in 3.29.3), `runtime-apply` on a buyer's, and
   `BASE_RUNTIME` installing from it with no OS, git, pip or uv step (§0.3's one exception, §0.12). The first flow
   first: `MODELS_LATER` and `BASE_STAGED=1` stand in for the rest, which a detached `base.sh fetch-later` brings behind
   the started server while `state/progress.json` reports each file. `BASE_FETCH_JOBS` fetches several files at once
