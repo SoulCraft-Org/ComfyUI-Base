@@ -9,7 +9,7 @@ gzip tar split into parts that fit a GitHub release asset, with a manifest (runt
 versions are written: the base's lib/ and py/ carry none.
 
     runtime.py build --root /workspace --comfy /workspace/ComfyUI --out DIR [--part-bytes N] [--url-base PREFIX]
-                     [--driver-min N] [--base-version V] [--python V] [--sage-key K]
+                     [--torch-cuda V] [--base-version V] [--python V] [--sage-key K]
     runtime.py verify-parts MANIFEST DIR           every part's size and sha256; rc 1 naming the first that differs
     runtime.py sources MANIFEST LOCATION           "<name>\\t<where to fetch it>\\t<bytes>" per part, relative names resolved
     runtime.py check-tree MANIFEST --comfy DIR     ComfyUI's and every pack's HEAD equal the manifest's; rc 1 per difference
@@ -31,6 +31,18 @@ PART_BYTES = 1_900_000_000          # under GitHub's 2 GiB per release asset
 PATHS = ["ComfyUI", "comfy-base/python", "comfy-base/bin", "comfy-base/tools", "comfy-base/state/wheels"]
 EXCLUDE_TOP = {"models", "input", "output", "user", "temp"}      # under ComfyUI/: data, never runtime
 EXCLUDE_NAMES = {"__pycache__"}
+# The lowest NVIDIA driver major a CUDA major's wheels run on: NVIDIA's minor-version compatibility table (CUDA Toolkit
+# release notes). It is what the runtime's WHEELS need, never what the capture machine happened to run.
+DRIVER_FLOOR = {13: 580, 12: 525, 11: 450}
+
+
+def driver_floor(cuda):
+    """The driver floor of a torch CUDA build ("13.0" -> 580). A build that names no CUDA, or one this table does not
+    know, raises: a runtime without a floor would be refused or accepted by accident."""
+    m = (cuda or "").strip().split(".")[0]
+    if not m.isdigit() or int(m) not in DRIVER_FLOOR:
+        raise SystemExit("runtime: cannot derive the driver floor from torch CUDA %r (known majors: %s)" % (cuda, sorted(DRIVER_FLOOR)))
+    return DRIVER_FLOOR[int(m)]
 
 
 def _git(d, *args):
@@ -125,6 +137,7 @@ def _members(root, comfy_rel):
 
 
 def build(a):
+    floor = driver_floor(a.torch_cuda)
     root = pathlib.Path(a.root)
     comfy = pathlib.Path(a.comfy)
     comfy_rel = str(comfy.relative_to(root)) if comfy.is_absolute() else str(comfy)
@@ -157,7 +170,8 @@ def build(a):
     for p in sink.parts:
         p["url"] = "%s/%s" % (url_base, p["name"]) if url_base else p["name"]
     manifest = {
-        "format": FORMAT, "created": _utc(), "base": a.base_version or "", "driver_min": str(a.driver_min or ""),
+        "format": FORMAT, "created": _utc(), "base": a.base_version or "",
+        "cuda": a.torch_cuda, "driver_min": str(floor),
         "comfyui": {"dir": comfy_rel, "commit": _git(root / comfy_rel, "rev-parse", "HEAD"), "version": version},
         "python": a.python or "", "venv": "%s/.venv-cu130" % comfy_rel if (root / comfy_rel / ".venv-cu130").exists() else "",
         "packs": packs, "sageattention": {"key": a.sage_key or ""},
@@ -254,7 +268,7 @@ def main(argv=None):
     b.add_argument("--out", required=True)
     b.add_argument("--part-bytes", type=int, default=PART_BYTES)
     b.add_argument("--url-base", default="")
-    b.add_argument("--driver-min", default="")
+    b.add_argument("--torch-cuda", required=True)
     b.add_argument("--base-version", default="")
     b.add_argument("--python", default="")
     b.add_argument("--sage-key", default="")

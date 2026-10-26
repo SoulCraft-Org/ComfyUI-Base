@@ -25,7 +25,7 @@ def _repo(d, url=None):
     return _git(d, "rev-parse", "HEAD")
 
 
-FAKE_PY = '#!/bin/bash\ncase "$*" in *"import torch"*) echo "2.99.0 13.0";; *"import sageattention"*) exit 0;; *platform.python_version*) echo "3.99.0";; *) exec python3 "$@";; esac\n'
+FAKE_PY = '#!/bin/bash\ncase "$*" in *"print(torch.version.cuda"*) echo "13.0";; *"import torch"*) echo "2.99.0 13.0";; *"import sageattention"*) exit 0;; *platform.python_version*) echo "3.99.0";; *) exec python3 "$@";; esac\n'
 
 
 def _green_tree(root):
@@ -62,7 +62,7 @@ def _green_tree(root):
 
 def _build(root, out, part_bytes=None):
     args = ["python3", str(RT), "build", "--root", str(root), "--comfy", str(root / "ComfyUI"), "--out", str(out),
-            "--driver-min", "580", "--base-version", "9.9.9", "--python", "3.99.0", "--sage-key", "sageattention-abc-cp399-torch2.99.0-sm_120"]
+            "--torch-cuda", "13.0", "--base-version", "9.9.9", "--python", "3.99.0", "--sage-key", "sageattention-abc-cp399-torch2.99.0-sm_120"]
     if part_bytes:
         args += ["--part-bytes", str(part_bytes)]
     r = subprocess.run(args, capture_output=True, text=True)
@@ -95,6 +95,39 @@ def test_unit_a_runtime_carries_code_never_data_or_secrets(tmp_path):
     assert man["comfyui"]["version"] == "0.99.0" and man["driver_min"] == "580" and man["sageattention"]["key"].endswith("sm_120")
     packa = [p for p in man["packs"] if p["dir"] == "PackA"]
     assert len(packa) == 1 and packa[0]["url"] == "https://github.com/o/PackA.git" and len(man["packs"]) == 1 + len(__import__("basetest").base_packs())
+
+
+def test_unit_the_driver_floor_comes_from_the_torch_build_never_the_capture_machine(tmp_path):
+    """Issue #2: a runtime captured on a machine that runs driver 615 must install on a 580 machine, because its cu130 wheels
+    need only 580. Capture runs with the machine's driver faked to 615; the apply side holds the real gate (BASE_FAKE_ROOT off)."""
+    src = tmp_path / "src"; _green_tree(src); (src / "comfy-base" / "state" / "last-run").mkdir(parents=True)
+    (src / "comfy-base" / "state" / "last-run" / "pkg").write_text("green 20261026-000000 1.0.0\n")
+    cap = ('source "%s/base.sh"; eval "$(declare -f base_discover | sed "1s/base_discover/_orig_discover/")"; '
+           'base_discover(){ _orig_discover "$@"; DRIVER=615.10; }; base_runtime_capture "%s"' % (BASE, tmp_path / "cap"))
+    r = subprocess.run(["bash", "-c", cap], capture_output=True, text=True, env=_env(src))
+    assert r.returncode == 0, r.stdout + r.stderr
+    m = json.loads((tmp_path / "cap" / "runtime.json").read_text())
+    assert m["driver_min"] == "580" and m["cuda"] == "13.0"
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    r = _base(["runtime-apply", str(tmp_path / "cap" / "runtime.json")], dst)
+    assert r.returncode == 0, r.stdout + r.stderr
+    gate = ('source "%s/base.sh"; base_env_setup; DRIVER=%s; _base_runtime_init >/dev/null && BASE_FAKE_ROOT= _base_driver_gate >/dev/null' % (BASE, "%s"))
+    env = _env(dst, BASE_RUNTIME=str(dst / "comfy-base" / "state" / "runtime.json"))
+    assert subprocess.run(["bash", "-c", gate % "580.178.04"], capture_output=True, text=True, env=env).returncode == 0
+    assert subprocess.run(["bash", "-c", gate % "575.10"], capture_output=True, text=True, env=env).returncode != 0
+
+
+def test_unit_the_driver_floor_table_and_a_build_with_no_cuda(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("runtime_mod", RT); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    assert mod.driver_floor("13.0") == 580 and mod.driver_floor("13.2") == 580 and mod.driver_floor("12.8") == 525
+    for bad in ("", None, "cpu", "99.0"):
+        with pytest.raises(SystemExit):
+            mod.driver_floor(bad)
+    src = tmp_path / "src"; _green_tree(src)
+    r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o"), "--torch-cuda", ""],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "driver floor" in r.stderr
 
 
 def test_unit_verify_parts_names_the_first_part_that_differs(tmp_path):

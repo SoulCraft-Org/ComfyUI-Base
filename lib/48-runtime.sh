@@ -109,7 +109,7 @@ base_runtime_apply(){ # <manifest path or https URL> → the runtime unpacked be
 }
 
 base_runtime_capture(){ # <outdir> [--url-base <prefix>] [--part-bytes <n>] → the runtime of this green machine, as parts + runtime.json
-  local out="" url_base="" part="" f bad="" dmaj
+  local out="" url_base="" part="" f bad="" cuda
   while [ $# -gt 0 ]; do
     case "$1" in
       --url-base) url_base="${2:-}"; shift 2 ;;
@@ -125,9 +125,11 @@ base_runtime_capture(){ # <outdir> [--url-base <prefix>] [--part-bytes <n>] → 
   if ! ls "$BASE_STATE"/last-run/* >/dev/null 2>&1; then err "no install has run here: nothing is proven yet"; return 1; fi
   for f in "$BASE_STATE"/last-run/*; do if ! grep -q '^green' "$f"; then bad="$bad $(basename "$f")"; fi; done
   if [ -n "$bad" ]; then err "the last run was not green for:$bad; capture a machine whose installs all passed"; return 1; fi
-  dmaj="${DRIVER%%.*}"; [[ "$dmaj" =~ ^[0-9]+$ ]] || dmaj="${DRIVER_MIN:-}"
+  # 3.29.2: the driver floor is what the runtime's torch build needs (py/runtime.py driver_floor), never this machine's driver
+  cuda="$("$PY" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || true)"
+  if [ -z "$cuda" ]; then err "runtime-capture: $PY has no CUDA torch: the driver floor cannot be derived"; return 1; fi
   "$SYS_PY" "$BASE_DIR/py/runtime.py" build --root "$(_base_runtime_root)" --comfy "$COMFY" --out "$out" \
-    ${part:+--part-bytes "$part"} ${url_base:+--url-base "$url_base"} --driver-min "$dmaj" --base-version "$BASE_VERSION" \
+    ${part:+--part-bytes "$part"} ${url_base:+--url-base "$url_base"} --torch-cuda "$cuda" --base-version "$BASE_VERSION" \
     --python "$("$PY" -c 'import platform; print(platform.python_version())' 2>/dev/null)" \
     --sage-key "$(cat "$VENV/.comfy-base-sageattention" 2>/dev/null)"
 }

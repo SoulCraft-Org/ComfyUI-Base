@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.29.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.29.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -154,7 +154,8 @@ run once per machine as **step one**; then each workflow package is **step two**
     packs, which its zip brings) into parts under 2 GiB with `runtime.json`,
     the only place its versions are written; `runtime-apply <manifest>` unpacks it on a buyer's machine, and
     `BASE_RUNTIME=<state/runtime.json>` installs from it with no OS, git, pip or uv step, each skip noted, the driver
-    gate held at the manifest's floor. A package that needs a pack the runtime lacks fails by name ("needs a newer
+    gate held at the manifest's floor (3.29.2: the floor of the runtime's own torch CUDA build, 580 for cu130, never the
+    capture machine's driver). A package that needs a pack the runtime lacks fails by name ("needs a newer
     runtime"). It is the §0.3 exception, and nothing else runs this way.
 13. **The model library may be SHARED by several machines** (2.4.0). `BASE_LIBRARY` names a store that more than
     one machine mounts at once, and with it set `models/` and ComfyUI's `output/` and `input/` live there instead of
@@ -882,6 +883,14 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.29.2: `runtime.json`'s `driver_min` is the floor the runtime's wheels need (2026-10-26, Fixes
+  SoulCraft-Org/ComfyUI-Base#2). Exercised by the suite only (no pod, no live capture). `runtime-capture` wrote the
+  capture machine's own driver major, so a runtime captured on a 615 machine was refused by the driver gate on every
+  580 and 595 image before any download, though its cu130 wheels run on 580. It now reads `torch.version.cuda` from the
+  venv and `py/runtime.py driver_floor` maps the CUDA major to NVIDIA's minor-version-compatibility floor (13 -> 580,
+  12 -> 525, 11 -> 450); `build` takes `--torch-cuda` (required, replacing `--driver-min`) and the manifest records
+  `cuda` beside `driver_min`. A torch build with no CUDA, or a CUDA major outside the table, stops the capture by name
+  instead of writing a floor by accident. No runtime has been published, so no existing manifest carries the old value.
 - 3.29.1: the OS stage installs `libegl1` and `libgles2` (2026-10-26). Exercised by the suite's text checks only (no pod,
   no apt run). MediaPipe 1.1.1's `libmediapipe.so` links `libEGL.so.1` and `libGLESv2.so.2` even on CPU (found by the
   Character Swap package's quality CI: `OSError: libEGL.so.1`), so a pod without them left that package's `head_pose`
