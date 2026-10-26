@@ -22,6 +22,9 @@
 #                    downloads too; hf and curl resume from the staging folder on the next run.
 #   off              BASE_MODELS_FOREGROUND=1 (the 3.10 order), a dry run, a seed build (no models), a buyer's machine
 #                    (BASE_RUNTIME: no uv step may run there, and its venv is not built anyway).
+#   3.28.0, sooner   before the ComfyUI fetch and the pack clones too, when no row of the first set is a custom_nodes/<Pack>
+#                    file and uv's bootstrap need not wait for the OS stage (_base_early_first); the later call then finds
+#                    them started. A package with a pack's file in its first set keeps the order above.
 
 _BASE_EARLY_PID=""; _BASE_EARLY_DIR=""; _BASE_EARLY_DESTS=(); _BASE_EARLY_FAILED=()
 
@@ -99,7 +102,23 @@ _base_models_early(){ # the background half: what goes early, then those downloa
   for spec in "${specs[@]}"; do _base_in_list "${spec##*|}" ${DL_DESTS[@]+"${DL_DESTS[@]}"} || _BASE_EARLY_BAD+=("${spec##*|}"); done
 }
 
+_base_early_first(){ # <OS stage in the background: 1|0> → 0 when the early downloads may start BEFORE the ComfyUI fetch and the
+  # pack clones (3.28.0): no row of the first set lives inside a pack (a custom_nodes/<Pack> dest needs its pack on disk; a
+  # MODELS_LATER row of a staged run is not in the first set), and uv's bootstrap need not wait for the OS stage's apt
+  # (python3-venv): that stage already ran in the foreground, the bootstrap venv is there, or the system python has ensurepip.
+  # Otherwise the downloads start after the clones and the OS join, as before 3.28.0.
+  local rows cat fam purp file url bytes mnote alts
+  rows="$(_base_model_rows 2>/dev/null)" || return 1
+  while IFS='|' read -r cat fam purp file url bytes mnote alts; do
+    [ -n "$cat" ] && [ "$url" != "LOCAL" ] || continue
+    if [ "${BASE_STAGED:-0}" = "1" ] && _base_is_later "$file"; then continue; fi
+    case "$cat" in custom_nodes/*) return 1 ;; esac
+  done <<< "$rows"
+  [ "${1:-0}" != 1 ] || [ "$BASE_NO_NET" = "1" ] || [ -x "$BASE_HOME/tools-bootstrap/bin/python" ] \
+    || "$SYS_PY" -c 'import ensurepip, venv' >/dev/null 2>&1
+}
 _base_models_early_start(){ # → 0 when the downloads now run in the background; 1 when they are off or there is nothing to start
+  if [ -n "${_BASE_EARLY_PID:-}" ]; then return 0; fi   # 3.28.0: started already, before the clones (_base_early_first)
   if [ "${BASE_MODELS_FOREGROUND:-0}" = "1" ] || [ "$BASE_DRY" = "1" ] || [ "${BASE_SEED:-0}" = "1" ] || _base_runtime_on; then return 1; fi
   [ "${#MODELS[@]}" -gt 0 ] || return 1
   # uv is refreshed once per run: here, in the foreground, so the venv step's own call finds it done instead of racing

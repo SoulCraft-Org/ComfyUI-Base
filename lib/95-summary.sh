@@ -21,6 +21,13 @@ _base_validate_tables(){ # every required declaration present and every table ro
     local gp; gp="$("$SYS_PY" "$BASE_DIR/py/gpu_fit.py" --check "$GPU_PREFER" 2>&1)" || { echo "  !! GPU_PREFER: $gp" >&2; bad=1; }
   fi
   _base_launch_env_rows >/dev/null || bad=1   # 3.10.0: LAUNCH_ENV, refused here, before anything downloads
+  local hrow                              # 3.28.0: a --cache-ram row carries one or two numbers of GB, as the flag takes
+  for hrow in ${HYGIENE_ARGS[@]+"${HYGIENE_ARGS[@]}"}; do
+    case "$hrow" in --cache-ram|"--cache-ram "*) ;; *) continue ;; esac
+    if ! _base_cache_ram_ok "$(printf '%s' "${hrow#--cache-ram}" | awk '{$1=$1; print}')"; then
+      echo "  !! HYGIENE_ARGS '$hrow': --cache-ram takes one or two numbers of GB (the active, then the inactive cache's headroom)" >&2; bad=1
+    fi
+  done
   return $bad
 }
 _base_declare_dump(){ # BASE_DECLARE_ONLY=1: the validated tables, one row per line, for list-packs / gen-models / suites
@@ -93,6 +100,9 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
   local nfail="${#BASE_FAILED[@]}"      # the OS stage may have recorded a failure that does not stop the run; tokens are judged alone
   base_tokens || true
   if [ "${#BASE_FAILED[@]}" -gt "$nfail" ]; then err "a token was rejected: stopping before anything downloads"; base_summary; fi
+  # 3.28.0: the model downloads start here, before the ComfyUI fetch and the pack clones, when no file of the first set lives
+  # inside a pack and uv can be had now (lib/52-models-early.sh _base_early_first); else after them, below, as before
+  if ! _base_runtime_on && _base_early_first "$sysbg"; then _base_models_early_start || true; fi
   if _base_runtime_on; then            # 3.1.0: the tree, the packs and the venv are the runtime's, checked, never moved
     if ! _base_runtime_comfy; then base_summary; fi
   else base_update_comfyui || true; fi
@@ -113,7 +123,7 @@ base_install(){ # the install, in the order the spec fixes; hooks run where a pa
     if [ "$src" = 10 ]; then base_summary; fi
     if ! _base_driver_gate; then base_summary; fi
   fi
-  _base_models_early_start || true     # 3.11.0: the model downloads run beside everything from here to the model stage
+  _base_models_early_start || true     # 3.11.0: the model downloads run beside everything from here to the model stage (3.28.0: unless already started above)
   _base_tools_start || true            # 3.11.0: and JupyterLab's tools venv, joined at the BOOT stage
   _base_cuda_toolchain_start || true   # 3.22.0: and the cuBLAS probe with its apt install (lib/40-packs.sh)
   base_venv_snapshot                   # 3.0.0: the venv before this run changed any of it (the core rollback's source)

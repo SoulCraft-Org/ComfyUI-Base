@@ -645,6 +645,68 @@ def test_unit_podctl_lease_release_is_one_round_trip_and_never_drops_another_hol
     assert podctl.lease_release("me") is True and not lease.exists()    # unreadable reads as free, so it goes
 
 
+def test_unit_podctl_install_takes_the_lease_and_writes_host_env_in_one_round_trip(tmp_path, monkeypatch):
+    """3.28.0: an install wrote its lease and then state/host.env, a round trip each. lease_take_with sends both in one
+    command and judges the lease exactly as lease_take does (its own exit status; a PodctlError when it could not be
+    written). The second write runs whatever the lease did, and when it fails the caller writes host.env on its own
+    round trip, where write_host_env says its own error, as before. The lines printed are the same."""
+    import inspect, pytest
+    podctl = _load()
+    root = tmp_path / "pod"; root.mkdir()
+    env, log = _pod_dir_ssh(tmp_path, root)
+    monkeypatch.setenv("PATH", env["PATH"])
+    lease = root / "local-state" / "gpu.lease"
+    monkeypatch.setattr(podctl, "LEASE_PATH", str(lease))
+    monkeypatch.setattr(podctl, "VOLUME_ROOT", "/workspace")
+
+    class Prov:
+        name = "runpod"
+        def host_env(self):
+            return "BASE_HOST=runpod\nBASE_VOLUME_KIND=mount\n"       # no /workspace in it: the stand-in ssh maps that string
+    cmd, line = podctl.host_env_write(Prov())
+    assert line == "host    runpod (state/host.env: BASE_HOST=runpod BASE_VOLUME_KIND=mount)"
+    log.write_text("")
+    got, ok = podctl.lease_take_with("me", "install: My Pkg", 30, cmd)
+    assert ok is True and got["holder"] == "me" and got["purpose"] == "install: My Pkg"
+    assert log.read_text().splitlines() == ["ssh"]                                   # one round trip for both writes
+    assert podctl.lease_parse(lease.read_text())["holder"] == "me"
+    assert (root / "comfy-base" / "state" / "host.env").read_text() == Prov().host_env()
+    got, ok = podctl.lease_take_with("me", "x", 30, "false")
+    assert got["holder"] == "me" and ok is False                                     # the lease stands; host.env is retried alone
+    monkeypatch.setattr(podctl, "LEASE_PATH", "/proc/podctl-no-such/gpu.lease")
+    with pytest.raises(podctl.PodctlError):
+        podctl.lease_take_with("me", "x", 30, cmd)
+    assert podctl.write_host_env(Prov(), env=env) == line                             # the single path still says the same
+    src = inspect.getsource(podctl.cmd_install)
+    assert "lease_take_with(" in src and "host_line if host_ok else write_host_env(prov)" in src and "lease_take(" not in src
+
+
+def test_unit_podctl_install_asks_both_gpu_questions_in_one_round_trip(tmp_path, monkeypatch, capsys):
+    """3.28.0: the GPU gate (is the card ours?) and the GPU_PREFER note (is it what the package is tuned for?) were two
+    nvidia-smi round trips; the note's question now rides in the gate's (gpu_probe(fit=True)) and the note reads that
+    answer. The lines and their order are unchanged, and a package with no GPU_PREFER asks only the gate's question."""
+    podctl = _load()
+    base, pkg = _local_packages(tmp_path)
+    (pkg / "My Pkg-script.sh").write_text('GPU_PREFER="B200 B300"\n' + (pkg / "My Pkg-script.sh").read_text())
+    d = tmp_path / "smi"; d.mkdir()
+    (d / "nvidia-smi").write_text('#!/bin/bash\ncase "$*" in *query-gpu=name,compute_cap,memory.total*) echo "NVIDIA B200, 10.0, 183359";; '
+                                  '*query-gpu=memory*) echo "183359, 600, GPU-a";; *query-compute-apps*) :;; *) exit 1;; esac\n')
+    (d / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", "%s:%s" % (d, os.environ["PATH"]))
+    io = LocalPodIO(tmp_path / "pod")
+    rc = podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-10-26", save_pins=False)
+    out = capsys.readouterr().out
+    asked = [c for c in io.cmds if "nvidia-smi" in c]
+    assert rc == 0 and len(asked) == 1 and "compute_cap" in asked[0] and "query-compute-apps" in asked[0], asked
+    assert "the GPU is ours" in out and "gpu fit NVIDIA B200 is what My Pkg is tuned for" in out, out
+    assert out.index("the GPU is ours") < out.index("gpu fit") < out.index("extracted")
+    (pkg / "My Pkg-script.sh").write_text("PACKS=()\n")
+    io = LocalPodIO(tmp_path / "pod2")
+    assert podctl.install("pod1", [pkg], io, every=1, timeout=60, today="2026-10-26", save_pins=False) == 0
+    asked = [c for c in io.cmds if "nvidia-smi" in c]
+    assert len(asked) == 1 and "compute_cap" not in asked[0], asked
+
+
 def test_unit_podctl_command_sessions_share_one_connection_that_never_forwards(monkeypatch):
     """3.24.0: one ssh connection per machine (ControlMaster), because a handshake to a pod is about 11 round trips: 1.8 s to
     EU-RO-1, about 21 of them per install. The master is whichever command comes first, so it carries the command sessions'
@@ -654,6 +716,9 @@ def test_unit_podctl_command_sessions_share_one_connection_that_never_forwards(m
     opts = podctl.ssh_mux_opts({"PODCTL_SSH_MUX_DIR": "/tmp/pcm"})
     joined = " ".join(opts)
     assert "ControlMaster=auto" in joined and "ControlPath=/tmp/pcm/%C" in joined and "ControlPersist=" in joined
+    # 3.28.0: the master outlives the Mac's own gate (the package's suite from its zip, minutes on a new zip), which sits
+    # between the lease and the upload: at 120 s it lapsed there and the upload paid a fresh handshake
+    assert podctl.SSH_MUX_PERSIST >= 600 and "ControlPersist=%d" % podctl.SSH_MUX_PERSIST in joined
     assert "ServerAliveInterval=" in joined                              # a stopped machine's master does not linger
     assert podctl.ssh_mux_opts({"PODCTL_SSH_MUX": "0"}) == []
     assert podctl.ssh_mux_opts({"PODCTL_SSH_MUX_DIR": "/" + "d" * 70}) == []       # the socket would not fit

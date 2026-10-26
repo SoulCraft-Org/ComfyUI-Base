@@ -257,6 +257,32 @@ def test_unit_gpu_fit_names_b200_and_b300_and_judges_every_other_gpu_below(tmp_p
     assert r.returncode == 1 and "H9000" in r.stdout
 
 
+def test_unit_gpu_fit_knows_the_rtx_pro_6000_server_edition_and_the_gb300(tmp_path):
+    """3.28.0: two more classes, warnings only (GPU_PREFER never stops a run). NVIDIA's CUDA GPU table: the RTX PRO 6000
+    Blackwell Server Edition is 12.0 (96 GB GDDR7; nvidia-smi reads 97887 MiB), the GB300 10.3 (288 GB HBM3e, on a Grace
+    aarch64 host). sm_120 is also an RTX 5090's (32 GB), so an architecture fits only with that class's memory too: a
+    5090 is below "RTX-PRO-6000", as a 34 GB MIG slice of a B300 is below "B300". A GB300's name is never a B300's."""
+    sys.path.insert(0, str(BASE / "py")); import gpu_fit
+    assert gpu_fit.unknown_classes(["B200", "B300", "GB300", "RTX-PRO-6000"]) == []
+    assert gpu_fit.fits(["RTX-PRO-6000"], "12.0", 97887) == "ok"
+    assert gpu_fit.fits(["RTX-PRO-6000"], "12.0", 32607) == "below"              # an RTX 5090: the same sm, a third of it
+    assert gpu_fit.fits(["GB300"], "10.3", 284000) == "ok" and gpu_fit.fits(["B200", "B300"], "10.3", 284000) == "ok"
+    assert gpu_fit.fits(["B200", "B300"], "10.3", 34816) == "below"              # a MIG slice by its numbers, as by its name
+    assert gpu_fit.fits(["B200", "B300"], "12.0", 97887) == "below"              # the RTX PRO 6000 under the video packages
+    assert gpu_fit.class_of_name("NVIDIA GB300") == "GB300" and gpu_fit.class_of_name("NVIDIA B300 SXM6 AC") == "B300"
+    assert gpu_fit.class_of_name("NVIDIA RTX PRO 6000 Blackwell Server Edition") == "RTX-PRO-6000"
+    assert gpu_fit.class_of_name("NVIDIA RTX PRO 6000 Blackwell Workstation Edition") == "RTX-PRO-6000"   # the same chip and memory
+    assert gpu_fit.class_of_name("NVIDIA RTX 6000 Ada Generation") is None       # Ada's card has no "PRO"
+    assert gpu_fit.fits(["RTX-PRO-6000"], None, None, "NVIDIA RTX PRO 6000 Blackwell Server Edition") == "ok"
+    assert gpu_fit.want_text(["GB300", "RTX-PRO-6000"]) == "GB300 (sm_103, 288 GB) or RTX-PRO-6000 (sm_120, 96 GB)"
+    assert gpu_fit.pick_lane(69, 60, "RTX-PRO-6000").gpu == "NVIDIA RTX PRO 6000"   # half a card (ZeroGPU large) is not one
+    r = subprocess.run([sys.executable, str(BASE / "py" / "gpu_fit.py"), "--check", "B200 B300 GB300 RTX-PRO-6000"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
+    # the run's own banner: a warning, never a stop
+    r = _bash('GPU_PREFER="B200 B300"; PKG_NAME=P; BASE_FAKE_GPU="NVIDIA RTX PRO 6000 Blackwell Server Edition|12.0|97887"; _base_gpu_fit; echo "RC=$?"')
+    assert "RC=0" in r.stdout and "is below what P is tuned for" in r.stdout + r.stderr, r.stdout + r.stderr
+
+
 def test_unit_pick_lane_takes_the_cheapest_lane_that_holds_the_peak_and_the_run(tmp_path):
     """3.21.0: pick_lane(peak_gib, minutes, needs) walks LANES cheapest first (Kaggle, ZeroGPU, Modal's credits, then
     paid RunPod) and returns the first whose card holds the measured peak plus 10 % and whose own limit holds the run.
@@ -2143,6 +2169,52 @@ def test_unit_hygiene_remove_entries_never_reappear(tmp_path):
     assert "--evil" not in r.stdout.splitlines()[-1] and "--fast" in r.stdout.splitlines()[-1]
 
 
+def test_unit_a_package_sets_cache_ram_with_both_values_and_it_is_off_unless_asked(tmp_path):
+    """3.28.0: HYGIENE_ARGS+=( "--cache-ram 10 32" ) in a package script puts `--cache-ram 10 32` in the args file (ComfyUI's
+    RAM-pressure cache: the active and the inactive cache's headroom in GB, at most two values, comfy/cli_args.py), where
+    any other row keeps one value and it would land as `--cache-ram 10`. With no such row nothing is written. The flag is
+    set by its values, never left with a stray old value (argparse would refuse the stray word and ComfyUI would not
+    start), never beside --cache-classic, --cache-lru or --cache-none (one argparse group), never for a ComfyUI that has no
+    --cache-ram; HYGIENE_ARGS_REMOVE takes it out with both values; a malformed row is refused at the declaration."""
+    for v, want in (("10 32", "YES"), ("10", "YES"), ("10.5  32", "YES"), ("0 0", "YES"), ("10 32 64", "NO"), ("-1", "NO"),
+                    ("ten", "NO"), ("10,32", "NO"), ("", "NO")):
+        assert _bash('_base_cache_ram_ok "$V" && echo YES || echo NO', env={"V": v}).stdout.strip() == want, v
+    comfy = tmp_path / "ComfyUI"; (comfy / "comfy").mkdir(parents=True)
+    (comfy / "comfy" / "cli_args.py").write_text('cache_group.add_argument("--cache-ram", nargs=\'*\', type=float)\n')
+    args = tmp_path / "comfyui_args.txt"
+    run = ('COMFY="%s"; ARGS_FILE="%s"; HYGIENE_ARGS=(); HYGIENE_ARGS_REMOVE=(); %s _base_args_package; echo "RC=$?"; '
+           '_base_args_extra | tr "\\n" " "') % (comfy, args, "%s")
+    args.write_text("# comfy-base launch args\n--fast\n")
+    r = _bash(run % 'HYGIENE_ARGS=( "--reserve-vram 1" );')                    # no --cache-ram row: off, the flag never written
+    assert "RC=0" in r.stdout and args.read_text() == "# comfy-base launch args\n--fast\n--reserve-vram 1\n", r.stdout + r.stderr
+    args.write_text("# comfy-base launch args\n--fast\n")
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')                  # the 6.0 package's line, as written
+    assert "--cache-ram 10 32\n" in args.read_text() and "--fast --cache-ram 10 32" in r.stdout, r.stdout + r.stderr
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')
+    assert "--cache-ram 10 32 present" in r.stdout and args.read_text().count("--cache-ram") == 1, r.stdout
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram  8  16 " );')                 # a new value replaces the old, both words
+    assert args.read_text() == "# comfy-base launch args\n--fast\n--cache-ram 8 16\n", args.read_text()
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 12" );')
+    assert args.read_text() == "# comfy-base launch args\n--fast\n--cache-ram 12\n", args.read_text()
+    args.write_text("--fast --cache-ram 10 32\n")
+    r = _bash(run % 'HYGIENE_ARGS_REMOVE=( --cache-ram );')                     # out with both values, no stray "32"
+    assert args.read_text() == "--fast\n" and "removed --cache-ram 10 32" in r.stdout, args.read_text() + r.stdout
+    args.write_text("--cache-lru 50\n")
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')
+    assert "--cache-ram" not in args.read_text() and "sets --cache-lru" in r.stdout + r.stderr, r.stdout + r.stderr
+    args.write_text("--fast\n"); (comfy / "comfy" / "cli_args.py").write_text("# an older ComfyUI\n")
+    r = _bash(run % 'HYGIENE_ARGS+=( "--cache-ram 10 32" );')
+    assert "--cache-ram" not in args.read_text() and "has no --cache-ram" in r.stdout + r.stderr, r.stdout + r.stderr
+    decl = 'PKG_ID=p; PKG_NAME=P; PKG_VERSION=1.0.0; BASE_MIN=1.0.0; COMFY_MIN=0.0.0; WF_NAME=""; PACKS=(); MODELS=(); '
+    for row in ("--cache-ram 10 32 64", "--cache-ram", "--cache-ram ten"):
+        r = _bash(decl + 'HYGIENE_ARGS=( "$ROW" ); _base_validate_tables; echo RC=$?', env={"ROW": row})
+        assert "RC=1" in r.stdout and "HYGIENE_ARGS '%s'" % row in r.stderr, (row, r.stdout + r.stderr)
+    r = _bash(decl + 'HYGIENE_ARGS=( "--cache-ram 10 32" "--fast" ); _base_validate_tables; echo RC=$?')
+    assert "RC=0" in r.stdout, r.stdout + r.stderr
+    hy = (BASE / "lib" / "70-hygiene.sh").read_text()
+    assert "_base_args_package" in hy[hy.index("base_hygiene(){"):]          # applied by the install's hygiene
+
+
 def test_unit_launch_line_is_composed_from_the_args_file_only(tmp_path):
     c = _pod(tmp_path)
     b = _base_args(tmp_path); b.parent.mkdir(parents=True)
@@ -2971,8 +3043,9 @@ def test_unit_launch_env_is_a_contract_not_a_free_for_all():
     variable the base owns, no shell expansion. A key set twice, or anything else, refuses the package's declarations."""
     good = ["OMP_NUM_THREADS=16", "MKL_NUM_THREADS=8", "CT2_VERBOSE=1", "CT2_USE_EXPERIMENTAL_PACKED_GEMM=1",
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512", "TOKENIZERS_PARALLELISM=false",
-            "RENDER_SPEED_ATTENTION=cudnn"]                                          # 3.18.0: a pack's attention order, one word
-    bad = ["PATH=/usr/bin", "RENDER_SPEED_ATTENTION=/x", "RENDER_SPEED=cudnn", "LD_PRELOAD=libx.so", "LD_LIBRARY_PATH=/x", "PYTHONPATH=/x", "HF_HOME=/x", "HF_TOKEN=hf_x",
+            "RENDER_SPEED_ATTENTION=cudnn",                                          # 3.18.0: a pack's attention order, one word
+            "RENDER_SPEED_LANCZOS_THREADS=1", "RENDER_SPEED_LANCZOS_THREADS=8"]      # 3.28.0: its lanczos thread count
+    bad = ["PATH=/usr/bin", "RENDER_SPEED_ATTENTION=/x", "RENDER_SPEED_LANCZOS_THREADS=/x", "RENDER_SPEED_LANCZOS=1", "RENDER_SPEED=cudnn", "LD_PRELOAD=libx.so", "LD_LIBRARY_PATH=/x", "PYTHONPATH=/x", "HF_HOME=/x", "HF_TOKEN=hf_x",
            "VHS_FORCE_FFMPEG_PATH=/x", "COMFY_BASE_STATE=/x", "OMP_NUM_THREADS=", "OMP_NUM_THREADS=$(id)", "OMP_NUM_THREADS=1 2",
            "OMP_NUM_THREADS=/tmp", "OMP_NUM_THREADS=`id`", "ct2_verbose=1", "CT2_=1x;", "OMP_NUM_THREADS", "=1"]
     for kv in good + bad:
@@ -2987,6 +3060,8 @@ def test_unit_launch_env_is_a_contract_not_a_free_for_all():
     assert "RC=1" in r.stdout and "PATH=/x" in r.stderr, r.stdout + r.stderr
     r = _bash(decl + 'LAUNCH_ENV=("OMP_NUM_THREADS=8"); _base_validate_tables; echo RC=$?; _base_declare_dump')
     assert "RC=0" in r.stdout and "LAUNCHENV OMP_NUM_THREADS=8" in r.stdout, r.stdout + r.stderr
+    r = _bash(decl + 'LAUNCH_ENV=( "RENDER_SPEED_LANCZOS_THREADS=1" ); _base_validate_tables; echo RC=$?; _base_declare_dump')
+    assert "RC=0" in r.stdout and "LAUNCHENV RENDER_SPEED_LANCZOS_THREADS=1" in r.stdout, r.stdout + r.stderr   # 3.28.0: the 6.0 line
 
 
 _CPUS64 = "_base_cpus_online(){ echo 64; }; "     # 3.20.3: a host whose CPUs never cap the fake quota (the runner has 2)
@@ -3050,6 +3125,53 @@ def test_unit_launch_env_reaches_comfyui_and_only_comfyui(tmp_path, monkeypatch)
               % (state, bin_ / "python", comfy, tmp_path / "nohup.out"), env=env)
     assert "LINE=env CT2_VERBOSE=1 OMP_NUM_THREADS=2 %s main.py" % (bin_ / "python") in r.stdout and "RC=0" in r.stdout, r.stdout + r.stderr
     assert "python env OMP=2 CT2=1" in log.read_text()
+
+
+def test_unit_the_cudnn_kernel_cache_is_off_while_the_venv_carries_cudnn_9_22_0_up_to_9_25_1(tmp_path, monkeypatch):
+    """3.28.0: cuDNN 9.22 added a default per-process cache of runtime-compiled kernels, and NVIDIA's cuDNN 9.25.1 release
+    notes (Fixed Issues) say a data corruption in it could cause a segmentation fault: "For cuDNN 9.22-9.24, a workaround
+    was to set the environment variable CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0". torch 2.14.1 pins 9.24.0. So ComfyUI starts
+    with it while the venv's nvidia-cudnn-cu* wheel is 9.22.0 up to 9.25.1 (9.25.0's notes are silent, so it still has the
+    fault), read from the wheel's dist-info name (no torch import); never for another version, never from a package (the key is not a LAUNCH_ENV key), and the machine's own
+    value still wins. Turning the cache off changes no kernel's result."""
+    _no_launch_env(monkeypatch); monkeypatch.delenv("CUDNN_ENABLE_DEFAULT_KERNEL_CACHE", raising=False)
+    for v, want in (("9.21.0.82", "NO"), ("9.22.0", "YES"), ("9.22.0.30", "YES"), ("9.24.0.37", "YES"), ("9.24.1.3", "YES"),
+                    ("9.25.0.12", "YES"), ("9.25.0", "YES"), ("9.25", "YES"), ("9.25.1.4", "NO"), ("9.25.1", "NO"), ("9.25.2.1", "NO"),
+                    ("9.26.0", "NO"), ("10.0.0", "NO"), ("10.22.0", "NO"), ("8.24.0", "NO"), ("", "NO"), ("9", "NO"), ("x.y", "NO"),
+                    ("9.25.x", "NO")):
+        r = _bash('_base_cudnn_cache_bug "$V" && echo YES || echo NO', env={"V": v})
+        assert r.stdout.strip() == want, (v, r.stdout, r.stderr)
+
+    def venv(name, *wheels):
+        site = tmp_path / name / "lib" / "python3.14" / "site-packages"; site.mkdir(parents=True)
+        for w in wheels:
+            (site / ("%s.dist-info" % w)).mkdir()
+        (site / "torch-2.14.1.dist-info").mkdir()
+        return tmp_path / name
+    pinned = venv("pinned", "nvidia_cudnn_cu13-9.24.0.37")
+    fixed = venv("fixed", "nvidia_cudnn_cu13-9.25.1.4")
+    silent = venv("silent", "nvidia_cudnn_cu13-9.25.0.12")                                  # 9.25.0: no fix in its notes
+    both = venv("both", "nvidia_cudnn_cu12-9.10.2.21", "nvidia_cudnn_cu13-9.24.0.37")      # the newest is what is read
+    none = venv("none")
+    for v_, want in ((pinned, "9.24.0.37"), (fixed, "9.25.1.4"), (both, "9.24.0.37"), (none, "")):
+        assert _bash('VENV="%s"; _base_cudnn_version' % v_).stdout.strip() == want, v_
+    assert _bash('VENV=""; PY="%s/bin/python"; _base_cudnn_version' % pinned).stdout.strip() == "9.24.0.37"   # the boot knows PY
+    state = tmp_path / "state"; (state / "launch.d").mkdir(parents=True)
+    le = 'BASE_STATE="%s"; VENV="%%s"; _base_launch_env' % state
+    env = {"BASE_CGROUP_ROOT": str(tmp_path / "nocgroup")}                    # no quota: the cuDNN line is the only default
+    for v_ in (pinned, silent):
+        r = _bash(le % v_, env=env)
+        assert r.stdout == "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0\n" and r.stderr == "", (v_, r.stdout + r.stderr)
+    for v_ in (fixed, none):
+        assert _bash(le % v_, env=env).stdout == "", v_
+    r = _bash(le % pinned, env=dict(env, CUDNN_ENABLE_DEFAULT_KERNEL_CACHE="1"))
+    assert r.stdout == "" and "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=1 is set in this machine's environment" in r.stderr, r.stdout + r.stderr
+    r = _bash('_base_launch_env_ok "CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0" && echo YES || echo NO')
+    assert r.stdout.strip() == "NO"                                           # the base's to set, never a package's
+    # it reaches ComfyUI's process with the rest of the launch environment, on the hand-off line too
+    bin_ = pinned / "bin"; bin_.mkdir()
+    r = _bash('BASE_STATE="%s"; VENV="%s"; PY="%s/python"; PORT=8188; ARGS_FILE=/nonexistent; _base_start_cmd' % (state, pinned, bin_), env=env)
+    assert "env CUDNN_ENABLE_DEFAULT_KERNEL_CACHE=0 %s/python main.py" % bin_ in r.stdout, r.stdout + r.stderr
 
 
 # ---------------------------------------------------------------- 3.20.0: one ComfyUI per GPU
