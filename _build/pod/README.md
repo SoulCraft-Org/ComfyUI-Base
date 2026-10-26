@@ -58,8 +58,11 @@ The stock check runs first and prints every data centre where the GPU is free no
 REST v1 has no stock call). A `--location` (or the `--volume`'s own data centre) without stock stops there, naming the
 ones that have it, before anything is created. Then a network volume of `--data-gb` in that data centre (or the existing
 `--volume`), then a Secure Cloud pod on it: the image, ports `8188/http 8888/http 22/tcp`, `PUBLIC_KEY` from the Mac key,
-`--os-gb` of container disk (default 100), and `allowedCudaVersions` from `--min-cuda`, else the image tag (`cuda13.0`,
-`cu130` → 13.0 and newer) never below 13.0 (3.8.0: the base installs a cu130 torch whatever the image was built for). A refused pod deletes the volume that same call created; an existing volume is never deleted.
+`--os-gb` of container disk (default 100), and a CUDA floor from `--min-cuda`, else the image tag (`cuda13.0`,
+`cu130` → 13.0) never below 13.0 (3.8.0: the base installs a cu130 torch whatever the image was built for). 3.29.0: the
+floor is never sent as `allowedCudaVersions` (an exact match RunPod's 13.2 hosts never meet); stock is asked of the v2
+catalog with `minCudaVersion`, and the placed pod's `cudaVersion` is checked: below the floor it is stopped (never
+deleted) and create exits 1. A refused pod deletes the volume that same call created; an existing volume is never deleted.
 `--wait` is the default (until sshd answers, then `Host runpod` → the new pod); then `podctl ensure <pod>`. `create` bills:
 a consumer's guard hook prompts for it like `deploy`.
 

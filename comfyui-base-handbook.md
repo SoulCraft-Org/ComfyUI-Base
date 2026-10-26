@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.28.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.29.0.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -309,8 +309,10 @@ create reads it live):
   one datacenter with B300 that also takes a network volume. `NVIDIA B300 SXM6 AC MIG 1g.34gb` is a 34 GB slice, not
   a B300, and `gpu_fit.py` never counts it as one.
 - A network volume pins its datacenter: create it where the GPU is, and a pod on it can only ever be that DC's GPU.
-- The CUDA floor is 13.0 (REST `allowedCudaVersions: ["13.0"]`; GraphQL calls it `minCudaVersion`): the base's cu130
-  torch and the Blackwell kernels need a 580+ driver, and a host on CUDA 12.x answers with an older one.
+- The CUDA floor is 13.0: the base's cu130 torch and the Blackwell kernels need a 580+ driver, and a host on CUDA 12.x
+  answers with an older one. 3.29.0: it is never sent as REST v1 `allowedCudaVersions` (an exact match, and every B200,
+  B300 and RTX PRO 6000 host with stock reported 13.2 on 2026-10-26, which v1's enum cannot name). Stock is read from
+  REST v2's catalog with `minCudaVersion`, and the placed pod's `cudaVersion` is held to the floor (`check_pod_cuda`).
 - No NVENC. NVIDIA's encode/decode matrix gives the HGX B200 and B300 0 NVENC engines (7 NVDEC), like the H100, so an
   `h264_nvenc` save fails there; encode on the CPU (`libx264`). "RTX" features (RTX Video Super Resolution) name an
   RTX GPU, which these are not.
@@ -880,6 +882,20 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.29.0: RunPod create's CUDA filter (2026-10-26), a blocker for the Video Swapper 6.0 B200 run. Exercised against the
+  suite's fake RunPod only (no live create, no pod).
+  - **No `allowedCudaVersions`.** RunPod matches that list exactly, REST v1's enum stops at 13.0, and every B200, B300
+    and RTX PRO 6000 host with stock reported CUDA 13.2, so `["13.0"]` could never place one while GraphQL's stock
+    (no CUDA input) said "free". `create_body` no longer sends it; RunPod's v1 says no list is any CUDA.
+  - **The floor is checked on the placed pod.** `create_floor` (`--min-cuda`, else the image tag's, never below 13.0) is
+    held against REST v2 `GET /pods/{id}` `cudaVersion`, asked again for about 60 s while it is null (`pod_cuda`,
+    `wait_pod_cuda`, `check_pod_cuda`, `cuda_at_least`), with or without `--no-wait`, public and `--private`. Below
+    the floor, or never named: the pod is STOPPED (never deleted), a `STOP:` line says the version and the floor, and
+    `PodctlError` makes podctl exit 1. A network volume the call made stays, with the stopped pod on it.
+  - **Stock at the floor.** `create` passes the image and `--min-cuda` to `availability`, and `stock` then asks REST v2
+    `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE&minCudaVersion=<floor>` (`catalog_stock`): data
+    centres whose availability is not NONE, still only those POST /pods takes and, for a network volume, those
+    GraphQL says take one. `podctl availability` with no image keeps the GraphQL view.
 - 3.28.0: the 6.0 install and GPU items (2026-10-26). Exercised against the suite's stand-ins only (no pod, no GPU).
   - **cuDNN's default kernel cache off while it is broken.** cuDNN 9.22 added a default per-process cache of
     runtime-compiled kernels; NVIDIA's cuDNN 9.25.1 release notes (Fixed Issues) fix "a data corruption issue in this

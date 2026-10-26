@@ -76,7 +76,8 @@ for _n in ("DEFAULT_API_URL", "PLACEHOLDERS", "SECRET_NAMES", "load_api_key", "A
            "link_token", "named_volumes", "DEFAULT_VOLUME_NAME",                                               # 3.14.0
            "balance", "BALANCE_QUERY", "GPU_NOTES", "FRESH_POD_GB",                                            # 3.18.0
            "REF_VARS", "env_ref", "env_refs", "refs_line", "DEFAULT_API_V2_URL",                   # 3.19.0
-           "stock_count", "count_rows", "COUNT_FIELDS", "pod_rate", "pods_spend", "unit_price"):   # 3.20.0
+           "stock_count", "count_rows", "COUNT_FIELDS", "pod_rate", "pods_spend", "unit_price",    # 3.20.0
+           "cuda_key", "cuda_at_least", "catalog_stock", "pod_cuda", "wait_pod_cuda", "check_pod_cuda"):   # 3.29.0
     _GLOBALS[_n] = getattr(_runpod, _n)
 del _n
 
@@ -2411,10 +2412,13 @@ def cmd_create(prov, args):
         raise PodctlError("--gpu is required on host %s (it has no default GPU order)" % getattr(prov, "name", "?"))
     seen = []
     takes_volume = "volume" in inspect.signature(prov.availability).parameters
+    # 3.29.0: a host whose stock check takes the image and --min-cuda asks only hosts at create's CUDA floor (RunPod)
+    floor_kw = ({k: v for k, v in (("image", getattr(args, "image", None)), ("min_cuda", getattr(args, "min_cuda", None))) if v}
+                if "image" in inspect.signature(prov.availability).parameters else {})
     for gpu in gpus:
         # 3.10.1: only data centres the pod can be created in, and with a network volume only those that take one;
         # 3.18.0: a fresh pod makes none (and a reusable volume's data centre takes them), so then every one counts
-        many = {"count": n} if n > 1 else {}
+        many = dict({"count": n} if n > 1 else {}, **floor_kw)
         locs = (prov.availability(gpu, spot=args.spot, volume=not private and not can_fresh, **many) if takes_volume
                 else prov.availability(gpu, spot=args.spot, **many))
         print("stock   %s%s%s free now in: %s" % (("%d x " % n) if n > 1 else "", gpu, spot, ", ".join(locs) if locs else "no location"))

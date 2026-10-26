@@ -54,7 +54,7 @@ RunPod, as read on 2026-10-15/16 (stock moves; the create reads it live):
 | type id | `NVIDIA B200` | `NVIDIA B300 SXM6 AC` (not `… MIG 1g.34gb`, a 34 GB slice) |
 | cloud | Secure | Secure (EUR-IS-1) |
 | datacenters with stock | EU-RO-1, US-CA-2, US-NC-2, US-NE-1, US-TX-6 | EUR-IS-1 (the one that also takes a network volume) |
-| CUDA floor | 13.0 (`allowedCudaVersions: ["13.0"]`) | 13.0 |
+| CUDA floor | 13.0 (3.29.0: checked on the placed pod, never sent as a list) | 13.0 |
 | NVENC | none (NVIDIA's matrix: 0 encoders, 7 decoders) | none |
 
 A network volume pins its datacenter, so create the volume where the GPU is. With no NVENC, video is encoded on the CPU
@@ -181,8 +181,15 @@ one or (3.14.0) a network volume called `--volume-name`, default `comfy-base-dat
 GPU free (`GET /networkvolumes`; such a data centre is chosen first, so models download once); `POST /pods` with `cloudType SECURE`, `dataCenterIds` [that one], the network volume at `/workspace`, ports
 `8188/http 8888/http`, one `/http` port per declared app, `22/tcp` (3.9.0: named through the port-names template above),
 `env.PUBLIC_KEY` (the Mac key), `env.JUPYTER_TOKEN` and (3.14.0) `env.BASE_LINK_TOKEN` (each fresh per pod), `containerDiskInGb` (`--os-gb`, default 100),
-`supportPublicIp`, and `allowedCudaVersions`: REST v1's field (GraphQL's is `minCudaVersion`), every version from
-`--min-cuda`, else from the image tag (`…-cuda13.0`, `…-cu130`) but never below 13.0, upward. Without `--gpu` the stock
+and `supportPublicIp`. 3.29.0: never `allowedCudaVersions`. RunPod matches that list exactly, REST v1's enum stops at
+13.0, and every B200, B300 and RTX PRO 6000 host with stock reported CUDA 13.2 on 2026-10-26, so `["13.0"]` could never
+place one. No list is any CUDA. The floor (`--min-cuda`, else the image tag's, `…-cuda13.0`, `…-cu130`, never below
+13.0) is used twice instead: the stock check asks REST v2 `GET /catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE&minCudaVersion=<floor>`
+(GraphQL's stock view has no CUDA input), and once the pod exists its host's `cudaVersion` is read from REST v2
+`GET /pods/{id}` (asked again for about 60 s while it is null). Below the floor, or never named, the pod is STOPPED
+(never deleted), a `STOP:` line says the version and the floor, and podctl exits 1. The helpers are importable:
+`pod_cuda(api, pod_id)`, `wait_pod_cuda`, `check_pod_cuda(api, pod_id, floor)`, `catalog_stock(api, gpu, floor)`,
+`cuda_at_least(version, floor)`. Without `--gpu` the stock
 check asks for `NVIDIA B200`, then `NVIDIA B300 SXM6 AC`, and the first with stock where the pod must go is created. No templateId but the port-names one.
 3.14.0: the pod is created with its start command already the boot guard plus sshd and NOTHING of its image's own
 (`create_start`: `dockerEntrypoint` = `bash -c "<guard>; <sshd bootstrap>; exec sleep infinity"`). Before, it started on
