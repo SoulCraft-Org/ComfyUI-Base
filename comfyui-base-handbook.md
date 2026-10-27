@@ -708,7 +708,7 @@ not a second install: CONSOLIDATE neither reports nor sizes its tree and venv, a
 `custom_nodes`, where the pack pass fetches it instead of cloning it.
 
 **The runtime's parts and how they land** (3.29.3): `runtime-capture` cuts the runtime into independent parts, each its own
-zstd-compressed tar (`runtime.NNN.tar.zst`, about 512 MB of file content each, `--part-bytes`), carrying the directories above
+zstd-compressed tar (`runtime.NNN.tar.zst`, 256 MiB of file content each by default, `--part-bytes`: 268 MB at most even if nothing compresses, under the 315 MB a single-request upload to Cloudflare's R2 takes; a file larger than that is one part alone and the build names any part over 315 MB packed), carrying the directories above
 its own files so it unpacks alone; compression runs one part per CPU. `runtime.json` lists each part's `name`, `sha256`,
 `bytes` (packed) and `raw` (unpacked), with `format: 2`, `compression: zstd`. `runtime-apply <manifest> [--parts <links.json>]
 [--jobs N]` fetches N parts at once (8; `BASE_RUNTIME_JOBS`), largest first, from the manifest's https URL (parts beside it,
@@ -760,8 +760,9 @@ boot kit as the entrypoint. Read from the code and held by suite tests; not yet 
 - **Its size, estimated** (nothing here was measured on a capture): earlier reads put the torch-and-NVIDIA closure at
   6.7 to 7.2 GB as a venv (3.18.2), a Video Swapper venv with its packs' requirements at 12 GB (3.15.0), and 4.1 GB of wheels
   in 165 packages (3.26.0); the tree without models is a few hundred MB plus the packs' `.git` (about 1 to 2 GB), the uv
-  Pythons about 0.2 GB, the tools venv about 0.4 GB. So about 13 to 16 GB unpacked, in about 26 to 32 parts of 512 MB, and,
-  at zstd level 3 on CUDA libraries (about 0.5 to 0.6), about 7 to 9 GB packed, 250 to 300 MB a part. At the 2 GB/s the
+  Pythons about 0.2 GB, the tools venv about 0.4 GB. So about 13 to 16 GB unpacked, in about 55 to 64 parts of 256 MiB, and,
+  at zstd level 3 on CUDA libraries (about 0.5 to 0.6), about 7 to 9 GB packed, 130 to 160 MB a part (a few parts that hold one
+  large CUDA library each, the biggest over 1 GB unpacked, pass 315 MB packed: the build names them). At the 2 GB/s the
   downloads reach that is about 4 s of line, so the volume's write speed sets the unpack. The first live capture's
   `runtime.json` and RUNTIME row replace this paragraph's numbers.
 
@@ -965,6 +966,8 @@ for any invocation that somehow arrives without the environment. The suite asser
   install's summary. (3) Runtime mode pins `COMFY_DIR` to the manifest's tree. (4) §1.1 states what was checked on the stock
   image: no OS step, no cuBLAS need, `BASE_LOCAL_RUN` off on a local disk, volume paths, the image's tree and start script
   unused, what a capture holds, and an estimate of its size. `runtime.py` gains `apt`, `result-add` and `ledger-line`.
+  (5) The default part is 256 MiB of content (was 512 MB), so a part stays under the 315 MB one request to R2 takes even if
+  nothing compresses; a file larger than that is a part alone and `runtime.py build` names any part over 315 MB packed.
 - 3.30.1: runtime mode starts the staged model downloads at t0 (2026-10-26). Exercised by the suite and by a hand run of
   the stub package's install beside a slowed `runtime-apply` (5 parts at 1.5 s each, one connection) on macOS; not on a
   live machine. Before, a buyer's install fetched models only at the model stage, after the tree, venv and pack checks

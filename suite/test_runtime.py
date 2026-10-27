@@ -587,3 +587,16 @@ def test_unit_runtime_mode_never_reaches_the_cublas_probe_uv_or_a_local_run_copy
     assert "/opt/comfyui-baked" not in "".join((BASE / "lib" / f).read_text() for f in os.listdir(BASE / "lib") if f.endswith(".sh"))
     run_local = (BASE / "py" / "run_local.py").read_text()
     assert "not a network filesystem: it runs in place" in run_local                       # BASE_LOCAL_RUN=auto leaves a local /workspace alone
+
+
+def test_unit_the_default_part_is_256_mib_and_the_build_names_a_part_no_upload_request_takes(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("runtime_mod2", RT); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    assert mod.PART_BYTES == 268435456 and mod.OBJECT_CAP == 315_000_000
+    assert mod.PART_BYTES + 512 * 1024 < mod.OBJECT_CAP                                  # even a part that does not compress stays under the cap
+    assert mod.oversize([{"name": "a", "bytes": 314_999_999}, {"name": "b", "bytes": 315_000_001}]) == ["b"]
+    src = tmp_path / "src"; _green_tree(src)
+    r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o"), "--torch-cuda", "13.0"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert len(json.loads((tmp_path / "o" / "runtime.json").read_text())["parts"]) == 1 and "NOTE" not in r.stdout       # the fake tree is far below one part

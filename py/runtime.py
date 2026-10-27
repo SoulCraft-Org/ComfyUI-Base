@@ -37,7 +37,10 @@ import tarfile
 import time
 
 FORMAT = 2                          # 3.29.3: independent zstd parts. Format 1 (gzip slices of one stream) was never published
-PART_BYTES = 512 * 1024 * 1024      # of file content per part, before compression: about 250 MB of torch's CUDA libraries packed
+PART_BYTES = 256 * 1024 * 1024      # of file content per part, before compression: 268 MB at most (plus tar headers) even if nothing compresses,
+                                    # under the 315 MB a single-request object upload takes (Cloudflare's API); a file larger than this is
+                                    # one part alone, and the build says so when that part passes OBJECT_CAP
+OBJECT_CAP = 315_000_000
 JOBS = 8                            # parts fetched and unpacked at once
 ZSTD_LEVEL = 3
 TAR_HEADER = 512
@@ -187,6 +190,11 @@ def _write_part(out, name, items, level):
     return {"name": name, "bytes": dest.stat().st_size, "sha256": _sha_file(dest), "raw": raw}
 
 
+def oversize(parts, cap=OBJECT_CAP):
+    """The parts whose packed size passes `cap`: a single file larger than --part-bytes cannot be cut, so its part can."""
+    return [p["name"] for p in parts if p["bytes"] > cap]
+
+
 def build(a):
     floor = driver_floor(a.torch_cuda)
     _zstd()
@@ -229,6 +237,10 @@ def build(a):
     (out / "runtime.json").write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
     print("runtime: %d part(s), %d bytes packed (%d unpacked), %d pack(s) -> %s" % (
         len(made), sum(p["bytes"] for p in made), sum(p["raw"] for p in made), len(packs), out / "runtime.json"))
+    big = oversize(made)
+    if big:
+        print("runtime: NOTE %d part(s) pass %d MB packed (one file larger than --part-bytes): %s. A store that takes %d MB per upload "
+              "request needs a multipart upload for these." % (len(big), OBJECT_CAP // 1_000_000, ", ".join(big), OBJECT_CAP // 1_000_000))
     return 0
 
 
