@@ -71,9 +71,21 @@ def test_unit_a_partial_or_a_stand_in_is_left_to_the_model_stage(tmp_path):
 
 def test_unit_the_early_pass_is_off_where_it_must_be(tmp_path):
     _pod(tmp_path)
-    for snippet in ('BASE_MODELS_FOREGROUND=1', 'BASE_DRY=1', 'BASE_SEED=1', '_base_runtime_on(){ return 0; }', 'MODELS=()'):
+    for snippet in ('BASE_MODELS_FOREGROUND=1', 'BASE_DRY=1', 'BASE_SEED=1', 'MODELS=()'):
         r = _bash('%s; base_env_setup; base_discover quiet; %s; _base_models_early_start; echo "STARTED=$?"' % (_models(ROW_A), snippet), env=_fake(tmp_path))
         assert "STARTED=1" in r.stdout, (snippet, r.stdout + r.stderr)
+
+
+def test_unit_a_buyers_machine_starts_the_early_pass_with_no_uv_step(tmp_path):
+    """3.30.1: runtime mode (BASE_RUNTIME) is no longer where the early pass is off: the first set starts at t0, and no uv
+    step runs to start it (the downloader is hf in a pip venv of the system Python, lib/48-runtime.sh)."""
+    _pod(tmp_path)
+    r = _bash('%s; base_env_setup; base_discover quiet; _base_runtime_on(){ return 0; }; _base_ensure_uv(){ echo UV_CALLED; return 1; }; '
+              '_base_models_early_start; echo "STARTED=$?"; _base_models_early_join' % _models(ROW_A), env=_fake(tmp_path))
+    assert "STARTED=0" in r.stdout and "UV_CALLED" not in r.stdout, r.stdout + r.stderr
+    starter = (BASE / "lib" / "52-models-early.sh").read_text()
+    starter = starter[starter.index("_base_models_early_start(){"):starter.index("_base_models_early_join(){")]
+    assert "! _base_runtime_on && [ \"$BASE_NO_NET\" != \"1\" ] && ! _base_ensure_uv" in starter
 
 
 # ---------------------------------------------------------------- the overlap, the join, the count
@@ -191,10 +203,14 @@ def test_unit_the_early_start_follows_the_os_join_and_the_join_precedes_the_mode
     as before, and a no-op when the first already started them."""
     src = (BASE / "lib" / "95-summary.sh").read_text()
     body = src[src.index("base_install(){"):src.index("_base_use_testbed(){")]
-    soon = body.index("_base_models_early_start"); start = body.index("_base_models_early_start", soon + 1)
+    soon = body.index("_base_models_early_start")
+    runtime = body.index("_base_models_early_start", soon + 1)           # 3.30.1: the buyer's machine starts them at t0, in its own branch
+    start = body.index("_base_models_early_start", runtime + 1)
     join = body.index("_base_models_early_join")
-    assert body.index("base_tokens") < soon < body.index("base_update_comfyui") < body.index("base_packs git")
+    assert body.index("base_tokens") < soon < runtime < body.index("base_update_comfyui") < body.index("base_packs git")
     assert '_base_early_first "$sysbg"; then _base_models_early_start' in body               # the sooner start is gated
+    assert "_base_runtime_early_ok && _base_early_first 0; then _base_models_early_start" in body
+    assert body.index("_base_runtime_early_ok") < runtime < body.index("_base_runtime_wait_apply") < body.index("_base_runtime_comfy; then")
     assert body.index("_base_system_join") < start < body.index("base_venv_snapshot")      # uv's bootstrap needs python3-venv from apt
     assert body.index("_base_hook pkg_pre_models") < join < body.index("base_models ||")
     assert start > body.index("base_packs git")                                             # custom_nodes/<Pack> dests are inside the packs
