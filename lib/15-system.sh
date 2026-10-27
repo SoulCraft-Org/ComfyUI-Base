@@ -91,6 +91,30 @@ _base_machine_record(){ # the store's per-machine record: which driver and CUDA 
   { echo "host=$h"; echo "driver=${BASE_DRIVER_AFTER:-$(_base_running_driver)}"; echo "cuda=${cuda:-}"; echo "kernel=$(uname -r 2>/dev/null)"; echo "ts=$(_base_ts)"; } > "$d/$h.env" 2>/dev/null || true
 }
 
+_base_apt_core(){ # the base's own apt packages on every host (3.30.2: one list, read by the OS stage and by runtime-capture, which
+  # writes the ones installed on its machine into runtime.json for a machine that skips the OS stage)
+  echo "python3-venv ffmpeg libegl1 libgles2"
+}
+_base_apt_missing(){ # <pkg>... → the ones dpkg does not report installed, one per line
+  local p; for p in "$@"; do dpkg-query -W -f '${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || echo "$p"; done
+}
+_base_apt_ensure(){ # <pkg>... → installs only the missing ones. 0 none missing or all installed (they are printed as "installed: ..."),
+  # 1 the install failed, 2 this machine cannot install (no apt, no root), 3 a fake run (no BASE_FAKE_APT): nothing is touched.
+  local miss=() p log
+  while IFS= read -r p; do [ -n "$p" ] && miss+=("$p"); done < <(_base_apt_missing "$@")
+  [ "${#miss[@]}" -gt 0 ] || return 0
+  if [ -n "$BASE_FAKE_ROOT" ] && [ -z "${BASE_FAKE_APT:-}" ]; then return 3; fi
+  command -v apt-get >/dev/null 2>&1 && _base_can_root || return 2
+  log="$(mktemp)"
+  # an image keeps no package lists: refresh them first, else try the install and refresh only when it fails
+  if ! ls "$(_base_sysroot)"/var/lib/apt/lists/*Packages* >/dev/null 2>&1; then _base_apt update >>"$log" 2>&1 || true; fi
+  if ! _base_apt install "${miss[@]}" >>"$log" 2>&1; then
+    _base_apt update >>"$log" 2>&1 || true
+    if ! _base_apt install "${miss[@]}" >>"$log" 2>&1; then tail -3 "$log"; rm -f "$log"; return 1; fi
+  fi
+  rm -f "$log"; echo "installed: ${miss[*]}"
+}
+
 base_system(){ # the stage; sets BASE_REBOOT_REQUIRED and returns 10 when a restart must come before anything uses the GPU
   hdr "SYSTEM · the OS and the NVIDIA driver at their newest"
   BASE_SYSTEM_ROWS=()
@@ -153,7 +177,7 @@ base_system(){ # the stage; sets BASE_REBOOT_REQUIRED and returns 10 when a rest
   # the base's own packages: present, and newest (full-upgrade moved what was installed; this adds what was not)
   # 3.29.1: libegl1 + libgles2 (Ubuntu 24.04 main) are libEGL.so.1 and libGLESv2.so.2, which MediaPipe's libmediapipe.so
   # links even on CPU; a pod without them leaves a package's MediaPipe face scores blank (OSError: libEGL.so.1).
-  local want=(python3-venv ffmpeg libegl1 libgles2) p missing=()
+  local want=() p missing=(); read -r -a want <<< "$(_base_apt_core)"
   [ "$host" = verda ] || [ "${BASE_VOLUME_SHARED:-0}" = "1" ] && want+=(nfs-common)
   command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ] || want+=(openssh-server)
   for p in "${want[@]}"; do dpkg-query -W -f '${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || missing+=("$p"); done

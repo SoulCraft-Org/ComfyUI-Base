@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.30.1.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.30.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -708,7 +708,7 @@ not a second install: CONSOLIDATE neither reports nor sizes its tree and venv, a
 `custom_nodes`, where the pack pass fetches it instead of cloning it.
 
 **The runtime's parts and how they land** (3.29.3): `runtime-capture` cuts the runtime into independent parts, each its own
-zstd-compressed tar (`runtime.NNN.tar.zst`, about 512 MB of file content each, `--part-bytes`), carrying the directories above
+zstd-compressed tar (`runtime.NNN.tar.zst`, 256 MiB of file content each by default, `--part-bytes`: 268 MB at most even if nothing compresses, under the 315 MB a single-request upload to Cloudflare's R2 takes; a file larger than that is one part alone and the build names any part over 315 MB packed), carrying the directories above
 its own files so it unpacks alone; compression runs one part per CPU. `runtime.json` lists each part's `name`, `sha256`,
 `bytes` (packed) and `raw` (unpacked), with `format: 2`, `compression: zstd`. `runtime-apply <manifest> [--parts <links.json>]
 [--jobs N]` fetches N parts at once (8; `BASE_RUNTIME_JOBS`), largest first, from the manifest's https URL (parts beside it,
@@ -722,6 +722,49 @@ lands, in parallel with the rest, then deleted. Nothing is stamped until every p
 named, and a re-run fetches again. `zstd` must be on the machine (the apply installs the package where it is root and apt
 exists). The apply's wall seconds, bytes and GB/s are the RUNTIME row of the timing ledger
 (`state/logs/runtime-apply_<ts>.timings.tsv` and `.timeline.tsv`) and `state/runtime-apply.json`.
+
+**RunPod's stock image in runtime mode** (3.30.2): `runpod/comfyui:1.4.7-cuda13.0`, a local volume disk at `/workspace`, the
+boot kit as the entrypoint. Read from the code and held by suite tests; not yet run on a pod.
+
+- **No OS step is needed, and none runs.** Runtime mode skips the OS stage. The image ships `nvcc` and `cudart` only (no
+  cuBLAS, no headers): `base_cuda_toolchain` is called only by a source build (SageAttention, llama-cpp-python), and
+  runtime mode starts none: SageAttention takes the runtime's own build by its cache key or nothing, and the background
+  cuBLAS probe is off. What the OS stage would have installed, the runtime carries as `runtime.json`'s `apt`: `runtime-capture`
+  writes the base's own list (`_base_apt_core`: `python3-venv ffmpeg libegl1 libgles2`, one list the OS stage reads too, plus
+  `openssh-server` and `nfs-common` where the capture machine has them) with `zstd` first, each only if dpkg reports it on
+  the capture machine. `runtime-apply` installs only the ones `dpkg -s` reports missing, in the background beside the unpack:
+  `zstd` and `python3-venv` first (the unpack waits for zstd where the image lacks it, the install's downloader waits for
+  python3-venv), the rest after, the package lists refreshed only when the image keeps none or the install fails. It joins
+  before the stamp is written, so ComfyUI never starts before a library a pack loads at import is there. The seconds and
+  the packages are in the RUNTIME row (`apt Ns: ...`) and `state/runtime-apply.json`; a package that could not be installed
+  (no root, no network) is a warning in the apply and in the next install's summary, not a stop. `runtime-capture` is
+  independent of how the pod was made (a podctl round on the stock image, or the template): it reads only the machine.
+- **`BASE_LOCAL_RUN` stays off.** `auto` is on only where the host is RunPod and the tree's filesystem is a network one
+  (`py/run_local.py --auto` reads the mount type); a local volume disk is "not a network filesystem: it runs in place", so
+  nothing is copied to `/opt/comfy-run`. A network volume still gets the copy.
+- **The tree and the venv are the volume's.** `/workspace/ComfyUI`, its `.venv-cu130`, `/workspace/comfy-base/python` (the uv
+  Pythons), `comfy-base/tools`, `ComfyUI/models`. Runtime mode pins `COMFY_DIR` to the manifest's tree before discovery, so
+  another tree on the volume (RunPod's own `runpod-slim/ComfyUI`, one a recorded `state/boot.env` names) is never the one
+  read or checked.
+- **The image's own ComfyUI and start script are never used.** The image's tree (`/opt/comfyui-baked`) lives on the container
+  disk, which discovery never counts as a tree, and no lib or py file names it; the image's start script is not the
+  entrypoint (the boot kit is, and `podctl ensure` rewrites a pod's start command to it). The one thing of the image's the
+  base can touch is a model-shaped file by name: the model index walks `/` and may move a file the image ships onto the
+  volume instead of downloading it.
+- **What a capture on that image holds.** ComfyUI's tree without `models`, `input`, `output`, `user` and `temp`, with every
+  pack that is a git checkout (`.git` included: the tree must equal the manifest's commits); the uv Pythons
+  (`comfy-base/python`) and uv (`comfy-base/bin`); the venv `ComfyUI/.venv-cu130` (torch cu130 with its `nvidia-*` wheels, the
+  packs' requirements, the SageAttention build); the tools venv (JupyterLab); `comfy-base/state/wheels` (the SageAttention
+  wheel); and `runtime.json` (commits, `cuda`, `driver_min`, `apt`, the parts). Never models, outputs, tokens or a package's
+  vendored packs.
+- **Its size, estimated** (nothing here was measured on a capture): earlier reads put the torch-and-NVIDIA closure at
+  6.7 to 7.2 GB as a venv (3.18.2), a Video Swapper venv with its packs' requirements at 12 GB (3.15.0), and 4.1 GB of wheels
+  in 165 packages (3.26.0); the tree without models is a few hundred MB plus the packs' `.git` (about 1 to 2 GB), the uv
+  Pythons about 0.2 GB, the tools venv about 0.4 GB. So about 13 to 16 GB unpacked, in about 55 to 64 parts of 256 MiB, and,
+  at zstd level 3 on CUDA libraries (about 0.5 to 0.6), about 7 to 9 GB packed, 130 to 160 MB a part (a few parts that hold one
+  large CUDA library each, the biggest over 1 GB unpacked, pass 315 MB packed: the build names them). At the 2 GB/s the
+  downloads reach that is about 4 s of line, so the volume's write speed sets the unpack. The first live capture's
+  `runtime.json` and RUNTIME row replace this paragraph's numbers.
 
 **The models do not wait for the unpack** (3.30.1): `runtime-apply` holds `state/runtime.applying` (`<pid> <manifest sha256>`;
 a dead pid is no lock) while it runs and puts the manifest at `state/runtime.json` as soon as it has it, so a boot kit can
@@ -912,6 +955,19 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.30.2: runtime mode on RunPod's stock image (2026-10-26). Exercised by the suite and by hand runs of capture, apply, the
+  tree pin and the zstd gate against stand-in `apt-get` and `dpkg-query` on macOS; not on a pod. (1) `runtime.json` carries
+  `apt`, written by `runtime-capture` from the base's own list (`_base_apt_core`, now the one list the OS stage reads too)
+  plus `zstd`, each only if dpkg reports it. (2) `runtime-apply` installs only the missing ones with apt, in the background
+  beside the unpack: `zstd` and `python3-venv` first, the rest after; the unpack waits for zstd (`--zstd-wait`, ended at once
+  by a failed install's gate file), the install's downloader waits for python3-venv, the stamp waits for all of it; the
+  seconds are in the RUNTIME row. This is the `zstd` answer for an image without it: (a) apt, since the stock image's Python
+  is 3.12 and only 3.14 has `compression.zstd`. Packages it could not install are a warning, said again in the next
+  install's summary. (3) Runtime mode pins `COMFY_DIR` to the manifest's tree. (4) §1.1 states what was checked on the stock
+  image: no OS step, no cuBLAS need, `BASE_LOCAL_RUN` off on a local disk, volume paths, the image's tree and start script
+  unused, what a capture holds, and an estimate of its size. `runtime.py` gains `apt`, `result-add` and `ledger-line`.
+  (5) The default part is 256 MiB of content (was 512 MB), so a part stays under the 315 MB one request to R2 takes even if
+  nothing compresses; a file larger than that is a part alone and `runtime.py build` names any part over 315 MB packed.
 - 3.30.1: runtime mode starts the staged model downloads at t0 (2026-10-26). Exercised by the suite and by a hand run of
   the stub package's install beside a slowed `runtime-apply` (5 parts at 1.5 s each, one connection) on macOS; not on a
   live machine. Before, a buyer's install fetched models only at the model stage, after the tree, venv and pack checks

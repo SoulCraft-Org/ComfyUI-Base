@@ -51,6 +51,7 @@ _base_hook(){ # run a package hook if the package defines it; a failing hook fai
 base_init(){
   base_env_setup
   _base_logging
+  ! _base_runtime_on || _base_runtime_pin_tree     # 3.30.2: the runtime's tree, never another one on the volume
   local drc=0; base_discover quiet || drc=$?
   if [ "$drc" = 3 ]; then base_discover || true; exit 3; fi             # no network volume: the refusal, printed
   BASE_RUNTIME_PENDING=0

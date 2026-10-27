@@ -63,6 +63,16 @@ _base_runtime_init(){ # base_init, when BASE_RUNTIME is set: the manifest must b
   if [ "$BASE_RUNTIME_PENDING" = 1 ]; then ok "runtime mode: $BASE_RUNTIME_NOTE; driver floor ${DRIVER_MIN:-580}; the runtime is still unpacking (the models start now, the tree is waited for where it is first needed)"
   else ok "runtime mode: $BASE_RUNTIME_NOTE; driver floor ${DRIVER_MIN:-580}"; fi
 }
+_base_runtime_apt_warn(){ # the apply could not install some of the runtime's apt packages: said in this run's summary, never silent
+  local bad; bad="$("$SYS_PY" -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1])).get("apt_failed", [])))' "$BASE_STATE/runtime-apply.json" 2>/dev/null || true)"
+  [ -z "$bad" ] || warn "the runtime-apply could not install: $bad (the OS stage is skipped in runtime mode; install them with apt-get)"
+}
+_base_runtime_pin_tree(){ # COMFY_DIR names the runtime's tree, so no other tree on the volume (RunPod's runpod-slim, a leftover) is the one read
+  [ -n "${COMFY_DIR:-}" ] && return 0
+  local d; d="$(_base_runtime_field comfyui.dir)"
+  [ -n "$d" ] || return 0
+  COMFY_DIR="$(_base_runtime_root)/$d"; export COMFY_DIR
+}
 _base_runtime_pretree(){ # the tree is not there yet: name where it WILL be, so the model downloads have a place to land
   COMFY="$(_base_runtime_root)/$(_base_runtime_field comfyui.dir)"; CN="$COMFY/custom_nodes"; VENV=""; PACK_DIRS=()
   M="$COMFY/models"; M_SRC="default (the runtime's tree, still unpacking)"; M_PRE="$M"
@@ -93,15 +103,12 @@ _base_runtime_wait_apply(){ # → 0 once the stamp names this manifest and the t
   ok "the runtime is unpacked (waited $(( SECONDS - t0 )) s)"
   # the apply ran beside this install: its seconds join this run's ledger as a background stage, as the downloads' do
   if [ -s "$res" ]; then
-    line="$("$SYS_PY" - "$res" <<'PYEOF' 2>/dev/null || true
-import json, sys
-r = json.load(open(sys.argv[1]))
-print("%s\t%s\t%s\t%s" % (r["t0"], r["t1"], round(r["seconds"]), "RUNTIME (in the background, beside the models): %d parts, %.2f GB, %.2f GB/s" % (r["parts"], r["bytes"] / 1e9, r["gbps"])))
-PYEOF
-)"
+    line="$("$SYS_PY" "$BASE_DIR/py/runtime.py" ledger-line "$res" --label "RUNTIME (in the background, beside the models)" 2>/dev/null || true)"
     if [ -n "$line" ]; then local r0 r1 rs rw; IFS=$'\t' read -r r0 r1 rs rw <<< "$line"; BASE_STAGE_TIMES+=("$rs|$rw"); _base_span "$(( r0 - BASE_EPOCH0 ))" "$(( r1 - BASE_EPOCH0 ))" "$rw"; fi
   fi
+  _base_runtime_apt_warn
   # now the tree exists: read it as base_init reads any tree
+  _base_runtime_pin_tree
   local drc=0; base_discover quiet || drc=$?
   if [ "$drc" != 0 ]; then base_discover || true; err "the runtime is unpacked but no ComfyUI tree was found"; BASE_FAILED+=("runtime: no tree after the unpack"); return 1; fi
   BASE_RUNTIME_PENDING=0
@@ -112,7 +119,12 @@ PYEOF
   return 0
 }
 _base_fetch_tool_pip(){ # the downloader of a runtime-mode install, on the system Python: uv and the runtime's own Python may be unpacking right now
-  local v="$BASE_HOME/fetch" out
+  local v="$BASE_HOME/fetch" out w=0
+  # python3-venv is one of the apply's first apt packages: while it runs, wait for it (up to 90 s) instead of giving the Hub rows up
+  while ! "$SYS_PY" -c 'import ensurepip, venv' >/dev/null 2>&1 && _base_runtime_applying "" && [ "$w" -lt 90 ]; do
+    [ "$w" != 0 ] || note "fetch venv: waiting for the runtime-apply to install python3-venv"
+    sleep 1; w=$((w + 1))
+  done
   if ! "$SYS_PY" -c 'import ensurepip, venv' >/dev/null 2>&1; then note "fetch venv: the system Python has no venv/ensurepip"; return 1; fi
   if [ ! -x "$v/bin/python" ]; then
     if ! out="$("$SYS_PY" -m venv "$v" 2>&1)"; then printf '%s\n' "$out" | tail -3; note "fetch venv: python -m venv failed"; rm -rf "$v"; return 1; fi
@@ -155,28 +167,36 @@ _base_runtime_venv(){ # in place of base_venv: the runtime's venv must import to
   return 0
 }
 
-_base_runtime_zstd(){ # the parts are zstd tars: the tool must be here (a stock image has it; else one small apt package)
-  command -v zstd >/dev/null 2>&1 && return 0
-  if [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null 2>&1; then
-    note "zstd is missing: installing the package (the runtime's parts are zstd tars)"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zstd >/dev/null 2>&1 || true
-  fi
-  command -v zstd >/dev/null 2>&1 || { err "zstd is not installed and could not be (apt-get install zstd): the runtime's parts are zstd tars"; return 1; }
+_base_runtime_zstd(){ # the parts are zstd tars: 0 when the tool is here; the apt job below installs it where it is not
+  command -v zstd >/dev/null 2>&1
 }
-_base_runtime_ledger(){ # <result json> → the RUNTIME row of the run's timing ledger: wall seconds, bytes, GB/s (3.29.3)
+_base_runtime_apt_job(){ # <dir> <pkg>... → in the background beside the unpack: zstd and python3-venv first (the unpack and an install's
+  # downloader wait on them), then the rest; only what dpkg reports missing is installed. Writes <dir>/result: "<secs>|<installed>|<failed>"
+  local dir="$1" t0="$SECONDS" first=() rest=() p out rc inst="" bad="" a b; shift
+  for p in zstd "$@"; do
+    case " ${first[*]-} ${rest[*]-} " in *" $p "*) continue ;; esac
+    case "$p" in zstd|python3-venv) first+=("$p") ;; *) rest+=("$p") ;; esac
+  done
+  out="$(_base_apt_ensure "${first[@]}")" && rc=0 || rc=$?
+  [ -z "$out" ] || inst="${out#installed: }"
+  if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then bad="${first[*]}"; fi
+  command -v zstd >/dev/null 2>&1 || touch "$dir/zstd.failed"
+  touch "$dir/first.done"
+  if [ "${#rest[@]}" -gt 0 ]; then
+    out="$(_base_apt_ensure "${rest[@]}")" && rc=0 || rc=$?
+    [ -z "$out" ] || inst="${inst:+$inst }${out#installed: }"
+    if [ "$rc" != 0 ] && [ "$rc" != 3 ]; then bad="${bad:+$bad }${rest[*]}"; fi
+  fi
+  printf '%s|%s|%s\n' "$(( SECONDS - t0 ))" "$inst" "$bad" > "$dir/result"
+}
+_base_runtime_ledger(){ # <result json> → the RUNTIME row of the run's timing ledger: wall seconds, bytes, GB/s, apt seconds (3.29.3)
   local res="$1" t0 t1 secs line
   [ -s "$res" ] || return 0
-  line="$("$SYS_PY" - "$res" <<'PYEOF' 2>/dev/null || true
-import json, sys
-r = json.load(open(sys.argv[1]))
-print("%s\t%s\t%s\tRUNTIME fetch and unpack: %d parts, %.2f GB packed (%.2f GB unpacked), %.2f GB/s, %d at once (busy: fetch %ss, verify %ss, unpack %ss)" % (
-    r["t0"], r["t1"], r["seconds"], r["parts"], r["bytes"] / 1e9, r["raw"] / 1e9, r["gbps"], r["jobs"], r["fetch_seconds"], r["verify_seconds"], r["unpack_seconds"]))
-PYEOF
-)"
+  line="$("$SYS_PY" "$BASE_DIR/py/runtime.py" ledger-line "$res" 2>/dev/null || true)"
   [ -n "$line" ] || return 0
   IFS=$'\t' read -r t0 t1 secs line <<< "$line"
   BASE_STAGE_NAME=""                                 # the header's open stage is replaced by the measured one
-  BASE_STAGE_TIMES+=("$(printf '%.0f' "$secs")|$line"); _base_span "$(( t0 - BASE_EPOCH0 ))" "$(( t1 - BASE_EPOCH0 ))" "$line"
+  BASE_STAGE_TIMES+=("$secs|$line"); _base_span "$(( t0 - BASE_EPOCH0 ))" "$(( t1 - BASE_EPOCH0 ))" "$line"
   PKG_ID="runtime-apply" _base_timings_write
 }
 
@@ -214,7 +234,6 @@ _base_runtime_apply_run(){ # <manifest path or https URL> [--parts <links.json>]
     cp "$man" "$BASE_STATE/runtime.json"; rm -rf "$work"
     ok "this runtime is already applied: install with BASE_RUNTIME=$BASE_STATE/runtime.json"; return 0
   fi
-  _base_runtime_zstd || return 1
   echo "$$ $sum" > "$BASE_STATE/runtime.applying"
   cp "$man" "$BASE_STATE/runtime.json.new" && mv -f "$BASE_STATE/runtime.json.new" "$BASE_STATE/runtime.json"     # the manifest an install names; its stamp follows the unpack
   # an Update replaces the code wholesale: the old venv and packs go aside first, and come back if the unpack fails
@@ -225,9 +244,31 @@ _base_runtime_apply_run(){ # <manifest path or https URL> [--parts <links.json>]
   fi
   # 3.29.3: every part fetched, verified and unpacked on its own, $jobs at a time (py/runtime.py apply); the result file
   # carries the seconds, bytes and GB/s for the ledger
-  local res="$work/apply-result.json"
+  # 3.30.2: and the apt packages the runtime needs (runtime mode skips the OS stage), beside it: zstd and python3-venv first, the rest
+  # after, only what dpkg reports missing. The unpack waits for zstd where it is not installed yet; the stamp waits for all of it.
+  local res="$work/apply-result.json" aptdir="$work/apt" apt_pid="" zwait=0 pkgs=()
+  mkdir -p "$aptdir"; rm -f "$aptdir"/*
+  while IFS= read -r name; do [ -n "$name" ] && pkgs+=("$name"); done < <("$SYS_PY" "$BASE_DIR/py/runtime.py" apt "$man")
+  if [ "${#pkgs[@]}" -gt 0 ] || ! _base_runtime_zstd; then
+    ( trap - ERR EXIT; set +e; _base_runtime_apt_job "$aptdir" ${pkgs[@]+"${pkgs[@]}"} ) > "$aptdir/out" 2>&1 &
+    apt_pid=$!
+    _base_runtime_zstd || zwait=180
+  fi
   "$SYS_PY" "$BASE_DIR/py/runtime.py" apply "$man" "$src" --root "$root" --work "$work/parts" --jobs "$jobs" --result "$res" \
-    ${parts_file:+--parts "$parts_file"} || rc=$?
+    --zstd-wait "$zwait" --zstd-gate "$aptdir/zstd.failed" ${parts_file:+--parts "$parts_file"} || rc=$?
+  if [ -n "$apt_pid" ]; then
+    wait "$apt_pid" 2>/dev/null || true
+    local asecs ainst abad
+    IFS='|' read -r asecs ainst abad < "$aptdir/result" 2>/dev/null || true
+    if [ -s "$aptdir/out" ]; then sed 's/^/  /' "$aptdir/out"; fi
+    if [ -n "${asecs:-}" ] && [ -s "$res" ]; then
+      "$SYS_PY" "$BASE_DIR/py/runtime.py" result-add "$res" apt_seconds "$asecs"
+      "$SYS_PY" "$BASE_DIR/py/runtime.py" result-add "$res" apt_installed "$("$SYS_PY" -c 'import json,sys; print(json.dumps(sys.argv[1].split()))' "$ainst")"
+      "$SYS_PY" "$BASE_DIR/py/runtime.py" result-add "$res" apt_failed "$("$SYS_PY" -c 'import json,sys; print(json.dumps(sys.argv[1].split()))' "$abad")"
+      if [ -n "$ainst" ]; then ok "apt: installed $ainst (${asecs} s, beside the unpack)"; else note "apt: nothing missing (${asecs} s)"; fi
+      if [ -n "$abad" ]; then warn "apt: could not install $abad: the OS stage is skipped in runtime mode, install them with apt-get"; fi
+    fi
+  fi
   if [ "$rc" != 0 ]; then
     err "the runtime did not unpack (rc $rc): nothing is stamped, so no install will run from it; re-run runtime-apply (a verified part is simply fetched again)"
     if [ -n "$old" ]; then local d; for d in "$old"/.venv* "$old/custom_nodes"; do [ -e "$d" ] && { rm -rf "$cdir/$(basename "$d")"; mv "$d" "$cdir/"; } || true; done; note "the previous runtime's venv and packs are back"; fi
@@ -254,7 +295,6 @@ base_runtime_capture(){ # <outdir> [--url-base <prefix>] [--part-bytes <n>] → 
   if [ -z "$out" ]; then err "runtime-capture needs an output directory"; return 2; fi
   base_env_setup
   if ! base_discover quiet; then err "runtime-capture: no ComfyUI tree to capture"; return 3; fi
-  _base_runtime_zstd || return 1
   hdr "RUNTIME CAPTURE · $COMFY"
   # only a machine whose every package's last run was green is a proven runtime
   if ! ls "$BASE_STATE"/last-run/* >/dev/null 2>&1; then err "no install has run here: nothing is proven yet"; return 1; fi
@@ -263,7 +303,12 @@ base_runtime_capture(){ # <outdir> [--url-base <prefix>] [--part-bytes <n>] → 
   # 3.29.2: the driver floor is what the runtime's torch build needs (py/runtime.py driver_floor), never this machine's driver
   cuda="$("$PY" -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || true)"
   if [ -z "$cuda" ]; then err "runtime-capture: $PY has no CUDA torch: the driver floor cannot be derived"; return 1; fi
-  "$SYS_PY" "$BASE_DIR/py/runtime.py" build --root "$(_base_runtime_root)" --comfy "$COMFY" --out "$out" \
+  # the apt packages this green machine runs on, from the base's own list: a machine that skips the OS stage installs the missing ones
+  local c apt=""
+  for c in zstd $(_base_apt_core) openssh-server nfs-common; do
+    dpkg-query -W -f '${db:Status-Abbrev}' "$c" 2>/dev/null | grep -q '^ii' && apt="${apt:+$apt,}$c" || true
+  done
+  "$SYS_PY" "$BASE_DIR/py/runtime.py" build --apt "$apt" --root "$(_base_runtime_root)" --comfy "$COMFY" --out "$out" \
     ${part:+--part-bytes "$part"} ${url_base:+--url-base "$url_base"} --torch-cuda "$cuda" --base-version "$BASE_VERSION" \
     --python "$("$PY" -c 'import platform; print(platform.python_version())' 2>/dev/null)" \
     --sage-key "$(cat "$VENV/.comfy-base-sageattention" 2>/dev/null)"
