@@ -169,6 +169,7 @@ def _write_part(out, name, items, level):
         proc.stdin.close()
     except BaseException:
         proc.kill()
+        proc.wait()
         raise
     if proc.wait() != 0:
         raise SystemExit("runtime: zstd failed on %s" % name)
@@ -330,9 +331,11 @@ def _fetch(where, dest):
 def _unpack(part, root):
     """zstd -dc part | tar -x -C root, both exit codes judged."""
     z = subprocess.Popen([_zstd(), "-dc", "-q", str(part)], stdout=subprocess.PIPE)
-    t = subprocess.run(["tar", "-xf", "-", "-C", str(root)], stdin=z.stdout, capture_output=True, text=True)
-    z.stdout.close()
-    zrc = z.wait()
+    try:
+        t = subprocess.run(["tar", "-xf", "-", "-C", str(root)], stdin=z.stdout, capture_output=True, text=True)
+    finally:
+        z.stdout.close()
+        zrc = z.wait()
     if zrc != 0 or t.returncode != 0:
         raise RuntimeError("unpack failed (zstd %d, tar %d) %s" % (zrc, t.returncode, (t.stderr or "").strip()[-300:]))
 
