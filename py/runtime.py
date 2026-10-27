@@ -9,8 +9,14 @@ INDEPENDENT parts: each one its own zstd-compressed tar of a share of the files 
 the parts fetch in any order, unpack in any order and unpack at once. runtime.json is the ONLY place the runtime's
 versions are written (the base's lib/ and py/ carry none) and lists every part's name, sha256 and bytes.
 
+3.30.3 (format 3): a file larger than --part-bytes is cut into chunks of that size, each chunk its own tar member in a
+"chunks" part of its own, so no part is larger than --part-bytes plus headers and one big library is fetched as several
+parts at once. runtime.json's `files` lists each split file (path, mode, mtime, bytes, sha256) with its chunks
+[{part, member, offset, bytes}]. `apply` creates the file at its full size, every chunk's part writes its bytes at its offset
+(pwrite) as it lands, in any order, and the whole file's sha256 is checked against the manifest when its last chunk is in.
+
     runtime.py build --root /workspace --comfy /workspace/ComfyUI --out DIR --torch-cuda 13.0 [--part-bytes N]
-                     [--url-base PREFIX] [--jobs N] [--level N] [--base-version V] [--python V] [--sage-key K] [--apt a,b,c]
+                     [--url-base PREFIX] [--jobs N] [--level N] [--max-packed N] [--base-version V] [--python V] [--sage-key K] [--apt a,b,c]
     runtime.py apply MANIFEST LOCATION --root DIR --work DIR [--parts FILE] [--jobs 8] [--result FILE]
                      [--zstd-wait S --zstd-gate FILE]   fetch parts --jobs at a time, verify each sha256, unpack each as it lands
     runtime.py apt MANIFEST                        the apt packages the runtime needs, one per line (zstd first)
@@ -36,10 +42,13 @@ import sys
 import tarfile
 import time
 
-FORMAT = 2                          # 3.29.3: independent zstd parts. Format 1 (gzip slices of one stream) was never published
+FORMAT = 3                          # 3.30.3: split files. Format 2 (3.29.3: independent zstd parts, no split file) is still read; format 1 never was published
+ACCEPTED = (2, 3)
+CHUNKS = "chunks"                   # a part's `kind` when it holds only chunks of split files
+BLOCK = 8 << 20
 PART_BYTES = 256 * 1024 * 1024      # of file content per part, before compression: 268 MB at most (plus tar headers) even if nothing compresses,
                                     # under the 315 MB a single-request object upload takes (Cloudflare's API); a file larger than this is
-                                    # one part alone, and the build says so when that part passes OBJECT_CAP
+                                    # cut into chunks of this size (format 3), and the build fails when a part passes --max-packed (OBJECT_CAP)
 OBJECT_CAP = 315_000_000
 JOBS = 8                            # parts fetched and unpacked at once
 ZSTD_LEVEL = 3
@@ -133,9 +142,28 @@ def _zstd(wait=0, gate=None):
 def _sha_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
+        for chunk in iter(lambda: fh.read(BLOCK), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+class _Range:
+    """A read-only file object over bytes [offset, offset + length) of a file: one chunk, for tarfile.addfile."""
+
+    def __init__(self, path, offset, length):
+        self.f = open(path, "rb")
+        self.f.seek(offset)
+        self.left = length
+
+    def read(self, n=-1):
+        if n is None or n < 0 or n > self.left:
+            n = self.left
+        b = self.f.read(n)
+        self.left -= len(b)
+        return b
+
+    def close(self):
+        self.f.close()
 
 
 def _ancestors(name):
@@ -143,31 +171,48 @@ def _ancestors(name):
     return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
-def _partition(members, limit):
-    """members -> a list of parts, each a list of (path, archive name). Files and symlinks are cut in walk order at about
-    `limit` bytes of content; every part also carries the directory entries above its own members, so it unpacks alone."""
-    dirs, files = {}, []
-    for path, name in members:
-        if path.is_dir() and not path.is_symlink():
-            dirs[name] = path
-        else:
-            size = path.lstat().st_size if path.is_file() and not path.is_symlink() else 0
-            files.append((path, name, size + TAR_HEADER))
+def _greedy(items, limit):
+    """Consecutive items cut into groups of about `limit` bytes (cost = content + one tar header); an item over it is a group alone."""
     cut, cur = [[]], 0
-    for path, name, cost in files:
+    for item, cost in items:
         if cut[-1] and cur + cost > limit:
             cut.append([])
             cur = 0
-        cut[-1].append((path, name))
+        cut[-1].append(item)
         cur += cost
+    return cut
+
+
+def _partition(members, limit):
+    """members -> (parts, chunk parts, split files). Files and symlinks are cut in walk order at about `limit` bytes of content,
+    and every part carries the directory entries above its own members, so it unpacks alone. A regular file larger than
+    `limit` is not in them: it is cut into chunks of `limit`, and the chunks are grouped into parts of their own (item
+    ("chunk", path, member, offset, bytes)). The split files come back as dicts without their chunks' part names."""
+    dirs, small, big = {}, [], []
+    for path, name in members:
+        if path.is_dir() and not path.is_symlink():
+            dirs[name] = path
+        elif path.is_file() and not path.is_symlink() and path.lstat().st_size > limit:
+            big.append((path, name))
+        else:
+            size = path.lstat().st_size if path.is_file() and not path.is_symlink() else 0
+            small.append(((path, name), size + TAR_HEADER))
+    cut = _greedy(small, limit)
     parts, covered = [], []
     for items in cut:
         need = {d for _, n in items for d in _ancestors(n) if d in dirs} | {n for _, n in items if n in dirs}
         covered.extend(need)
         parts.append([(dirs[d], d) for d in sorted(need)] + items)
-    rest = [(dirs[d], d) for d in sorted(dirs) if d not in covered]      # empty subtrees go with the first part
+    rest = [(dirs[d], d) for d in sorted(dirs) if d not in covered]      # empty subtrees, and the directories above split files, go with the first part
     parts[0] = rest + parts[0]
-    return parts
+    files, chunks = [], []
+    for i, (path, name) in enumerate(big):
+        st = path.lstat()
+        files.append({"path": name, "mode": st.st_mode & 0o7777, "mtime": int(st.st_mtime), "bytes": st.st_size, "src": path})
+        for k, off in enumerate(range(0, st.st_size, limit)):
+            n = min(limit, st.st_size - off)
+            chunks.append((("chunk", path, "f%04d.c%03d" % (i, k), off, n, i), n + TAR_HEADER))
+    return parts, _greedy(chunks, limit) if chunks else [], files
 
 
 def _write_part(out, name, items, level):
@@ -177,7 +222,19 @@ def _write_part(out, name, items, level):
     raw = 0
     try:
         with tarfile.open(fileobj=proc.stdin, mode="w|", format=tarfile.PAX_FORMAT) as tar:
-            for path, arc in items:
+            for item in items:
+                if item[0] == "chunk":
+                    _, path, member, off, n, _fi = item
+                    ti = tarfile.TarInfo(member)
+                    ti.size, ti.mode = n, 0o600
+                    src = _Range(path, off, n)
+                    try:
+                        tar.addfile(ti, src)
+                    finally:
+                        src.close()
+                    raw += n
+                    continue
+                path, arc = item
                 tar.add(str(path), arcname=arc, recursive=False)
                 if path.is_file() and not path.is_symlink():
                     raw += path.stat().st_size
@@ -191,8 +248,8 @@ def _write_part(out, name, items, level):
 
 
 def oversize(parts, cap=OBJECT_CAP):
-    """The parts whose packed size passes `cap`: a single file larger than --part-bytes cannot be cut, so its part can."""
-    return [p["name"] for p in parts if p["bytes"] > cap]
+    """The parts whose packed size passes `cap` (0: no cap). With split files only a --part-bytes above the cap can make one."""
+    return [p["name"] for p in parts if cap and p["bytes"] > cap]
 
 
 def build(a):
@@ -205,10 +262,20 @@ def build(a):
         PATHS[0] = comfy_rel
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    cut = _partition(list(_members(root, comfy_rel)), a.part_bytes)
-    names = ["runtime.%03d.tar.zst" % i for i in range(len(cut))]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(a.jobs, len(cut)))) as ex:
-        made = list(ex.map(lambda t: _write_part(out, t[0], t[1], a.level), zip(names, cut)))
+    cut, chunk_cut, files = _partition(list(_members(root, comfy_rel)), a.part_bytes)
+    allcut = cut + chunk_cut
+    names = ["runtime.%03d.tar.zst" % i for i in range(len(allcut))]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(a.jobs, len(allcut)))) as ex:
+        hashes = list(ex.map(lambda f: _sha_file(f["src"]), files))                  # the whole split file's sha256: apply's judge
+        made = list(ex.map(lambda t: _write_part(out, t[0], t[1], a.level), zip(names, allcut)))
+    for p in made[len(cut):]:
+        p["kind"] = CHUNKS
+    for f, h in zip(files, hashes):
+        f["sha256"], f["chunks"] = h, []
+        del f["src"]
+    for name, items in zip(names[len(cut):], chunk_cut):
+        for _, _path, member, off, n, fi in items:
+            files[fi]["chunks"].append({"part": name, "member": member, "offset": off, "bytes": n})
     cn = root / comfy_rel / "custom_nodes"
     packs = []
     if cn.is_dir():
@@ -232,15 +299,14 @@ def build(a):
         "python": a.python or "", "venv": "%s/.venv-cu130" % comfy_rel if (root / comfy_rel / ".venv-cu130").exists() else "",
         "packs": packs, "sageattention": {"key": a.sage_key or ""},
         "paths": _paths(root), "exclude": ["%s/%s" % (comfy_rel, x) for x in sorted(EXCLUDE_TOP)],
-        "parts": made,
+        "parts": made, "files": files,
     }
     (out / "runtime.json").write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
-    print("runtime: %d part(s), %d bytes packed (%d unpacked), %d pack(s) -> %s" % (
-        len(made), sum(p["bytes"] for p in made), sum(p["raw"] for p in made), len(packs), out / "runtime.json"))
-    big = oversize(made)
+    print("runtime: %d part(s) (%d of chunks, %d split file(s)), %d bytes packed (%d unpacked), %d pack(s) -> %s" % (
+        len(made), len(chunk_cut), len(files), sum(p["bytes"] for p in made), sum(p["raw"] for p in made), len(packs), out / "runtime.json"))
+    big = oversize(made, a.max_packed)
     if big:
-        print("runtime: NOTE %d part(s) pass %d MB packed (one file larger than --part-bytes): %s. A store that takes %d MB per upload "
-              "request needs a multipart upload for these." % (len(big), OBJECT_CAP // 1_000_000, ", ".join(big), OBJECT_CAP // 1_000_000))
+        raise SystemExit("runtime: %d part(s) pass %d bytes packed (--max-packed): %s. Lower --part-bytes (now %d)." % (len(big), a.max_packed, ", ".join(big), a.part_bytes))
     return 0
 
 
@@ -365,7 +431,96 @@ def _unpack(part, root):
         raise RuntimeError("unpack failed (zstd %d, tar %d) %s" % (zrc, t.returncode, (t.stderr or "").strip()[-300:]))
 
 
-def _one(part, root, work):
+def _plan(m, names):
+    """The manifest's split files, checked: -> (files, chunk map {(part, member): (file index, offset, bytes)}, chunks per file)."""
+    files = m.get("files", []) if m.get("format") == 3 else []
+    cmap, count = {}, []
+    for i, f in enumerate(files):
+        path = f.get("path", "")
+        if not path or os.path.isabs(path) or ".." in pathlib.PurePosixPath(path).parts:
+            raise SystemExit("runtime: a split file has the path %r, which is not inside the machine's root" % path)
+        total = 0
+        for c in sorted(f.get("chunks", []), key=lambda c: c["offset"]):
+            if c["part"] not in names:
+                raise SystemExit("runtime: file %s has a chunk in part %s, which the manifest does not list" % (path, c["part"]))
+            if c["offset"] != total:
+                raise SystemExit("runtime: file %s: its chunks leave a gap or overlap at byte %d" % (path, total))
+            total += c["bytes"]
+            cmap[(c["part"], c["member"])] = (i, c["offset"], c["bytes"])
+        if total != f.get("bytes") or not f.get("chunks"):
+            raise SystemExit("runtime: file %s: its chunks add up to %d bytes, the manifest says %s" % (path, total, f.get("bytes")))
+        count.append(len(f["chunks"]))
+    return files, cmap, count
+
+
+def _prepare_files(files, root):
+    """Every split file created at its full size, empty, before any chunk lands (each chunk part writes its own range)."""
+    for f in files:
+        target = pathlib.Path(root) / f["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        with open(target, "wb") as fh:
+            fh.truncate(f["bytes"])
+
+
+def _unpack_chunks(local, part_name, cmap, files, root):
+    """A chunks part: every member written into its split file at its offset (pwrite), no copy to join them. -> the file index of each chunk."""
+    try:
+        zbin = _zstd(*ZSTD_WAIT)
+    except SystemExit as e:
+        raise RuntimeError(str(e))
+    z = subprocess.Popen([zbin, "-dc", "-q", str(local)], stdout=subprocess.PIPE)
+    seen, unknown = [], []
+    try:
+        with tarfile.open(fileobj=z.stdout, mode="r|") as tar:
+            for member in tar:
+                key = (part_name, member.name)
+                if key not in cmap:
+                    unknown.append(member.name)      # reported after the missing chunk it usually means, which names the file
+                    continue
+                i, off, n = cmap[key]
+                path = files[i]["path"]
+                if member.size != n:
+                    raise RuntimeError("file %s: chunk %s is %d bytes, the manifest says %d" % (path, member.name, member.size, n))
+                src = tar.extractfile(member)
+                fd = os.open(str(pathlib.Path(root) / path), os.O_WRONLY)
+                try:
+                    pos = 0
+                    while pos < n:
+                        b = src.read(min(BLOCK, n - pos))
+                        if not b:
+                            raise RuntimeError("file %s: chunk %s ends after %d of %d bytes" % (path, member.name, pos, n))
+                        os.pwrite(fd, b, off + pos)
+                        pos += len(b)
+                finally:
+                    os.close(fd)
+                seen.append(key)
+    finally:
+        z.stdout.close()
+        zrc = z.wait()
+    if zrc != 0:
+        raise RuntimeError("unpack failed (zstd %d)" % zrc)
+    missing = [k for k in cmap if k[0] == part_name and k not in seen]
+    if missing:
+        raise RuntimeError("file %s: chunk %s is not in this part" % (files[cmap[missing[0]][0]]["path"], missing[0][1]))
+    if unknown:
+        raise RuntimeError("holds a member %r that no file's chunk list names" % unknown[0])
+    return [cmap[k][0] for k in seen]
+
+
+def _finish_file(f, root):
+    """A split file whose chunks are all in: its sha256 against the manifest's, then its mode and mtime. -> seconds."""
+    t0 = time.time()
+    target = pathlib.Path(root) / f["path"]
+    if _sha_file(target) != f["sha256"]:
+        raise RuntimeError("does not match its sha256 once its %d chunk(s) are written" % len(f["chunks"]))
+    os.chmod(target, f["mode"])
+    os.utime(target, (f["mtime"], f["mtime"]))
+    return time.time() - t0
+
+
+def _one(part, root, work, files, cmap):
     """Fetch one part (skipped when a verified copy is already in `work`), check size and sha256, unpack it, drop the copy."""
     name, t0 = part["name"], time.time()
     local = pathlib.Path(part["where"]) if "://" not in part["where"] else pathlib.Path(work) / name
@@ -379,22 +534,28 @@ def _one(part, root, work):
             local.unlink()                       # a bad copy is never resumed from
         raise RuntimeError("%s does not match its sha256" % name)
     t2 = time.time()
-    _unpack(local, root)
+    done = []
+    if part.get("kind") == CHUNKS:
+        done = _unpack_chunks(local, name, cmap, files, root)
+    else:
+        _unpack(local, root)
     t3 = time.time()
     if "://" in part["where"]:
         local.unlink()
-    return {"name": name, "fetch": t1 - t0, "verify": t2 - t1, "unpack": t3 - t2}
+    return {"name": name, "fetch": t1 - t0, "verify": t2 - t1, "unpack": t3 - t2, "chunks": done}
 
 
 def apply(a):
-    """Every part, `jobs` at a time: fetched, verified and unpacked as it lands, the largest first. Nothing is stamped
-    here: the caller does that on a zero exit. A failed part stops the rest and is named (never its link)."""
+    """Every part, `jobs` at a time: fetched, verified and unpacked as it lands, the largest first. A split file's chunks are
+    written into it by whichever parts hold them, and the file is checked whole once its last chunk is in. Nothing is stamped
+    here: the caller does that on a zero exit. A failed part or file stops the rest and is named (never its link)."""
     m = _load(a.manifest)
     if a.parts:
         _check_links_manifest(a.manifest, a.parts)
-    if m.get("format") != FORMAT or m.get("compression") != "zstd":
-        raise SystemExit("runtime: %s is runtime format %s, this base reads format %d (zstd parts): capture it again" % (a.manifest, m.get("format"), FORMAT))
+    if m.get("format") not in ACCEPTED or m.get("compression") != "zstd":
+        raise SystemExit("runtime: %s is runtime format %s, this base reads formats 2 and 3 (zstd parts): capture it again" % (a.manifest, m.get("format")))
     rows = sorted(_resolve(m, a.location, a.parts), key=lambda r: -r.get("bytes", 0))
+    files, cmap, remaining = _plan(m, {r["name"] for r in rows})
     root, work = pathlib.Path(a.root), pathlib.Path(a.work)
     work.mkdir(parents=True, exist_ok=True)
     global ZSTD_WAIT
@@ -402,31 +563,46 @@ def apply(a):
     if not a.zstd_wait:
         _zstd()
     t0 = time.time()
-    done, failed = [], None
+    root.mkdir(parents=True, exist_ok=True)
+    _prepare_files(files, root)
+    done, failed, file_secs = [], None, 0.0
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(a.jobs, len(rows) or 1)))
-    futs = {ex.submit(_one, r, root, work): r["name"] for r in rows}
+    futs = {ex.submit(_one, r, root, work, files, cmap): ("part", r["name"]) for r in rows}
     try:
-        for f in concurrent.futures.as_completed(futs):
-            try:
-                done.append(f.result())
-            except Exception as e:                # noqa: BLE001 - every cause is reported by part name
-                failed = "%s: %s" % (futs[f], _scrub(str(e)))
-                break
+        while futs and not failed:
+            finished, _ = concurrent.futures.wait(list(futs), return_when=concurrent.futures.FIRST_COMPLETED)
+            for f in finished:
+                kind, name = futs.pop(f)
+                try:
+                    res = f.result()
+                except Exception as e:            # noqa: BLE001 - every cause is reported by part or file name
+                    failed = "%s %s: %s" % (kind, name, _scrub(str(e)))
+                    break
+                if kind == "file":
+                    file_secs += res
+                    continue
+                done.append(res)
+                for i in res["chunks"]:
+                    remaining[i] -= 1
+                    if remaining[i] == 0:        # the last chunk is in: the whole file is judged at once, beside the other parts
+                        futs[ex.submit(_finish_file, files[i], root)] = ("file", files[i]["path"])
     finally:
         ex.shutdown(wait=True, cancel_futures=True)
     if failed:
-        print("runtime: part %s" % failed, file=sys.stderr)
+        print("runtime: %s" % failed, file=sys.stderr)
         return 1
     t1 = time.time()
     wall = max(t1 - t0, 1e-6)
     packed, raw = sum(r.get("bytes", 0) for r in rows), sum(r.get("raw", 0) for r in rows)
     res = {"t0": int(t0), "t1": int(t1 + 0.999), "seconds": round(wall, 2), "parts": len(rows), "jobs": a.jobs, "bytes": packed, "raw": raw,
            "gbps": round(packed / wall / 1e9, 3), "fetch_seconds": round(sum(d["fetch"] for d in done), 1),
-           "verify_seconds": round(sum(d["verify"] for d in done), 1), "unpack_seconds": round(sum(d["unpack"] for d in done), 1)}
+           "verify_seconds": round(sum(d["verify"] for d in done), 1), "unpack_seconds": round(sum(d["unpack"] for d in done), 1),
+           "split_files": len(files), "file_seconds": round(file_secs, 1)}
     if a.result:
         pathlib.Path(a.result).write_text(json.dumps(res) + "\n", encoding="utf-8")
-    print("runtime: %d part(s), %.2f GB packed (%.2f GB unpacked) in %.1f s = %.2f GB/s, %d at once (busy: fetch %.0f s, verify %.0f s, unpack %.0f s)" % (
-        len(rows), packed / 1e9, raw / 1e9, wall, res["gbps"], a.jobs, res["fetch_seconds"], res["verify_seconds"], res["unpack_seconds"]))
+    print("runtime: %d part(s), %.2f GB packed (%.2f GB unpacked) in %.1f s = %.2f GB/s, %d at once (busy: fetch %.0f s, verify %.0f s, unpack %.0f s%s)" % (
+        len(rows), packed / 1e9, raw / 1e9, wall, res["gbps"], a.jobs, res["fetch_seconds"], res["verify_seconds"], res["unpack_seconds"],
+        ("; %d split file(s) joined and verified, %.0f s" % (len(files), file_secs)) if files else ""))
     return 0
 
 
@@ -452,6 +628,8 @@ def ledger_line(a):
     extra = ""
     if "apt_seconds" in r:
         extra = "; apt %ss%s" % (r["apt_seconds"], (": " + " ".join(r["apt_installed"])) if r.get("apt_installed") else ", nothing missing")
+    if r.get("split_files"):
+        extra = "; %d split file(s) verified, %ss%s" % (r["split_files"], r.get("file_seconds", 0), extra)
     print("%s\t%s\t%s\t%s: %d parts, %.2f GB packed (%.2f GB unpacked), %.2f GB/s, %d at once (busy: fetch %ss, verify %ss, unpack %ss%s)" % (
         r["t0"], r["t1"], round(r["seconds"]), a.label, r["parts"], r["bytes"] / 1e9, r["raw"] / 1e9, r["gbps"], r["jobs"],
         r["fetch_seconds"], r["verify_seconds"], r["unpack_seconds"], extra))
@@ -506,6 +684,7 @@ def main(argv=None):
     b.add_argument("--part-bytes", type=int, default=PART_BYTES, help="bytes of file content per part, before compression")
     b.add_argument("--jobs", type=int, default=max(1, min(8, os.cpu_count() or 2)), help="parts compressed at once")
     b.add_argument("--level", type=int, default=ZSTD_LEVEL)
+    b.add_argument("--max-packed", type=int, default=OBJECT_CAP, help="fail when a packed part passes this many bytes (0: no limit)")
     b.add_argument("--url-base", default="")
     b.add_argument("--torch-cuda", required=True)
     b.add_argument("--apt", default="", help="comma-separated apt packages the runtime needs on a machine that skips the OS stage")
