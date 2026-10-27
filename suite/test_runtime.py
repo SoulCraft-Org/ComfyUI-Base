@@ -4,7 +4,7 @@ A buyer's machine installs what its maintainer's own sweep proved: ComfyUI, the 
 venv and the wheel cache, as parts with a manifest that is the ONLY place their versions are written. These tests build
 a runtime from a fake green tree, apply it to a fresh one, and install the stub package from it with every fetching tool
 stubbed to fail loudly if it is ever called to fetch."""
-import functools, http.server, json, os, pathlib, shutil, subprocess, tarfile, threading, time, pytest
+import functools, http.server, importlib.util, json, os, pathlib, random, shutil, subprocess, tarfile, threading, time, pytest
 pytestmark = [pytest.mark.unit, pytest.mark.skipif(not shutil.which("zstd"), reason="the runtime's parts are zstd tars: the machine needs zstd (CI has it)")]
 BASE = pathlib.Path(__file__).resolve().parents[1]
 RT = BASE / "py" / "runtime.py"
@@ -91,7 +91,7 @@ def _names(out, man):
 def test_unit_a_runtime_carries_code_never_data_or_secrets(tmp_path):
     src = tmp_path / "src"; _green_tree(src)
     out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
-    assert len(man["parts"]) > 1 and man["format"] == 2 and man["compression"] == "zstd"
+    assert len(man["parts"]) > 1 and man["format"] == 3 and man["compression"] == "zstd" and man["files"] == []
     assert all(p["name"].endswith(".tar.zst") and len(p["sha256"]) == 64 and p["bytes"] > 0 for p in man["parts"])
     names = _names(out, man)
     assert "ComfyUI/main.py" in names and "ComfyUI/custom_nodes/PackA/README" in names and "ComfyUI/.venv-cu130/bin/python" in names
@@ -600,14 +600,152 @@ def test_unit_runtime_mode_never_reaches_the_cublas_probe_uv_or_a_local_run_copy
     assert "not a network filesystem: it runs in place" in run_local                       # BASE_LOCAL_RUN=auto leaves a local /workspace alone
 
 
-def test_unit_the_default_part_is_256_mib_and_the_build_names_a_part_no_upload_request_takes(tmp_path):
-    import importlib.util
+def test_unit_the_default_part_is_256_mib_and_no_part_may_pass_the_upload_cap(tmp_path):
     spec = importlib.util.spec_from_file_location("runtime_mod2", RT); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
     assert mod.PART_BYTES == 268435456 and mod.OBJECT_CAP == 315_000_000
     assert mod.PART_BYTES + 512 * 1024 < mod.OBJECT_CAP                                  # even a part that does not compress stays under the cap
     assert mod.oversize([{"name": "a", "bytes": 314_999_999}, {"name": "b", "bytes": 315_000_001}]) == ["b"]
+    assert mod.oversize([{"name": "b", "bytes": 10 ** 12}], cap=0) == []
     src = tmp_path / "src"; _green_tree(src)
     r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o"), "--torch-cuda", "13.0"],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert len(json.loads((tmp_path / "o" / "runtime.json").read_text())["parts"]) == 1 and "NOTE" not in r.stdout       # the fake tree is far below one part
+    assert len(json.loads((tmp_path / "o" / "runtime.json").read_text())["parts"]) == 1                 # the fake tree is far below one part
+    tight = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(tmp_path / "o2"), "--torch-cuda", "13.0",
+                            "--max-packed", "1000"], capture_output=True, text=True)
+    assert tight.returncode != 0 and "--max-packed" in tight.stderr                                      # a part over the cap is an error, not a note
+
+
+# ---------------------------------------------------------------- 3.30.3: a file larger than a part is split across parts
+
+LIMIT = 100_000
+
+
+def _rt():
+    spec = importlib.util.spec_from_file_location("runtime_split", RT); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
+
+
+def _with_a_big_file(tmp_path, size=250_000):
+    """A green tree plus one 'library' of random bytes (no compression) that is 2.5 parts long, and a build of it."""
+    src = tmp_path / "src"; _green_tree(src)
+    big = src / "ComfyUI" / ".venv-cu130" / "lib" / "libbig.so"; big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_bytes(random.Random(7).randbytes(size)); big.chmod(0o755); os.utime(big, (1_700_000_000, 1_700_000_000))
+    out = tmp_path / "out"
+    r = subprocess.run(["python3", str(RT), "build", "--root", str(src), "--comfy", str(src / "ComfyUI"), "--out", str(out), "--torch-cuda", "13.0",
+                        "--part-bytes", str(LIMIT)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return src, out, big, json.loads((out / "runtime.json").read_text())
+
+
+def _apply(manifest, out, dst, work, jobs=4):
+    return subprocess.run(["python3", str(RT), "apply", str(manifest), str(out / "runtime.json"), "--root", str(dst), "--work", str(work), "--jobs", str(jobs)],
+                          capture_output=True, text=True)
+
+
+def test_unit_a_file_larger_than_a_part_is_cut_into_chunks_in_parts_of_their_own(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    assert m["format"] == 3 and len(m["files"]) == 1
+    f = m["files"][0]
+    assert f["path"] == "ComfyUI/.venv-cu130/lib/libbig.so" and f["bytes"] == 250_000 and f["mode"] == 0o755 and f["mtime"] == 1_700_000_000
+    assert f["sha256"] == __import__("hashlib").sha256(big.read_bytes()).hexdigest()
+    assert [c["offset"] for c in f["chunks"]] == [0, 100_000, 200_000] and [c["bytes"] for c in f["chunks"]] == [100_000, 100_000, 50_000]
+    assert len({c["part"] for c in f["chunks"]}) == 3                                    # one file's chunks are in different parts: they fetch at once
+    kinds = {p["name"]: p.get("kind") for p in m["parts"]}
+    assert {c["part"] for c in f["chunks"]} == {n for n, k in kinds.items() if k == "chunks"}
+    for p in m["parts"]:                                                                # no part is larger than a part plus headers
+        assert p["bytes"] <= LIMIT + 4096 and p["raw"] <= LIMIT, (p["name"], p["bytes"], p["raw"])
+    names = _names(out, {"parts": [p for p in m["parts"] if p.get("kind") != "chunks"]})
+    assert not any(n.endswith("libbig.so") for n in names)                              # the file itself is in no ordinary part
+    assert "ComfyUI/.venv-cu130/lib" in names                                           # the directory above it still arrives, with the first part
+
+
+def test_unit_the_chunks_join_into_the_file_whatever_order_the_parts_land_in(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    for jobs in (1, 4):
+        dst = tmp_path / ("dst%d" % jobs); dst.mkdir()
+        r = _apply(out / "runtime.json", out, dst, tmp_path / ("w%d" % jobs), jobs=jobs)
+        assert r.returncode == 0, r.stdout + r.stderr
+        t = dst / "ComfyUI" / ".venv-cu130" / "lib" / "libbig.so"
+        assert t.read_bytes() == big.read_bytes() and (t.stat().st_mode & 0o7777) == 0o755 and int(t.stat().st_mtime) == 1_700_000_000
+        assert "1 split file(s)" in r.stdout
+    mod = _rt()
+    chunk_parts = [p for p in m["parts"] if p.get("kind") == "chunks"]
+    for order in ([2, 1, 0], [1, 2, 0], [2, 0, 1]):                                     # parts landing out of order, each writing at its own offset
+        dst = tmp_path / ("ooo%d%d%d" % tuple(order)); dst.mkdir()
+        files, cmap, count = mod._plan(m, {p["name"] for p in m["parts"]})
+        mod._prepare_files(files, dst)
+        assert (dst / files[0]["path"]).stat().st_size == 250_000                        # created at its full size first
+        for i in order:
+            mod._unpack_chunks(out / chunk_parts[i]["name"], chunk_parts[i]["name"], cmap, files, dst)
+        mod._finish_file(files[0], dst)
+        assert (dst / files[0]["path"]).read_bytes() == big.read_bytes()
+
+
+def test_unit_a_missing_a_wrong_or_a_corrupt_chunk_fails_by_the_files_or_the_parts_name(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    path = m["files"][0]["path"]
+    # 1. a chunk the manifest lists is not in its part
+    lost = json.loads(json.dumps(m)); lost["files"][0]["chunks"][1]["member"] = "f0000.c999"
+    (tmp_path / "lost.json").write_text(json.dumps(lost))
+    r = _apply(tmp_path / "lost.json", out, tmp_path / "d1", tmp_path / "w1")
+    assert r.returncode == 1 and path in r.stderr and "f0000.c999" in r.stderr and "not in this part" in r.stderr
+    # 2. every part is the one the manifest names, but the file does not add up to its sha256
+    wrong = json.loads(json.dumps(m)); wrong["files"][0]["sha256"] = "0" * 64
+    (tmp_path / "wrong.json").write_text(json.dumps(wrong))
+    r = _apply(tmp_path / "wrong.json", out, tmp_path / "d2", tmp_path / "w2")
+    assert r.returncode == 1 and path in r.stderr and "sha256" in r.stderr
+    # 3. a corrupt chunk part: its own sha256 stops it, by part name, before a byte is written
+    bad = tmp_path / "bad"; shutil.copytree(out, bad)
+    part = next(p for p in m["parts"] if p.get("kind") == "chunks")["name"]
+    b = bytearray((bad / part).read_bytes()); b[200] ^= 1; (bad / part).write_bytes(bytes(b))
+    r = _apply(bad / "runtime.json", bad, tmp_path / "d3", tmp_path / "w3")
+    assert r.returncode == 1 and part in r.stderr and "sha256" in r.stderr
+    # 4. a chunk part rebuilt with different bytes under a correct part sha256: the whole file is the judge
+    rebuilt = tmp_path / "rebuilt"; shutil.copytree(out, rebuilt)
+    c = m["files"][0]["chunks"][0]
+    mod = _rt()
+    payload = tmp_path / "payload"; payload.write_bytes(b"\x01" * c["bytes"])
+    mod_items = [("chunk", payload, c["member"], 0, c["bytes"], 0)]
+    made = mod._write_part(rebuilt, c["part"], mod_items, 3)
+    forged = json.loads(json.dumps(m))
+    for p in forged["parts"]:
+        if p["name"] == c["part"]:
+            p.update(bytes=made["bytes"], sha256=made["sha256"], raw=made["raw"])
+    (rebuilt / "runtime.json").write_text(json.dumps(forged))
+    r = _apply(rebuilt / "runtime.json", rebuilt, tmp_path / "d4", tmp_path / "w4")
+    assert r.returncode == 1 and path in r.stderr and "does not match its sha256" in r.stderr
+
+
+def test_unit_a_manifest_whose_chunks_do_not_add_up_is_refused_before_anything_is_written(tmp_path):
+    src, out, big, m = _with_a_big_file(tmp_path)
+    mod = _rt()
+    names = {p["name"] for p in m["parts"]}
+    gap = json.loads(json.dumps(m)); gap["files"][0]["chunks"][1]["offset"] += 1
+    short = json.loads(json.dumps(m)); short["files"][0]["bytes"] += 5
+    ghost = json.loads(json.dumps(m)); ghost["files"][0]["chunks"][0]["part"] = "runtime.999.tar.zst"
+    outside = json.loads(json.dumps(m)); outside["files"][0]["path"] = "../escape"
+    for bad, word in ((gap, "gap or overlap"), (short, "add up"), (ghost, "does not list"), (outside, "not inside")):
+        with pytest.raises(SystemExit) as e:
+            mod._plan(bad, names)
+        assert word in str(e.value), (word, str(e.value))
+    (tmp_path / "gap.json").write_text(json.dumps(gap))
+    r = _apply(tmp_path / "gap.json", out, tmp_path / "dx", tmp_path / "wx")
+    assert r.returncode != 0 and not (tmp_path / "dx" / "ComfyUI").exists()
+
+
+def test_unit_apply_still_reads_a_format_2_runtime_and_the_ledger_counts_split_files(tmp_path):
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
+    m = json.loads((out / "runtime.json").read_text()); m["format"] = 2; m.pop("files")
+    (out / "runtime.json").write_text(json.dumps(m))
+    r = _apply(out / "runtime.json", out, tmp_path / "dst", tmp_path / "w")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "dst" / "ComfyUI" / "main.py").exists()
+    assert "split file" not in r.stdout
+    src2, out2, big, m2 = _with_a_big_file(tmp_path / "two")
+    res = tmp_path / "res.json"
+    r = subprocess.run(["python3", str(RT), "apply", str(out2 / "runtime.json"), str(out2 / "runtime.json"), "--root", str(tmp_path / "dst2"), "--work", str(tmp_path / "w2"),
+                        "--result", str(res)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    line = subprocess.run(["python3", str(RT), "ledger-line", str(res)], capture_output=True, text=True).stdout
+    assert "1 split file(s) verified" in line

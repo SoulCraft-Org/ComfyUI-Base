@@ -1,6 +1,6 @@
 # ComfyUI Base — Handbook
 
-**Version 3.30.2.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
+**Version 3.30.3.** The shared toolchain every workflow package on a machine sources, on **any host with an NVIDIA
 GPU** (RunPod, Verda, Crusoe, an owned box) and on any image or OS that gives it a driver and Python 3. One command,
 run once per machine as **step one**; then each workflow package is **step two**, still one command. From a Mac,
 `podctl` reaches the machine and hands its boot to the base (§1); after that every boot is the base's.
@@ -708,9 +708,18 @@ not a second install: CONSOLIDATE neither reports nor sizes its tree and venv, a
 `custom_nodes`, where the pack pass fetches it instead of cloning it.
 
 **The runtime's parts and how they land** (3.29.3): `runtime-capture` cuts the runtime into independent parts, each its own
-zstd-compressed tar (`runtime.NNN.tar.zst`, 256 MiB of file content each by default, `--part-bytes`: 268 MB at most even if nothing compresses, under the 315 MB a single-request upload to Cloudflare's R2 takes; a file larger than that is one part alone and the build names any part over 315 MB packed), carrying the directories above
+zstd-compressed tar (`runtime.NNN.tar.zst`, 256 MiB of file content each by default, `--part-bytes`: 268 MB at most even if nothing compresses, under the 315 MB a single-request upload to Cloudflare's R2 takes), carrying the directories above
 its own files so it unpacks alone; compression runs one part per CPU. `runtime.json` lists each part's `name`, `sha256`,
-`bytes` (packed) and `raw` (unpacked), with `format: 2`, `compression: zstd`. `runtime-apply <manifest> [--parts <links.json>]
+`bytes` (packed) and `raw` (unpacked), with `format: 3`, `compression: zstd` (format 2, without split files, is still read).
+**A file larger than a part is split** (3.30.3): it is cut into chunks of `--part-bytes`, each chunk its own tar member in a part of
+its own (`kind: chunks`, holding only chunks), so no part passes `--part-bytes` plus headers, one big CUDA library is fetched as
+several parts at once, and the long pole of the parallel fetch is gone. `runtime.json`'s `files` lists each split file's
+`path`, `mode`, `mtime`, `bytes`, whole-file `sha256` and its `chunks` (`part`, `member`, `offset`, `bytes`). `runtime-apply` checks
+that the chunks tile the file exactly and name listed parts, creates the file at its full size before any part is unpacked, has
+each chunk's worker write its bytes at its offset (`pwrite`, no copy to join them) in whatever order the parts land, and when a
+file's last chunk is in checks the whole file's sha256 against the manifest (the judge), then sets its mode and mtime. A chunk
+missing from its part, or a file whose bytes do not add up, fails the apply naming the file; a corrupt part fails by its own
+sha256, by part name. `runtime-capture` fails when a packed part passes `--max-packed` (315 MB by default, 0 for none). `runtime-apply <manifest> [--parts <links.json>]
 [--jobs N]` fetches N parts at once (8; `BASE_RUNTIME_JOBS`), largest first, from the manifest's https URL (parts beside it,
 or each part's own `url`), from the per-part links given beside a local manifest (`--parts links.json`: the site's entitlement `runtime` object as it
 comes, `{id, manifest: {url, sha256, bytes}, parts: [{name, url, sha256, bytes}]}`, or a bare list of parts; the manifest's
@@ -761,8 +770,8 @@ boot kit as the entrypoint. Read from the code and held by suite tests; not yet 
   6.7 to 7.2 GB as a venv (3.18.2), a Video Swapper venv with its packs' requirements at 12 GB (3.15.0), and 4.1 GB of wheels
   in 165 packages (3.26.0); the tree without models is a few hundred MB plus the packs' `.git` (about 1 to 2 GB), the uv
   Pythons about 0.2 GB, the tools venv about 0.4 GB. So about 13 to 16 GB unpacked, in about 55 to 64 parts of 256 MiB, and,
-  at zstd level 3 on CUDA libraries (about 0.5 to 0.6), about 7 to 9 GB packed, 130 to 160 MB a part (a few parts that hold one
-  large CUDA library each, the biggest over 1 GB unpacked, pass 315 MB packed: the build names them). At the 2 GB/s the
+  at zstd level 3 on CUDA libraries (about 0.5 to 0.6), about 7 to 9 GB packed, 130 to 160 MB a part (the CUDA libraries larger
+  than 256 MiB, the biggest over 1 GB unpacked, are split into chunks of 256 MiB, so no part passes about 270 MB). At the 2 GB/s the
   downloads reach that is about 4 s of line, so the volume's write speed sets the unpack. The first live capture's
   `runtime.json` and RUNTIME row replace this paragraph's numbers.
 
@@ -955,6 +964,18 @@ for any invocation that somehow arrives without the environment. The suite asser
 
 ## 10. Record
 
+- 3.30.3: a file larger than a part is split across parts (2026-10-26). Exercised by the suite and by hand runs of `runtime.py
+  build` and `apply` on a small tree on macOS (a 250 KB random file in 100 KB parts: three chunks in three parts, applied in
+  order, in reverse and through the worker pool, with a missing chunk, a wrong whole-file hash and a corrupt part each refused
+  by name); not on a live machine. The default part is 256 MiB (3.30.2) and a library of 1 GB or more was one part alone,
+  over the 315 MB a single `wrangler r2 object put` takes and the long pole of the parallel fetch. Now `runtime-capture` cuts
+  any regular file over `--part-bytes` into chunks of that size, each its own tar member in parts of their own, one file's
+  chunks in different parts; `runtime.json` is `format: 3` with `files` (path, mode, mtime, bytes, sha256, chunks) and
+  `kind: chunks` on those parts, and `runtime-apply` reads formats 2 and 3 (format 3 is what is captured now). Apply
+  creates each split file at its full size, writes each chunk at its offset with `pwrite` as its part lands (no join copy,
+  any order), and checks the whole file's sha256 when its last chunk is in, then sets its mode and mtime; the RUNTIME
+  ledger row counts the split files and the seconds they took. The "NOTE n part(s) pass 315 MB" line of 3.30.2 is a hard
+  error now (`--max-packed`, default 315 MB, 0 for none), which only an explicit larger `--part-bytes` can trip.
 - 3.30.2: runtime mode on RunPod's stock image (2026-10-26). Exercised by the suite and by hand runs of capture, apply, the
   tree pin and the zstd gate against stand-in `apt-get` and `dpkg-query` on macOS; not on a pod. (1) `runtime.json` carries
   `apt`, written by `runtime-capture` from the base's own list (`_base_apt_core`, now the one list the OS stage reads too)
