@@ -145,9 +145,9 @@ def test_unit_every_part_unpacks_alone_and_in_any_order(tmp_path):
     assert len(man["parts"]) > 3
     for i, p in enumerate(man["parts"]):
         alone = tmp_path / ("alone%d" % i); alone.mkdir()
-        z = subprocess.Popen(["zstd", "-dc", "-q", str(out / p["name"])], stdout=subprocess.PIPE)
-        r = subprocess.run(["tar", "-xf", "-", "-C", str(alone)], stdin=z.stdout, capture_output=True, text=True)
-        z.stdout.close(); assert z.wait() == 0 and r.returncode == 0, r.stderr
+        with subprocess.Popen(["zstd", "-dc", "-q", str(out / p["name"])], stdout=subprocess.PIPE) as z:
+            r = subprocess.run(["tar", "-xf", "-", "-C", str(alone)], stdin=z.stdout, capture_output=True, text=True)
+        assert z.returncode == 0 and r.returncode == 0, r.stderr
     trees = {}
     for jobs in (1, 6):
         dst = tmp_path / ("dst%d" % jobs); dst.mkdir()
@@ -417,11 +417,16 @@ def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
 
 # ---------------------------------------------------------------- 3.30.1: the models start while the runtime is still unpacking
 
-def _install_beside_an_apply(dst, tmp_path, extra=None):
-    from basetest import run_script
+def _need_stub():
     stub = BASE / "_build" / "stub"
     if not stub.exists():
         pytest.skip("_build/stub is repo tooling")
+    return stub
+
+
+def _install_beside_an_apply(dst, tmp_path, extra=None):
+    from basetest import run_script
+    stub = _need_stub()
     shutil.copytree(stub, dst / "pkg")
     (dst / "somewhere").mkdir(exist_ok=True); (dst / "somewhere" / "stub_local.safetensors").write_bytes(b"mine")
     env = {"BASE_RUNTIME": str(dst / "comfy-base" / "state" / "runtime.json"), "BASE_NO_SUITE": "1"}
@@ -440,19 +445,24 @@ def _spans(dst):
 
 
 def test_unit_the_models_start_before_the_unpack_ends_and_only_the_tree_waits(tmp_path):
+    _need_stub()                                                  # before the apply is started: a skip must leave nothing running
     src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=80000)
     dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
     lock = dst / "comfy-base" / "state" / "runtime.applying"
     with _Server(out, delay=1.5) as srv:
-        ap = subprocess.Popen(["bash", str(BASE / "base.sh"), "runtime-apply", srv.url + "/runtime.json", "--jobs", "1"], env=_env(dst),
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        for _ in range(200):
-            if lock.exists():
-                break
-            time.sleep(0.05)
-        assert lock.exists()
-        r = _install_beside_an_apply(dst, tmp_path)
-        apply_out = ap.communicate(timeout=120)[0]
+        with subprocess.Popen(["bash", str(BASE / "base.sh"), "runtime-apply", srv.url + "/runtime.json", "--jobs", "1"], env=_env(dst),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as ap:      # the with waits for it and closes its pipe
+            try:
+                for _ in range(200):
+                    if lock.exists():
+                        break
+                    time.sleep(0.05)
+                assert lock.exists()
+                r = _install_beside_an_apply(dst, tmp_path)
+                apply_out = ap.communicate(timeout=120)[0]
+            except BaseException:
+                ap.kill()                                         # a failed assertion must not leave the apply running to be finalized later
+                raise
     assert ap.returncode == 0, apply_out
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1500:]
     assert "still unpacking" in r.stdout and "the runtime is unpacked" in r.stdout
@@ -469,6 +479,7 @@ def test_unit_the_models_start_before_the_unpack_ends_and_only_the_tree_waits(tm
 
 
 def test_unit_an_apply_that_ends_without_a_stamp_fails_the_install_by_name(tmp_path):
+    _need_stub()
     src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out)
     dst = tmp_path / "dst"; st = dst / "comfy-base" / "state"; st.mkdir(parents=True)
     shutil.copy(out / "runtime.json", st / "runtime.json")
