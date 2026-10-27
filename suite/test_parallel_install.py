@@ -202,7 +202,8 @@ def test_unit_the_boot_stage_joins_the_tools_venv_or_builds_it_itself():
 def test_unit_the_pipeline_starts_the_background_work_after_the_os_join_and_hooks_the_local_runtime():
     body = _code("lib/95-summary.sh", "base_install(){", "_base_use_testbed(){")
     soon = body.index("_base_models_early_start")                   # 3.28.0: the gated start before the clones comes first
-    tools = body.index("_base_tools_start"); early = body.index("_base_models_early_start", soon + 1)
+    runtime = body.index("_base_models_early_start", soon + 1)      # 3.30.1: and the buyer's machine's, in the runtime branch
+    tools = body.index("_base_tools_start"); early = body.index("_base_models_early_start", runtime + 1)
     assert body.index("_base_system_join") < early < tools < body.index("base_venv_snapshot")
     prewarm = body.index("_base_run_prewarm")
     assert body.index("base_venv_latest") < prewarm < body.index("_base_hook pkg_pre_models")

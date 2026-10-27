@@ -486,6 +486,7 @@ def test_unit_a_lock_whose_process_is_gone_is_no_lock_and_a_library_waits_for_th
     snippet = 'source "%s/base.sh"; base_env_setup; _base_runtime_applying abc && echo LOCKED || echo FREE; ' % BASE
     r = subprocess.run(["bash", "-c", snippet + '_base_runtime_early_ok && echo EARLY || echo LATE'], capture_output=True, text=True, env=_env(dst))
     assert r.stdout.split() == ["FREE", "EARLY"], r.stdout + r.stderr
+    (tmp_path / "lib").mkdir()                                  # base_env_setup ignores a BASE_LIBRARY that is not a directory
     r = subprocess.run(["bash", "-c", snippet + '_base_runtime_early_ok && echo EARLY || echo LATE'], capture_output=True, text=True, env=_env(dst, BASE_LIBRARY=str(tmp_path / "lib")))
     assert r.stdout.split() == ["FREE", "LATE"], r.stdout + r.stderr
 
