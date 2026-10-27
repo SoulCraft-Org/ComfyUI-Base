@@ -88,7 +88,7 @@ def _names(out, man):
 
 def test_unit_a_runtime_carries_code_never_data_or_secrets(tmp_path):
     src = tmp_path / "src"; _green_tree(src)
-    out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     assert len(man["parts"]) > 1 and man["format"] == 2 and man["compression"] == "zstd"
     assert all(p["name"].endswith(".tar.zst") and len(p["sha256"]) == 64 and p["bytes"] > 0 for p in man["parts"])
     names = _names(out, man)
@@ -139,13 +139,13 @@ def test_unit_the_driver_floor_table_and_a_build_with_no_cuda(tmp_path):
 def test_unit_every_part_unpacks_alone_and_in_any_order(tmp_path):
     """3.29.3: independent parts. Each one unpacks into an empty folder by itself (the directories above its files ride in it),
     and the parts applied at once, largest first, make exactly the tree the parts applied one at a time make."""
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     assert len(man["parts"]) > 3
     for i, p in enumerate(man["parts"]):
         alone = tmp_path / ("alone%d" % i); alone.mkdir()
-        z = subprocess.Popen(["zstd", "-dc", "-q", str(out / p["name"])], stdout=subprocess.PIPE)
-        r = subprocess.run(["tar", "-xf", "-", "-C", str(alone)], stdin=z.stdout, capture_output=True, text=True)
-        z.stdout.close(); assert z.wait() == 0 and r.returncode == 0, r.stderr
+        with subprocess.Popen(["zstd", "-dc", "-q", str(out / p["name"])], stdout=subprocess.PIPE) as z:
+            r = subprocess.run(["tar", "-xf", "-", "-C", str(alone)], stdin=z.stdout, capture_output=True, text=True)
+        assert z.returncode == 0 and r.returncode == 0, r.stderr
     trees = {}
     for jobs in (1, 6):
         dst = tmp_path / ("dst%d" % jobs); dst.mkdir()
@@ -194,7 +194,7 @@ class _Server:
 
 
 def test_unit_apply_fetches_several_parts_at_once_from_a_manifest_url(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     dst = tmp_path / "dst"; dst.mkdir()
     with _Server(out, delay=0.15) as srv:
         (tmp_path / "m").mkdir(); (tmp_path / "m" / "runtime.json").write_bytes((out / "runtime.json").read_bytes())
@@ -208,7 +208,7 @@ def test_unit_apply_fetches_several_parts_at_once_from_a_manifest_url(tmp_path):
 
 
 def test_unit_signed_links_beside_a_local_manifest_are_used_and_never_printed(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     held = tmp_path / "held"; held.mkdir(); (held / "runtime.json").write_bytes((out / "runtime.json").read_bytes())      # no parts beside it
     dst = tmp_path / "dst"; dst.mkdir()
     with _Server(out, need="sig=s3cret") as srv:
@@ -258,7 +258,7 @@ def test_unit_runtime_apply_records_a_runtime_row_in_the_timing_ledger(tmp_path)
 
 
 def test_unit_runtime_apply_takes_jobs_and_a_manifest_url(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
     dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
     with _Server(out, delay=0.1) as srv:
         r = _base(["runtime-apply", srv.url + "/runtime.json", "--jobs", "3"], dst)
@@ -268,7 +268,7 @@ def test_unit_runtime_apply_takes_jobs_and_a_manifest_url(tmp_path):
 
 
 def test_unit_verify_parts_names_the_first_part_that_differs(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     ok = subprocess.run(["python3", str(RT), "verify-parts", str(out / "runtime.json"), str(out)], capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr
     p = out / man["parts"][1]["name"]; b = bytearray(p.read_bytes()); b[0] ^= 1; p.write_bytes(bytes(b))
@@ -312,7 +312,7 @@ def _base(cmd, root, **extra):
 
 
 def _applied(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=40000)
     dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
     r = _base(["runtime-apply", str(out / "runtime.json")], dst)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -330,7 +330,7 @@ def test_unit_runtime_apply_unpacks_stamps_and_is_idempotent(tmp_path):
 
 
 def test_unit_a_corrupt_part_fails_the_apply_by_name_and_stamps_nothing(tmp_path):
-    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=700)
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; man = _build(src, out, part_bytes=40000)
     p = out / man["parts"][0]["name"]; b = bytearray(p.read_bytes()); b[-1] ^= 1; p.write_bytes(bytes(b))
     dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
     r = _base(["runtime-apply", str(out / "runtime.json")], dst)
@@ -398,6 +398,9 @@ def test_unit_the_stub_installs_from_the_runtime_with_no_git_pip_or_uv_fetch(tmp
         else:
             assert tool == "uv" and rest.strip() == "--version", ln
     assert "runtime mode" in r.stdout and "runtime " in r.stdout
+    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()      # 3.30.1: fetched by the early pass
+    tl = "".join(f.read_text() for f in (dst / "comfy-base" / "state" / "logs").glob("stub_*.timeline.tsv"))
+    assert "MODELS (in the background" in tl and "RUNTIME (in the background" not in tl      # the runtime was applied before this run: no wait
 
 
 def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
@@ -408,3 +411,90 @@ def test_unit_run_order_keeps_the_3_0_steps_for_every_plain_run():
     for a, b in (("_base_system_join", "base_venv_snapshot"), ("base_venv_snapshot", "if ! base_venv"), ("if ! base_venv", "base_packs pip"), ("base_packs pip", "base_mcp"), ("base_mcp", "base_venv_latest")):
         assert plain.index(a) < plain.index(b)
     assert "else base_system || src=$?; fi" in run and "else base_update_comfyui || true; fi" in run
+
+
+# ---------------------------------------------------------------- 3.30.1: the models start while the runtime is still unpacking
+
+def _need_stub():
+    stub = BASE / "_build" / "stub"
+    if not stub.exists():
+        pytest.skip("_build/stub is repo tooling")
+    return stub
+
+
+def _install_beside_an_apply(dst, tmp_path, extra=None):
+    from basetest import run_script
+    stub = _need_stub()
+    shutil.copytree(stub, dst / "pkg")
+    (dst / "somewhere").mkdir(exist_ok=True); (dst / "somewhere" / "stub_local.safetensors").write_bytes(b"mine")
+    env = {"BASE_RUNTIME": str(dst / "comfy-base" / "state" / "runtime.json"), "BASE_NO_SUITE": "1"}
+    env.update(extra or {})
+    return run_script(dst / "pkg" / "stub-script.sh", fake_root=dst, env=env)
+
+
+def _spans(dst):
+    rows = {}
+    for f in (dst / "comfy-base" / "state" / "logs").glob("stub_*.timeline.tsv"):
+        for ln in f.read_text().splitlines():
+            if ln and not ln.startswith("#"):
+                t0, t1, secs, what = ln.split("\t", 3)
+                rows[what] = (int(t0), int(t1))
+    return rows
+
+
+def test_unit_the_models_start_before_the_unpack_ends_and_only_the_tree_waits(tmp_path):
+    _need_stub()                                                  # before the apply is started: a skip must leave nothing running
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out, part_bytes=80000)
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    lock = dst / "comfy-base" / "state" / "runtime.applying"
+    with _Server(out, delay=1.5) as srv:
+        with subprocess.Popen(["bash", str(BASE / "base.sh"), "runtime-apply", srv.url + "/runtime.json", "--jobs", "1"], env=_env(dst),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as ap:      # the with waits for it and closes its pipe
+            try:
+                for _ in range(200):
+                    if lock.exists():
+                        break
+                    time.sleep(0.05)
+                assert lock.exists()
+                r = _install_beside_an_apply(dst, tmp_path)
+                apply_out = ap.communicate(timeout=120)[0]
+            except BaseException:
+                ap.kill()                                         # a failed assertion must not leave the apply running to be finalized later
+                raise
+    assert ap.returncode == 0, apply_out
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1500:]
+    assert "still unpacking" in r.stdout and "the runtime is unpacked" in r.stdout
+    assert not lock.exists() and (dst / "comfy-base" / "state" / "runtime.stamp").exists()
+    spans = _spans(dst)
+    models = spans["MODELS (in the background, beside the venv build)"]
+    unpack = next(v for k, v in spans.items() if k.startswith("RUNTIME (in the background"))
+    waited = spans["RUNTIME · waiting for the unpack"]
+    assert models[0] < unpack[1]                                  # the downloads began before the unpack ended
+    assert waited[1] >= unpack[1] - 1 and waited[0] < unpack[1]   # and the tree is what waited for it
+    assert "COMFYUI · the proven runtime" in spans and spans["COMFYUI · the proven runtime"][0] >= waited[1]
+    assert (dst / "ComfyUI" / "models" / "vae" / "Example" / "Real" / "stub_vae.safetensors").exists()
+    assert (dst / "ComfyUI" / "custom_nodes" / "PackA" / "README").exists()
+
+
+def test_unit_an_apply_that_ends_without_a_stamp_fails_the_install_by_name(tmp_path):
+    _need_stub()
+    src = tmp_path / "src"; _green_tree(src); out = tmp_path / "out"; _build(src, out)
+    dst = tmp_path / "dst"; st = dst / "comfy-base" / "state"; st.mkdir(parents=True)
+    shutil.copy(out / "runtime.json", st / "runtime.json")
+    sha = __import__("hashlib").sha256((st / "runtime.json").read_bytes()).hexdigest()
+    pid = subprocess.run(["sh", "-c", "sleep 4 </dev/null >/dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout.strip()   # reaped by init
+    (st / "runtime.applying").write_text("%s %s\n" % (pid, sha))
+    r = _install_beside_an_apply(dst, tmp_path)
+    assert r.returncode != 0 and "ended without finishing" in r.stdout + r.stderr
+    assert not (st / "runtime.stamp").exists()
+
+
+def test_unit_a_lock_whose_process_is_gone_is_no_lock_and_a_library_waits_for_the_tree(tmp_path):
+    dst = tmp_path / "dst"; (dst / "comfy-base" / "state").mkdir(parents=True)
+    (dst / "comfy-base" / "state" / "runtime.applying").write_text("999999 abc\n")
+    snippet = 'source "%s/base.sh"; base_env_setup; _base_runtime_applying abc && echo LOCKED || echo FREE; ' % BASE
+    r = subprocess.run(["bash", "-c", snippet + '_base_runtime_early_ok && echo EARLY || echo LATE'], capture_output=True, text=True, env=_env(dst))
+    assert r.stdout.split() == ["FREE", "EARLY"], r.stdout + r.stderr
+    (tmp_path / "lib").mkdir()                                  # base_env_setup ignores a BASE_LIBRARY that is not a directory
+    r = subprocess.run(["bash", "-c", snippet + '_base_runtime_early_ok && echo EARLY || echo LATE'], capture_output=True, text=True, env=_env(dst, BASE_LIBRARY=str(tmp_path / "lib")))
+    assert r.stdout.split() == ["FREE", "LATE"], r.stdout + r.stderr

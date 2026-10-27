@@ -12,22 +12,116 @@
 #   BASE_RUNTIME=<state/runtime.json> <package script>                  install from it: no OS, git, pip or uv step
 #
 # The versions live ONLY in runtime.json. This file and py/runtime.py read them; neither writes one down.
+#
+# 3.30.1: the models do not wait for the unpack. While `runtime-apply` runs it holds $BASE_STATE/runtime.applying
+# ("<pid> <manifest sha256>"; a dead pid is no lock) and has already put the manifest at state/runtime.json; an install
+# with BASE_RUNTIME set then finds its manifest "pending", starts the package's model downloads at once where the tree
+# will be, and waits for the stamp only where it first needs the tree, the venv or a pack. Pod to App ready becomes
+# max(unpack, first models) plus one ComfyUI start.
 
 _base_runtime_on(){ [ -n "${BASE_RUNTIME:-}" ]; }
 _base_runtime_field(){ "$SYS_PY" "$BASE_DIR/py/runtime.py" field "$BASE_RUNTIME" "$1" 2>/dev/null || true; }
 _base_runtime_skip(){ note "$1: runtime mode, from the proven runtime (${BASE_RUNTIME_NOTE:-runtime.json}); nothing is fetched or built"; }
 _base_runtime_root(){ dirname "$BASE_HOME"; }            # /workspace on a machine, the fake root in the suite
 
-_base_runtime_init(){ # base_init, when BASE_RUNTIME is set: the manifest must be the one runtime-apply unpacked
+BASE_RUNTIME_PENDING=0; M_PRE=""
+_base_runtime_applying(){ # [manifest sha256] → 0 when a runtime-apply is running now (and, when a sha256 is given, is unpacking that manifest)
+  local f="$BASE_STATE/runtime.applying" pid="" sum=""
+  [ -f "$f" ] || return 1
+  read -r pid sum < "$f" || true
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  [ -z "${1:-}" ] || [ "$sum" = "?" ] || [ "$sum" = "$1" ]
+}
+_base_runtime_pending_check(){ # → 0 when the manifest BASE_RUNTIME names is being unpacked right now (the install need not wait for it yet)
+  local i want stamp
+  if [ ! -f "$BASE_RUNTIME" ] && _base_runtime_applying; then      # the apply fetches its manifest first: a second or two
+    note "BASE_RUNTIME: the runtime-apply that writes it is running; waiting for the manifest"
+    for i in $(seq 1 60); do [ -f "$BASE_RUNTIME" ] && break; sleep 1; done
+  fi
+  [ -f "$BASE_RUNTIME" ] || return 1
+  want="$(_base_sha256 "$BASE_RUNTIME" | awk '{print $1}')"; stamp="$(cat "$BASE_STATE/runtime.stamp" 2>/dev/null || true)"
+  [ "$stamp" != "$want" ] || return 1
+  _base_runtime_applying "$want" || return 1
+  # the stamp may have landed between the two reads: a finished apply is not pending
+  [ "$(cat "$BASE_STATE/runtime.stamp" 2>/dev/null || true)" != "$want" ]
+}
+_base_runtime_init(){ # base_init, when BASE_RUNTIME is set: the manifest must be the one runtime-apply unpacked (or is unpacking)
   local stamp want
-  if [ ! -f "$BASE_RUNTIME" ]; then err "BASE_RUNTIME=$BASE_RUNTIME does not exist: run 'runtime-apply <manifest>' first"; exit 2; fi
+  if [ ! -f "$BASE_RUNTIME" ] && ! _base_runtime_pending_check; then err "BASE_RUNTIME=$BASE_RUNTIME does not exist: run 'runtime-apply <manifest>' first"; exit 2; fi
   stamp="$(cat "$BASE_STATE/runtime.stamp" 2>/dev/null || true)"
   want="$(_base_sha256 "$BASE_RUNTIME" | awk '{print $1}')"
-  if [ "$stamp" != "$want" ]; then err "BASE_RUNTIME names a manifest this machine has not applied (stamp ${stamp:-none}): run 'runtime-apply' with it first"; exit 2; fi
+  BASE_RUNTIME_PENDING=0
+  if [ "$stamp" != "$want" ]; then
+    if _base_runtime_pending_check; then BASE_RUNTIME_PENDING=1
+    elif [ "$(cat "$BASE_STATE/runtime.stamp" 2>/dev/null || true)" != "$want" ]; then
+      err "BASE_RUNTIME names a manifest this machine has not applied (stamp ${stamp:-none}): run 'runtime-apply' with it first"; exit 2
+    fi
+  fi
   BASE_RUNTIME_NOTE="created $(_base_runtime_field created), base $(_base_runtime_field base)"
   local dm; dm="$(_base_runtime_field driver_min)"
   if [[ "$dm" =~ ^[0-9]+$ ]] && { ! [[ "${DRIVER_MIN:-}" =~ ^[0-9]+$ ]] || [ "$dm" -gt "$DRIVER_MIN" ]; }; then DRIVER_MIN="$dm"; fi
-  ok "runtime mode: $BASE_RUNTIME_NOTE; driver floor ${DRIVER_MIN:-580}"
+  if [ "$BASE_RUNTIME_PENDING" = 1 ]; then ok "runtime mode: $BASE_RUNTIME_NOTE; driver floor ${DRIVER_MIN:-580}; the runtime is still unpacking (the models start now, the tree is waited for where it is first needed)"
+  else ok "runtime mode: $BASE_RUNTIME_NOTE; driver floor ${DRIVER_MIN:-580}"; fi
+}
+_base_runtime_pretree(){ # the tree is not there yet: name where it WILL be, so the model downloads have a place to land
+  COMFY="$(_base_runtime_root)/$(_base_runtime_field comfyui.dir)"; CN="$COMFY/custom_nodes"; VENV=""; PACK_DIRS=()
+  M="$COMFY/models"; M_SRC="default (the runtime's tree, still unpacking)"; M_PRE="$M"
+  STAGING_ROOT="$M/.comfy-base-staging"; STAGING="$STAGING_ROOT"
+  mkdir -p "$M" 2>/dev/null || true
+  # the facts base_discover reads only once a tree exists, and the driver gate and the banner need before it
+  GPU_NAME="?"; DRIVER="?"; TORCH_NOW="?"; BASE_GPU_SM=""
+  if [ -z "$BASE_FAKE_ROOT" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    local q; q="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1 || true)"
+    GPU_NAME="${q%%,*}"; DRIVER="${q##*, }"
+  fi
+}
+_base_runtime_early_ok(){ # → 0 when the model downloads may start before (or beside) the unpack: a library of its own, or a shared store, decides the models' place only once the tree is read
+  [ -z "${BASE_LIBRARY:-}" ] && [ "${BASE_VOLUME_SHARED:-0}" != "1" ] || return 1
+}
+_base_runtime_wait_apply(){ # → 0 once the stamp names this manifest and the tree is read as usual; 1 when the apply ended without it
+  local want t0="$SECONDS" limit="${BASE_RUNTIME_WAIT:-3600}" res="$BASE_STATE/runtime-apply.json" line
+  hdr "RUNTIME · waiting for the unpack"                    # its seconds are how long the unpack outlasted everything started before it
+  want="$(_base_sha256 "$BASE_RUNTIME" | awk '{print $1}')"
+  while [ "$(cat "$BASE_STATE/runtime.stamp" 2>/dev/null || true)" != "$want" ]; do
+    if ! _base_runtime_applying "$want" && [ "$(cat "$BASE_STATE/runtime.stamp" 2>/dev/null || true)" != "$want" ]; then
+      err "the runtime-apply ended without finishing (no stamp): re-run 'runtime-apply' with the manifest"
+      BASE_FAILED+=("runtime: the apply did not finish"); return 1
+    fi
+    if [ $(( SECONDS - t0 )) -ge "$limit" ]; then err "the runtime was still unpacking after ${limit}s (BASE_RUNTIME_WAIT)"; BASE_FAILED+=("runtime: the apply took over ${limit}s"); return 1; fi
+    sleep 1
+  done
+  ok "the runtime is unpacked (waited $(( SECONDS - t0 )) s)"
+  # the apply ran beside this install: its seconds join this run's ledger as a background stage, as the downloads' do
+  if [ -s "$res" ]; then
+    line="$("$SYS_PY" - "$res" <<'PYEOF' 2>/dev/null || true
+import json, sys
+r = json.load(open(sys.argv[1]))
+print("%s\t%s\t%s\t%s" % (r["t0"], r["t1"], round(r["seconds"]), "RUNTIME (in the background, beside the models): %d parts, %.2f GB, %.2f GB/s" % (r["parts"], r["bytes"] / 1e9, r["gbps"])))
+PYEOF
+)"
+    if [ -n "$line" ]; then local r0 r1 rs rw; IFS=$'\t' read -r r0 r1 rs rw <<< "$line"; BASE_STAGE_TIMES+=("$rs|$rw"); _base_span "$(( r0 - BASE_EPOCH0 ))" "$(( r1 - BASE_EPOCH0 ))" "$rw"; fi
+  fi
+  # now the tree exists: read it as base_init reads any tree
+  local drc=0; base_discover quiet || drc=$?
+  if [ "$drc" != 0 ]; then base_discover || true; err "the runtime is unpacked but no ComfyUI tree was found"; BASE_FAILED+=("runtime: no tree after the unpack"); return 1; fi
+  BASE_RUNTIME_PENDING=0
+  if [ -n "$M_PRE" ] && [ "$M" != "$M_PRE" ]; then
+    warn "the model library resolved to $M, not $M_PRE where the early downloads went: whatever is missing there is fetched again"
+  fi
+  _base_library_link; base_banner || true
+  return 0
+}
+_base_fetch_tool_pip(){ # the downloader of a runtime-mode install, on the system Python: uv and the runtime's own Python may be unpacking right now
+  local v="$BASE_HOME/fetch" out
+  if ! "$SYS_PY" -c 'import ensurepip, venv' >/dev/null 2>&1; then note "fetch venv: the system Python has no venv/ensurepip"; return 1; fi
+  if [ ! -x "$v/bin/python" ]; then
+    if ! out="$("$SYS_PY" -m venv "$v" 2>&1)"; then printf '%s\n' "$out" | tail -3; note "fetch venv: python -m venv failed"; rm -rf "$v"; return 1; fi
+  fi
+  if ! out="$("$v/bin/python" -m pip install -q --disable-pip-version-check --upgrade "huggingface_hub[hf-xet]" 2>&1)"; then
+    printf '%s\n' "$out" | tail -3; note "fetch venv: huggingface_hub[hf-xet] could not be installed"
+  fi
+  if [ ! -x "$v/bin/hf" ]; then return 1; fi
+  ok "fetch venv: huggingface_hub $("$v/bin/python" -c 'import importlib.metadata as m; print(m.version("huggingface_hub"))' 2>/dev/null) on the system Python ($v)"
 }
 _base_runtime_comfy(){ # in place of base_update_comfyui: the tree must be exactly the runtime's, packs included
   hdr "COMFYUI · the proven runtime"
@@ -86,7 +180,13 @@ PYEOF
   PKG_ID="runtime-apply" _base_timings_write
 }
 
-base_runtime_apply(){ # <manifest path or https URL> [--parts <links.json>] [--jobs <n>] → the runtime unpacked beside comfy-base, stamped; idempotent
+base_runtime_apply(){ # the apply, holding state/runtime.applying while it runs (3.30.1): an install may start beside it
+  local rc=0
+  _base_runtime_apply_run "$@" || rc=$?
+  [ -z "${BASE_STATE:-}" ] || rm -f "$BASE_STATE/runtime.applying" 2>/dev/null || true
+  return $rc
+}
+_base_runtime_apply_run(){ # <manifest path or https URL> [--parts <links.json>] [--jobs <n>] → the runtime unpacked beside comfy-base, stamped; idempotent
   local src="" parts_file="" jobs="${BASE_RUNTIME_JOBS:-8}" root work man sum have name from rc=0 old="" ts
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -102,6 +202,7 @@ base_runtime_apply(){ # <manifest path or https URL> [--parts <links.json>] [--j
   local drc=0; base_discover quiet || drc=$?
   if [ "$drc" = 3 ]; then base_discover || true; return 3; fi
   if [ "${BASE_VOLUME_SHARED:-0}" = "1" ]; then note "runtime-apply: a shared store is the operator's shape, which builds everything newest; a runtime is for a buyer's own machine"; return 0; fi
+  echo "$$ ?" > "$BASE_STATE/runtime.applying"                  # "<pid> <manifest sha256>"; the sha256 follows the manifest fetch below
   hdr "RUNTIME · $src"
   root="$(_base_runtime_root)"; work="$root/.comfy-base-runtime"; mkdir -p "$work"; man="$work/runtime.json"
   case "$src" in
@@ -114,6 +215,8 @@ base_runtime_apply(){ # <manifest path or https URL> [--parts <links.json>] [--j
     ok "this runtime is already applied: install with BASE_RUNTIME=$BASE_STATE/runtime.json"; return 0
   fi
   _base_runtime_zstd || return 1
+  echo "$$ $sum" > "$BASE_STATE/runtime.applying"
+  cp "$man" "$BASE_STATE/runtime.json.new" && mv -f "$BASE_STATE/runtime.json.new" "$BASE_STATE/runtime.json"     # the manifest an install names; its stamp follows the unpack
   # an Update replaces the code wholesale: the old venv and packs go aside first, and come back if the unpack fails
   local cdir; cdir="$root/$("$SYS_PY" "$BASE_DIR/py/runtime.py" field "$man" comfyui.dir)"; ts="$(_base_ts)"
   if [ -n "$have" ] && [ -d "$cdir" ]; then

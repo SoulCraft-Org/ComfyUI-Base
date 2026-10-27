@@ -54,7 +54,7 @@ _base_timeline_write(){ # <file> → 3.22.0: every span as wall-clock time, earl
     printf '# start\tend\tseconds\twhat  (epoch seconds; ComfyUI Base %s, %s)\n' "${BASE_VERSION:-?}" "${PKG_NAME:-${PKG_ID:-base}}"
     for row in ${BASE_SPANS[@]+"${BASE_SPANS[@]}"} ${BASE_FILE_SPANS[@]+"${BASE_FILE_SPANS[@]}"}; do
       IFS='|' read -r t0 t1 what <<< "$row"
-      [[ "$t0" =~ ^[0-9]+$ ]] && [[ "$t1" =~ ^[0-9]+$ ]] || continue
+      [[ "$t0" =~ ^-?[0-9]+$ ]] && [[ "$t1" =~ ^-?[0-9]+$ ]] || continue     # 3.30.1: a background stage may begin before this shell did
       printf '%s\t%s\t%s\t%s\n' "$(( BASE_EPOCH0 + t0 ))" "$(( BASE_EPOCH0 + t1 ))" "$(( t1 - t0 ))" "$what"
     done | sort -t"$(printf '\t')" -k1,1n -k2,2n
   } > "$1" 2>/dev/null || true
